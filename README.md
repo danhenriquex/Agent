@@ -1,93 +1,226 @@
-# Agents
+# SDR Bot — Sistema Multi-Agente (Parte 1: Esqueleto)
 
+Chatbot SDR (Sales Development Representative) construído com **Google ADK**,
+desenhado para demonstrar, na prática, os requisitos técnicos de vagas de
+LLM/AI Engineer sênior focadas em produção: orquestração multi-agente,
+guardrails, mascaramento de PII, RAG avaliado e observabilidade.
 
+Este projeto é dividido em partes incrementais. Este README cobre a **Parte 1**.
 
-## Getting started
+## O que existe nesta parte
 
-To make it easy for you to get started with GitLab, here's a list of recommended next steps.
+- Hierarquia multi-agente real no ADK: 1 `OrchestratorAgent` (raiz) +
+  5 agentes especialistas (`QualificationAgent`, `KnowledgeAgent`,
+  `ObjectionHandlingAgent`, `SchedulingAgent`, `EscalateToHumanAgent`),
+  consultados via **AgentTool** — não via `sub_agents`/`transfer_to_agent`
+  (ver docstring de `app/agents/orchestrator.py` para o porquê: usar
+  `sub_agents` causou dois bugs reais de transferência não intencional
+  entre agentes durante testes manuais, rastreados a issues abertas do
+  ADK — google/adk-python#1038 e #3850).
+- O Orchestrator decide qual especialista **consultar** (como uma função)
+  com base na `description` de cada um, recebe a resposta de volta, e
+  permanece no controle da conversa em todo turno — nenhum especialista
+  assume a conversa permanentemente.
+- Estado compartilhado (`session.state`) com contrato documentado em
+  `app/session/state_schema.py`.
+- Camada de modelo desacoplada: cada agente usa `LiteLlm` apontando para
+  um **LiteLLM Proxy self-hosted**, que por sua vez roteia para modelos na
+  **OpenRouter** — ver `litellm_proxy/config.yaml` para o mapeamento
+  modelo-por-agente e a lógica de fallback.
+- Um agente com tools reais (`SchedulingAgent`), para validar tool-calling
+  ponta a ponta através do proxy antes de mexer em tools mais sensíveis.
+- Smoke test da topologia (`tests/test_smoke.py`) que roda sem precisar de
+  chave de API.
 
-Already a pro? Just edit this README.md and make it your own. Want to make it easy? [Use the template at the bottom](#editing-this-readme)!
+## O que **não** está aqui ainda (de propósito)
 
-## Add your files
+| Falta | Onde entra |
+|---|---|
+| Mascaramento de PII (Presidio + recognizers BR) | Parte 2 |
+| Guardrails / mitigação de prompt injection | Parte 3 |
+| RAG real + MCP Server para o KnowledgeAgent | Parte 4 |
+| LangFuse + Phoenix (observabilidade) | Parte 5 |
+| Golden eval set + LLM-as-judge + regressão | Parte 6 |
 
-* [Create](https://docs.gitlab.com/user/project/repository/web_editor/#create-a-file) or [upload](https://docs.gitlab.com/user/project/repository/web_editor/#upload-a-file) files
-* [Add files using the command line](https://docs.gitlab.com/topics/git/add_files/#add-files-to-a-git-repository) or push an existing Git repository with the following command:
+Cada agente tem comentários `TODO Parte N` no código exatamente nos pontos
+onde essas camadas vão se conectar — não são promessas soltas, são pontos
+de extensão já identificados na arquitetura.
+
+## Como rodar
+
+### 1. Pré-requisitos
+
+```bash
+# Instala o uv (gerenciador de projeto/dependências), se ainda não tiver
+curl -LsSf https://astral.sh/uv/install.sh | sh
+
+# Cria o ambiente virtual e instala tudo (runtime + dev) a partir do
+# uv.lock, com versões travadas — reprodutível, não "funciona na minha
+# máquina"
+uv sync
+```
+
+Não precisa ativar o `.venv` manualmente — use `uv run <comando>` (ex:
+`uv run pytest`, `uv run python -m app.main`), que já roda dentro do
+ambiente certo.
+
+### 2. Configurar variáveis de ambiente
+
+```bash
+cp .env.example .env
+# edite .env e preencha OPENROUTER_API_KEY (https://openrouter.ai/keys)
+```
+
+### 3. Subir o LiteLLM Proxy
+
+```bash
+cd litellm_proxy
+docker compose up
+```
+
+Isso expõe um endpoint OpenAI-compatible em `http://localhost:4000`, que
+roteia cada alias (`orchestrator-model`, `qualification-model`, etc.) para
+o modelo real configurado em `config.yaml` na OpenRouter.
+
+Alternativa sem Docker:
+
+```bash
+uvx --from 'litellm[proxy]' litellm --config litellm_proxy/config.yaml --port 4000
+```
+
+### 4. Rodar o bot
+
+Em outro terminal, na raiz do projeto:
+
+```bash
+uv run python -m app.main
+```
+
+Exemplo de conversa esperada — note que o autor exibido é sempre
+`OrchestratorAgent` agora (ele consulta o especialista internamente via
+AgentTool e entrega a resposta final; ver trade-off documentado em
+`app/agents/orchestrator.py`):
 
 ```
-cd existing_repo
-git remote add origin https://gitlab.com/danilosantana/agents.git
-git branch -M main
-git push -uf origin main
+Você: Oi, vi vocês no LinkedIn
+[OrchestratorAgent] Oi! Que bom que você chegou até a gente...
+
+Você: quanto custa o plano?
+[OrchestratorAgent] Sobre os planos...
 ```
 
-## Integrate with your tools
+### 5. Rodar os testes
 
-* [Set up project integrations](https://gitlab.com/danilosantana/agents/-/settings/integrations)
+```bash
+uv run pytest
+```
 
-## Collaborate with your team
+## Arquitetura (visão desta parte)
 
-* [Invite team members and collaborators](https://docs.gitlab.com/user/project/members/)
-* [Create a new merge request](https://docs.gitlab.com/user/project/merge_requests/creating_merge_requests/)
-* [Automatically close issues from merge requests](https://docs.gitlab.com/user/project/issues/managing_issues/#closing-issues-automatically)
-* [Enable merge request approvals](https://docs.gitlab.com/user/project/merge_requests/approvals/)
-* [Set auto-merge](https://docs.gitlab.com/user/project/merge_requests/auto_merge/)
+```
+Usuário (CLI)
+      │
+      ▼
+OrchestratorAgent (LlmAgent, tools=[AgentTool(...), ...])
+      │  consulta o especialista certo com base na description,
+      │  recebe a resposta de volta, permanece no controle
+      ├── QualificationAgent
+      ├── KnowledgeAgent        (RAG real chega na Parte 4)
+      ├── ObjectionHandlingAgent
+      ├── SchedulingAgent        (único com tools nesta parte)
+      └── EscalateToHumanAgent
+      │
+      ▼  model=LiteLlm(model="litellm_proxy/<alias>", api_base=..., api_key=...)
+LiteLLM Proxy (Docker, litellm_proxy/config.yaml)
+      │  resolve alias -> modelo real + fallback
+      ▼
+OpenRouter ──► Claude 3.5 Sonnet / GPT-4o-mini / Llama 3.1 (fallback)
+```
 
-## Test and Deploy
+## CI/CD (GitLab) e deploy na GCP
 
-Use the built-in continuous integration in GitLab.
+O pipeline (`.gitlab-ci.yml`) é evolutivo, em duas camadas:
 
-* [Get started with GitLab CI/CD](https://docs.gitlab.com/ci/quick_start/)
-* [Analyze your code for known vulnerabilities with Static Application Security Testing (SAST)](https://docs.gitlab.com/user/application_security/sast/)
-* [Deploy to Kubernetes, Amazon EC2, or Amazon ECS using Auto Deploy](https://docs.gitlab.com/topics/autodevops/requirements/)
-* [Use pull-based deployments for improved Kubernetes management](https://docs.gitlab.com/user/clusters/agent/)
-* [Set up protected environments](https://docs.gitlab.com/ci/environments/protected_environments/)
+1. **Sempre roda, sem credencial nenhuma**: `lint`, `test` (smoke tests,
+   sem chamada real de LLM) e `docker_build_check` (valida que os
+   Dockerfiles buildam). Isso mantém o pipeline verde desde o primeiro
+   commit, mesmo antes de qualquer configuração de nuvem.
+2. **Só aparece quando a GCP estiver configurada**: `build_and_push`
+   (Artifact Registry) e os dois `deploy_*` (Cloud Run), condicionados à
+   variável `$GCP_PROJECT_ID` existir no projeto GitLab.
 
-***
+Arquitetura de deploy: dois serviços Cloud Run — `litellm-proxy` (o
+gateway pra OpenRouter) e `sdr-bot-api` (a API FastAPI sobre o sistema de
+agentes), o segundo apontando pro primeiro via `LITELLM_PROXY_URL`.
 
-# Editing this README
+### Configurando deploy na GCP (rodar uma vez, fora do pipeline)
 
-When you're ready to make this README your own, just edit this file and use the handy template below (or feel free to structure it however you want - this is just a starting point!). Thanks to [makeareadme.com](https://www.makeareadme.com/) for this template.
+```bash
+# 1. Habilitar APIs necessárias
+gcloud services enable run.googleapis.com artifactregistry.googleapis.com \
+    iamcredentials.googleapis.com secretmanager.googleapis.com
 
-## Suggestions for a good README
+# 2. Criar repositório no Artifact Registry
+gcloud artifacts repositories create sdr-bot-repo \
+    --repository-format=docker --location=us-central1
 
-Every project is different, so consider which of these sections apply to yours. The sections used in the template are suggestions for most open source projects. Also keep in mind that while a README can be too long and detailed, too long is better than too short. If you think your README is too long, consider utilizing another form of documentation rather than cutting out information.
+# 3. Criar service account que o pipeline vai impersonar
+gcloud iam service-accounts create gitlab-ci-deployer \
+    --display-name="GitLab CI/CD deployer"
 
-## Name
-Choose a self-explaining name for your project.
+# Dar as permissões mínimas necessárias (Artifact Registry + Cloud Run)
+gcloud projects add-iam-policy-binding "$GCP_PROJECT_ID" \
+    --member="serviceAccount:gitlab-ci-deployer@${GCP_PROJECT_ID}.iam.gserviceaccount.com" \
+    --role="roles/artifactregistry.writer"
+gcloud projects add-iam-policy-binding "$GCP_PROJECT_ID" \
+    --member="serviceAccount:gitlab-ci-deployer@${GCP_PROJECT_ID}.iam.gserviceaccount.com" \
+    --role="roles/run.admin"
+gcloud projects add-iam-policy-binding "$GCP_PROJECT_ID" \
+    --member="serviceAccount:gitlab-ci-deployer@${GCP_PROJECT_ID}.iam.gserviceaccount.com" \
+    --role="roles/iam.serviceAccountUser"
 
-## Description
-Let people know what your project can do specifically. Provide context and add a link to any reference visitors might be unfamiliar with. A list of Features or a Background subsection can also be added here. If there are alternatives to your project, this is a good place to list differentiating factors.
+# 4. Criar o Workload Identity Pool + Provider pro GitLab
+gcloud iam workload-identity-pools create gitlab-pool \
+    --location="global" --display-name="GitLab CI"
 
-## Badges
-On some READMEs, you may see small images that convey metadata, such as whether or not all the tests are passing for the project. You can use Shields to add some to your README. Many services also have instructions for adding a badge.
+gcloud iam workload-identity-pools providers create-oidc gitlab-provider \
+    --location="global" --workload-identity-pool="gitlab-pool" \
+    --issuer-uri="https://gitlab.com" \
+    --attribute-mapping="google.subject=assertion.sub,attribute.repository=assertion.project_path" \
+    --attribute-condition="assertion.project_path == '<seu-namespace>/<seu-repo>'"
 
-## Visuals
-Depending on what you are making, it can be a good idea to include screenshots or even a video (you'll frequently see GIFs rather than actual videos). Tools like ttygif can help, but check out Asciinema for a more sophisticated method.
+# 5. Permitir que a identidade federada do GitLab impersone a service account
+gcloud iam service-accounts add-iam-policy-binding \
+    "gitlab-ci-deployer@${GCP_PROJECT_ID}.iam.gserviceaccount.com" \
+    --role="roles/iam.workloadIdentityUser" \
+    --member="principalSet://iam.googleapis.com/projects/${GCP_PROJECT_NUMBER}/locations/global/workloadIdentityPools/gitlab-pool/attribute.repository/<seu-namespace>/<seu-repo>"
 
-## Installation
-Within a particular ecosystem, there may be a common way of installing things, such as using Yarn, NuGet, or Homebrew. However, consider the possibility that whoever is reading your README is a novice and would like more guidance. Listing specific steps helps remove ambiguity and gets people to using your project as quickly as possible. If it only runs in a specific context like a particular programming language version or operating system or has dependencies that have to be installed manually, also add a Requirements subsection.
+# 6. Guardar os segredos de runtime no Secret Manager (não em CI/CD variables)
+echo -n "sua-chave-openrouter" | gcloud secrets create openrouter-api-key --data-file=-
+echo -n "sua-master-key-do-proxy" | gcloud secrets create litellm-proxy-key --data-file=-
+```
 
-## Usage
-Use examples liberally, and show the expected output if you can. It's helpful to have inline the smallest example of usage that you can demonstrate, while providing links to more sophisticated examples if they are too long to reasonably include in the README.
+### Variáveis a configurar no GitLab (Settings > CI/CD > Variables)
 
-## Support
-Tell people where they can go to for help. It can be any combination of an issue tracker, a chat room, an email address, etc.
+| Variável | Valor |
+|---|---|
+| `GCP_PROJECT_ID` | ID do projeto GCP |
+| `GCP_PROJECT_NUMBER` | Número do projeto (`gcloud projects describe`) |
+| `GCP_REGION` / `AR_REGION` | ex: `us-central1` |
+| `AR_REPOSITORY` | `sdr-bot-repo` |
+| `WIF_POOL_ID` | `gitlab-pool` |
+| `WIF_PROVIDER_ID` | `gitlab-provider` |
+| `WIF_SERVICE_ACCOUNT` | `gitlab-ci-deployer@<project-id>.iam.gserviceaccount.com` |
 
-## Roadmap
-If you have ideas for releases in the future, it is a good idea to list them in the README.
+Nenhuma chave JSON de service account é armazenada em lugar nenhum — a
+autenticação usa o ID token OIDC que o próprio GitLab emite por job
+(`id_tokens` no `.gitlab-ci.yml`), trocado por uma credencial federada de
+curta duração via `gcloud iam workload-identity-pools create-cred-config`.
 
-## Contributing
-State if you are open to contributions and what your requirements are for accepting them.
+## Próxima parte
 
-For people who want to make changes to your project, it's helpful to have some documentation on how to get started. Perhaps there is a script that they should run or some environment variables that they need to set. Make these steps explicit. These instructions could also be useful to your future self.
-
-You can also document commands to lint the code or run tests. These steps help to ensure high code quality and reduce the likelihood that the changes inadvertently break something. Having instructions for running tests is especially helpful if it requires external setup, such as starting a Selenium server for testing in a browser.
-
-## Authors and acknowledgment
-Show your appreciation to those who have contributed to the project.
-
-## License
-For open source projects, say how it is licensed.
-
-## Project status
-If you have run out of energy or time for your project, put a note at the top of the README saying that development has slowed down or stopped completely. Someone may choose to fork your project or volunteer to step in as a maintainer or owner, allowing your project to keep going. You can also make an explicit request for maintainers.
+**Parte 2**: camada de PII (Presidio + recognizers customizados para CPF,
+telefone e CNPJ brasileiros) integrada via `before_model_callback` /
+`after_model_callback` do ADK — mascaramento reversível para dados
+"úteis à conversa" (nome, empresa) e redação irreversível para dados que
+nunca deveriam estar ali (número de cartão completo).

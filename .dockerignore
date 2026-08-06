@@ -1,0 +1,11 @@
+.venv/
+venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+.env
+.git/
+tests/
+README.md
+part1_setup.sh
+cicd_setup.sh

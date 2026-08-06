@@ -1,0 +1,36 @@
+[project]
+name = "sdr-agent"
+version = "0.1.0"
+description = "SDR Bot multi-agente (Google ADK + LiteLLM/OpenRouter) — portfolio de engenharia de IA em produção"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "google-adk>=1.0.0",
+    "litellm>=1.55.0",
+    "python-dotenv>=1.0.1",
+    "fastapi>=0.115.0",
+    "uvicorn[standard]>=0.32.0",
+]
+
+# Dependências de desenvolvimento/CI (PEP 735) — nunca instaladas na
+# imagem de produção. Isso é o motivo real da migração: com
+# requirements.txt, o Dockerfile instalava pytest dentro do container
+# que vai pro Cloud Run. Com dependency-groups, `uv sync --no-dev` no
+# build de produção simplesmente não inclui nada daqui.
+[dependency-groups]
+dev = [
+    "pytest>=8.0.0",
+    "pytest-asyncio>=0.24.0",
+    "httpx>=0.27.0",
+    "ruff>=0.7.0",
+]
+
+[tool.pytest.ini_options]
+pythonpath = ["."]
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP"]

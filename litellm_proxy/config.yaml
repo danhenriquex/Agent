@@ -1,0 +1,72 @@
+# litellm_proxy/config.yaml
+#
+# Cada "model_name" abaixo é um ALIAS que os agentes do ADK referenciam
+# (ex: LiteLlm(model="litellm_proxy/orchestrator-model")). O proxy resolve
+# o alias pro modelo real na OpenRouter. Isso permite trocar o modelo por
+# trás de um agente sem tocar no código do agente — só mexe aqui.
+#
+# Racional de qual modelo vai em cada papel está documentado na arquitetura
+# (README.md) — resumo: tarefas de raciocínio/nuance usam modelo mais forte,
+# tarefas estruturadas/roteamento usam modelo mais barato e rápido.
+
+model_list:
+  # --- Orquestrador: roteamento de intenção, não precisa de raciocínio pesado ---
+  - model_name: orchestrator-model
+    litellm_params:
+      model: openrouter/openai/gpt-4o-mini
+      api_key: os.environ/OPENROUTER_API_KEY
+
+  # --- Qualificação: precisa conduzir perguntas de discovery coerentes ---
+  - model_name: qualification-model
+    litellm_params:
+      model: openrouter/anthropic/claude-3.5-sonnet
+      api_key: os.environ/OPENROUTER_API_KEY
+
+  # --- Knowledge/RAG: faithfulness importa, não pode alucinar sobre produto ---
+  - model_name: knowledge-model
+    litellm_params:
+      model: openrouter/anthropic/claude-3.5-sonnet
+      api_key: os.environ/OPENROUTER_API_KEY
+
+  # --- Objeções: nuance e persuasão ---
+  - model_name: objection-model
+    litellm_params:
+      model: openrouter/anthropic/claude-3.5-sonnet
+      api_key: os.environ/OPENROUTER_API_KEY
+
+  # --- Agendamento: tarefa estruturada (extrair data/hora), modelo barato ---
+  - model_name: scheduling-model
+    litellm_params:
+      model: openrouter/openai/gpt-4o-mini
+      api_key: os.environ/OPENROUTER_API_KEY
+
+  # --- Escalonamento: resposta curta e padronizada ---
+  - model_name: escalate-model
+    litellm_params:
+      model: openrouter/openai/gpt-4o-mini
+      api_key: os.environ/OPENROUTER_API_KEY
+
+  # Fallback global: se o modelo primário de qualquer alias falhar
+  # (rate limit, indisponibilidade), tenta este antes de propagar o erro.
+  - model_name: fallback-model
+    litellm_params:
+      model: openrouter/meta-llama/llama-3.1-8b-instruct
+      api_key: os.environ/OPENROUTER_API_KEY
+
+litellm_settings:
+  # Cada alias acima cai neste fallback em caso de erro/rate-limit.
+  fallbacks:
+    - orchestrator-model: ["fallback-model"]
+    - qualification-model: ["fallback-model"]
+    - knowledge-model: ["fallback-model"]
+    - objection-model: ["fallback-model"]
+    - scheduling-model: ["fallback-model"]
+    - escalate-model: ["fallback-model"]
+
+  # TODO Parte 5: adicionar "langfuse" aqui para logging de custo/latência
+  # nativo do proxy, complementando o tracing feito no lado do ADK.
+  success_callback: []
+  failure_callback: []
+
+general_settings:
+  master_key: os.environ/LITELLM_PROXY_KEY
