@@ -2743,7 +2743,7 @@ Este projeto é dividido em partes incrementais. Este README cobre a **Parte 1**
   permanece no controle da conversa em todo turno — nenhum especialista
   assume a conversa permanentemente.
 - Estado compartilhado (`session.state`) com contrato documentado em
-  `app/session/state_schema.py`.
+  `app/agents/session/state_schema.py`.
 - Camada de modelo desacoplada: cada agente usa `LiteLlm` apontando para
   um **LiteLLM Proxy self-hosted**, que por sua vez roteia para modelos na
   **OpenRouter** — ver `litellm_proxy/config.yaml` para o mapeamento
@@ -2830,7 +2830,42 @@ Você: quanto custa o plano?
 [OrchestratorAgent] Sobre os planos...
 ```
 
-### 5. Rodar os testes
+### 6. Interface visual do ADK (`adk web`)
+
+O ADK inclui uma UI de desenvolvimento que mostra a árvore de agentes, o
+histórico de eventos turno a turno, e o payload exato de cada chamada de
+tool (nome, argumentos, retorno) — útil sobretudo para depurar problemas
+de tool-calling sem precisar ler traceback.
+
+```bash
+uv run adk web app/agents
+```
+
+Abra `http://127.0.0.1:8000` no navegador. O agente aparece na UI com o
+nome `agents` (nome da pasta) — isso é esperado, não é o nome de nenhum
+agente nosso especificamente.
+
+**Detalhe não-óbvio, documentado aqui porque nos custou tempo depurando**:
+o ADK decide como escanear a pasta baseado numa convenção específica —
+`is_single_agent_directory()` (em `google/adk/cli/utils/agent_loader.py`)
+procura por um arquivo chamado literalmente `agent.py` (ou
+`root_agent.yaml`) diretamente na pasta apontada. Sem isso, o ADK assume
+que a pasta é um **diretório pai contendo vários agentes** e escaneia
+*suas subpastas* como se cada uma fosse um agente separado — no nosso
+caso, isso faria o ADK escanear `config/` e `session/` (que não têm
+`root_agent`) em vez do próprio pacote `agents`, e a UI aparecia vazia,
+sem nenhum erro explícito.
+
+É por isso que existe `app/agents/agent.py` — um arquivo pequeno,
+somente com `from .orchestrator import root_agent`, cuja única função é
+satisfazer essa convenção. É também o motivo de `config/` e `session/`
+estarem aninhados dentro de `app/agents/` (não como pastas irmãs de
+`app/agents/`): o ADK isola a pasta apontada como raiz de import sem
+visibilidade nenhuma para pastas irmãs via import relativo — então tudo
+que os agentes precisam importar precisa estar dentro da própria pasta
+que o `adk web` aponta.
+
+### 7. Rodar os testes
 
 ```bash
 uv run pytest

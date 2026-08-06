@@ -19,8 +19,8 @@ echo "==> Gerando projeto em: $TARGET_DIR"
 
 mkdir -p "$TARGET_DIR/app"
 mkdir -p "$TARGET_DIR/app/agents"
-mkdir -p "$TARGET_DIR/app/config"
-mkdir -p "$TARGET_DIR/app/session"
+mkdir -p "$TARGET_DIR/app/agents/config"
+mkdir -p "$TARGET_DIR/app/agents/session"
 mkdir -p "$TARGET_DIR/litellm_proxy"
 mkdir -p "$TARGET_DIR/tests"
 
@@ -82,7 +82,7 @@ Este projeto é dividido em partes incrementais. Este README cobre a **Parte 1**
   permanece no controle da conversa em todo turno — nenhum especialista
   assume a conversa permanentemente.
 - Estado compartilhado (`session.state`) com contrato documentado em
-  `app/session/state_schema.py`.
+  `app/agents/session/state_schema.py`.
 - Camada de modelo desacoplada: cada agente usa `LiteLlm` apontando para
   um **LiteLLM Proxy self-hosted**, que por sua vez roteia para modelos na
   **OpenRouter** — ver `litellm_proxy/config.yaml` para o mapeamento
@@ -169,7 +169,42 @@ Você: quanto custa o plano?
 [OrchestratorAgent] Sobre os planos...
 ```
 
-### 5. Rodar os testes
+### 6. Interface visual do ADK (`adk web`)
+
+O ADK inclui uma UI de desenvolvimento que mostra a árvore de agentes, o
+histórico de eventos turno a turno, e o payload exato de cada chamada de
+tool (nome, argumentos, retorno) — útil sobretudo para depurar problemas
+de tool-calling sem precisar ler traceback.
+
+```bash
+uv run adk web app/agents
+```
+
+Abra `http://127.0.0.1:8000` no navegador. O agente aparece na UI com o
+nome `agents` (nome da pasta) — isso é esperado, não é o nome de nenhum
+agente nosso especificamente.
+
+**Detalhe não-óbvio, documentado aqui porque nos custou tempo depurando**:
+o ADK decide como escanear a pasta baseado numa convenção específica —
+`is_single_agent_directory()` (em `google/adk/cli/utils/agent_loader.py`)
+procura por um arquivo chamado literalmente `agent.py` (ou
+`root_agent.yaml`) diretamente na pasta apontada. Sem isso, o ADK assume
+que a pasta é um **diretório pai contendo vários agentes** e escaneia
+*suas subpastas* como se cada uma fosse um agente separado — no nosso
+caso, isso faria o ADK escanear `config/` e `session/` (que não têm
+`root_agent`) em vez do próprio pacote `agents`, e a UI aparecia vazia,
+sem nenhum erro explícito.
+
+É por isso que existe `app/agents/agent.py` — um arquivo pequeno,
+somente com `from .orchestrator import root_agent`, cuja única função é
+satisfazer essa convenção. É também o motivo de `config/` e `session/`
+estarem aninhados dentro de `app/agents/` (não como pastas irmãs de
+`app/agents/`): o ADK isola a pasta apontada como raiz de import sem
+visibilidade nenhuma para pastas irmãs via import relativo — então tudo
+que os agentes precisam importar precisa estar dentro da própria pasta
+que o `adk web` aponta.
+
+### 7. Rodar os testes
 
 ```bash
 uv run pytest
@@ -2301,9 +2336,27 @@ SDR_PART1_EOF
 
 echo "  - app/agents/__init__.py"
 cat > "$TARGET_DIR/app/agents/__init__.py" <<'SDR_PART1_EOF'
-from app.agents.orchestrator import root_agent
+from .orchestrator import root_agent
 
 __all__ = ["root_agent"]
+SDR_PART1_EOF
+
+echo "  - app/agents/agent.py"
+cat > "$TARGET_DIR/app/agents/agent.py" <<'SDR_PART1_EOF'
+"""
+Este arquivo existe só para satisfazer a convenção de descoberta do
+`adk web`/`adk run`: o loader do ADK (is_single_agent_directory em
+google/adk/cli/utils/agent_loader.py) procura especificamente por um
+arquivo chamado `agent.py` (não `orchestrator.py`) diretamente nesta
+pasta para tratá-la como "single agent mode" — sem ele, o ADK acha que
+esta pasta é um DIRETÓRIO PAI contendo vários agentes, e escaneia suas
+subpastas (`config/`, `session/`) como se cada uma fosse um agente
+separado, encontra nenhuma com root_agent, e a UI mostra vazio.
+
+O agente em si é definido em orchestrator.py — este arquivo só reexporta.
+"""
+
+from .orchestrator import root_agent  # noqa: F401
 SDR_PART1_EOF
 
 echo "  - app/agents/_guardrails.py"
@@ -2333,7 +2386,7 @@ from google.adk.agents.callback_context import CallbackContext
 from google.adk.models import LlmResponse
 from google.genai import types
 
-from app.session.state_schema import STATE_GUARDRAIL_FLAGS
+from .session.state_schema import STATE_GUARDRAIL_FLAGS
 
 _LEAKED_TRANSFER_PATTERN = re.compile(r"transfer_to_agent\s*\{")
 
@@ -2395,9 +2448,9 @@ fallback silencioso dentro de outro agente) para que:
 
 from google.adk.agents import LlmAgent
 
-from app.agents._guardrails import block_unauthorized_transfer
-from app.config.models import get_model_for_role
-from app.session.state_schema import STATE_ESCALATED
+from ._guardrails import block_unauthorized_transfer
+from .config.models import get_model_for_role
+from .session.state_schema import STATE_ESCALATED
 
 escalate_agent = LlmAgent(
     name="EscalateToHumanAgent",
@@ -2439,9 +2492,9 @@ termos avaliação de faithfulness (Parte 6).
 
 from google.adk.agents import LlmAgent
 
-from app.agents._guardrails import block_unauthorized_transfer
-from app.config.models import get_model_for_role
-from app.session.state_schema import STATE_LAST_RETRIEVED_CONTEXT
+from ._guardrails import block_unauthorized_transfer
+from .config.models import get_model_for_role
+from .session.state_schema import STATE_LAST_RETRIEVED_CONTEXT
 
 knowledge_agent = LlmAgent(
     name="KnowledgeAgent",
@@ -2481,9 +2534,9 @@ Objection Handling Agent — lida com objeções comuns (preço, concorrente,
 
 from google.adk.agents import LlmAgent
 
-from app.agents._guardrails import block_unauthorized_transfer
-from app.config.models import get_model_for_role
-from app.session.state_schema import STATE_OBJECTIONS_RAISED
+from ._guardrails import block_unauthorized_transfer
+from .config.models import get_model_for_role
+from .session.state_schema import STATE_OBJECTIONS_RAISED
 
 objection_agent = LlmAgent(
     name="ObjectionHandlingAgent",
@@ -2556,12 +2609,12 @@ Documentação: https://google.github.io/adk-docs/agents/multi-agents/#agents-as
 from google.adk.agents import LlmAgent
 from google.adk.tools.agent_tool import AgentTool
 
-from app.agents.escalate import escalate_agent
-from app.agents.knowledge import knowledge_agent
-from app.agents.objection import objection_agent
-from app.agents.qualification import qualification_agent
-from app.agents.scheduling import scheduling_agent
-from app.config.models import get_model_for_role
+from .config.models import get_model_for_role
+from .escalate import escalate_agent
+from .knowledge import knowledge_agent
+from .objection import objection_agent
+from .qualification import qualification_agent
+from .scheduling import scheduling_agent
 
 root_agent = LlmAgent(
     name="OrchestratorAgent",
@@ -2615,9 +2668,9 @@ estruturada e mensurável — ajustaremos o schema então.
 
 from google.adk.agents import LlmAgent
 
-from app.agents._guardrails import block_unauthorized_transfer
-from app.config.models import get_model_for_role
-from app.session.state_schema import STATE_QUALIFICATION_NOTES
+from ._guardrails import block_unauthorized_transfer
+from .config.models import get_model_for_role
+from .session.state_schema import STATE_QUALIFICATION_NOTES
 
 qualification_agent = LlmAgent(
     name="QualificationAgent",
@@ -2667,9 +2720,9 @@ próximas partes.
 
 from google.adk.agents import LlmAgent
 
-from app.agents._guardrails import block_unauthorized_transfer
-from app.config.models import get_model_for_role
-from app.session.state_schema import STATE_MEETING_SLOT
+from ._guardrails import block_unauthorized_transfer
+from .config.models import get_model_for_role
+from .session.state_schema import STATE_MEETING_SLOT
 
 _MOCK_SLOTS = ["terça-feira às 10h", "quarta-feira às 15h", "quinta-feira às 11h"]
 
@@ -2735,11 +2788,11 @@ scheduling_agent = LlmAgent(
 )
 SDR_PART1_EOF
 
-echo "  - app/config/__init__.py"
-cat > "$TARGET_DIR/app/config/__init__.py" <<'SDR_PART1_EOF'
+echo "  - app/agents/config/__init__.py"
+cat > "$TARGET_DIR/app/agents/config/__init__.py" <<'SDR_PART1_EOF'
 """
 Carrega o .env como efeito colateral da primeira vez que algo sob
-app.config é importado.
+app.agents.config é importado.
 
 Isso acontece cedo o suficiente — antes dos agentes serem construídos,
 que já leem variáveis de ambiente durante a própria importação (ver
@@ -2753,8 +2806,8 @@ from dotenv import load_dotenv
 load_dotenv()
 SDR_PART1_EOF
 
-echo "  - app/config/models.py"
-cat > "$TARGET_DIR/app/config/models.py" <<'SDR_PART1_EOF'
+echo "  - app/agents/config/models.py"
+cat > "$TARGET_DIR/app/agents/config/models.py" <<'SDR_PART1_EOF'
 """
 Mapeia cada papel de agente para o alias configurado no LiteLLM Proxy.
 
@@ -2815,6 +2868,51 @@ def get_model_for_role(role: str) -> LiteLlm:
         api_base=PROXY_URL,
         api_key=PROXY_KEY,
     )
+SDR_PART1_EOF
+
+echo "  - app/agents/session/__init__.py"
+cat > "$TARGET_DIR/app/agents/session/__init__.py" <<'SDR_PART1_EOF'
+SDR_PART1_EOF
+
+echo "  - app/agents/session/state_schema.py"
+cat > "$TARGET_DIR/app/agents/session/state_schema.py" <<'SDR_PART1_EOF'
+"""
+Chaves do session.state compartilhado entre os agentes.
+
+Centralizar isso aqui evita o erro clássico de sistema multi-agente: um
+agente escreve "lead_name" e outro lê "leadName" ou "nome_lead". Toda
+leitura/escrita de estado no projeto deve usar essas constantes, nunca
+strings soltas espalhadas pelos agentes.
+
+Isso também documenta o "contrato" entre agentes — qualquer pessoa lendo
+este arquivo entende o que cada agente espera receber e o que produz, sem
+precisar ler os prompts inteiros de cada um.
+"""
+
+# Escrito pelo Qualification Agent
+STATE_QUALIFICATION_NOTES = "qualification_notes"      # texto livre nesta Parte 1
+# "in_progress" | "qualified" | "disqualified"
+STATE_QUALIFICATION_STATUS = "qualification_status"
+# TODO Parte 6: qualification_notes deveria virar um dict estruturado
+# (budget, authority, need, timeline) para o eval set conseguir medir
+# "qualificação correta" de forma objetiva, não só ler texto livre.
+
+# Escrito pelo Knowledge Agent (Parte 4 vai popular de fato via RAG/MCP)
+STATE_LAST_RETRIEVED_CONTEXT = "last_retrieved_context"
+
+# Escrito pelo Objection Agent
+STATE_OBJECTIONS_RAISED = "objections_raised"
+
+# Escrito pelo Scheduling Agent
+STATE_MEETING_SLOT = "meeting_slot"
+
+# Escrito pelo Escalate Agent
+STATE_ESCALATED = "escalated"
+
+# Escrito pela camada de guardrail/PII (Partes 2 e 3 — placeholder aqui
+# para já deixar o contrato visível desde a Parte 1)
+STATE_PII_TOKEN_MAP = "pii_token_map"        # token -> valor original; NUNCA vai ao LLM nem a logs
+STATE_GUARDRAIL_FLAGS = "guardrail_flags"    # list[str]: violações detectadas na sessão
 SDR_PART1_EOF
 
 echo "  - app/main.py"
@@ -2891,51 +2989,6 @@ async def main() -> None:
 
 if __name__ == "__main__":
     asyncio.run(main())
-SDR_PART1_EOF
-
-echo "  - app/session/__init__.py"
-cat > "$TARGET_DIR/app/session/__init__.py" <<'SDR_PART1_EOF'
-SDR_PART1_EOF
-
-echo "  - app/session/state_schema.py"
-cat > "$TARGET_DIR/app/session/state_schema.py" <<'SDR_PART1_EOF'
-"""
-Chaves do session.state compartilhado entre os agentes.
-
-Centralizar isso aqui evita o erro clássico de sistema multi-agente: um
-agente escreve "lead_name" e outro lê "leadName" ou "nome_lead". Toda
-leitura/escrita de estado no projeto deve usar essas constantes, nunca
-strings soltas espalhadas pelos agentes.
-
-Isso também documenta o "contrato" entre agentes — qualquer pessoa lendo
-este arquivo entende o que cada agente espera receber e o que produz, sem
-precisar ler os prompts inteiros de cada um.
-"""
-
-# Escrito pelo Qualification Agent
-STATE_QUALIFICATION_NOTES = "qualification_notes"      # texto livre nesta Parte 1
-# "in_progress" | "qualified" | "disqualified"
-STATE_QUALIFICATION_STATUS = "qualification_status"
-# TODO Parte 6: qualification_notes deveria virar um dict estruturado
-# (budget, authority, need, timeline) para o eval set conseguir medir
-# "qualificação correta" de forma objetiva, não só ler texto livre.
-
-# Escrito pelo Knowledge Agent (Parte 4 vai popular de fato via RAG/MCP)
-STATE_LAST_RETRIEVED_CONTEXT = "last_retrieved_context"
-
-# Escrito pelo Objection Agent
-STATE_OBJECTIONS_RAISED = "objections_raised"
-
-# Escrito pelo Scheduling Agent
-STATE_MEETING_SLOT = "meeting_slot"
-
-# Escrito pelo Escalate Agent
-STATE_ESCALATED = "escalated"
-
-# Escrito pela camada de guardrail/PII (Partes 2 e 3 — placeholder aqui
-# para já deixar o contrato visível desde a Parte 1)
-STATE_PII_TOKEN_MAP = "pii_token_map"        # token -> valor original; NUNCA vai ao LLM nem a logs
-STATE_GUARDRAIL_FLAGS = "guardrail_flags"    # list[str]: violações detectadas na sessão
 SDR_PART1_EOF
 
 echo "  - litellm_proxy/config.yaml"
@@ -3049,7 +3102,7 @@ from google.adk.models import LlmResponse
 from google.genai import types
 
 from app.agents._guardrails import block_unauthorized_transfer
-from app.session.state_schema import STATE_GUARDRAIL_FLAGS
+from app.agents.session.state_schema import STATE_GUARDRAIL_FLAGS
 
 
 def _fake_context(agent_name: str = "KnowledgeAgent") -> MagicMock:

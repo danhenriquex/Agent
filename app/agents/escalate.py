@@ -14,9 +14,9 @@ fallback silencioso dentro de outro agente) para que:
 
 from google.adk.agents import LlmAgent
 
-from app.agents._guardrails import block_unauthorized_transfer
-from app.config.models import get_model_for_role
-from app.session.state_schema import STATE_ESCALATED
+from ._guardrails import block_unauthorized_transfer
+from .config.models import get_model_for_role
+from .session.state_schema import STATE_ESCALATED
 
 escalate_agent = LlmAgent(
     name="EscalateToHumanAgent",

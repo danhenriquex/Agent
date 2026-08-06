@@ -23,7 +23,7 @@ from google.adk.agents.callback_context import CallbackContext
 from google.adk.models import LlmResponse
 from google.genai import types
 
-from app.session.state_schema import STATE_GUARDRAIL_FLAGS
+from .session.state_schema import STATE_GUARDRAIL_FLAGS
 
 _LEAKED_TRANSFER_PATTERN = re.compile(r"transfer_to_agent\s*\{")
 

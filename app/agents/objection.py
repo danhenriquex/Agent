@@ -5,9 +5,9 @@ Objection Handling Agent — lida com objeções comuns (preço, concorrente,
 
 from google.adk.agents import LlmAgent
 
-from app.agents._guardrails import block_unauthorized_transfer
-from app.config.models import get_model_for_role
-from app.session.state_schema import STATE_OBJECTIONS_RAISED
+from ._guardrails import block_unauthorized_transfer
+from .config.models import get_model_for_role
+from .session.state_schema import STATE_OBJECTIONS_RAISED
 
 objection_agent = LlmAgent(
     name="ObjectionHandlingAgent",

@@ -38,12 +38,12 @@ Documentação: https://google.github.io/adk-docs/agents/multi-agents/#agents-as
 from google.adk.agents import LlmAgent
 from google.adk.tools.agent_tool import AgentTool
 
-from app.agents.escalate import escalate_agent
-from app.agents.knowledge import knowledge_agent
-from app.agents.objection import objection_agent
-from app.agents.qualification import qualification_agent
-from app.agents.scheduling import scheduling_agent
-from app.config.models import get_model_for_role
+from .config.models import get_model_for_role
+from .escalate import escalate_agent
+from .knowledge import knowledge_agent
+from .objection import objection_agent
+from .qualification import qualification_agent
+from .scheduling import scheduling_agent
 
 root_agent = LlmAgent(
     name="OrchestratorAgent",

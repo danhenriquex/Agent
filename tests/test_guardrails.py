@@ -13,7 +13,7 @@ from google.adk.models import LlmResponse
 from google.genai import types
 
 from app.agents._guardrails import block_unauthorized_transfer
-from app.session.state_schema import STATE_GUARDRAIL_FLAGS
+from app.agents.session.state_schema import STATE_GUARDRAIL_FLAGS
 
 
 def _fake_context(agent_name: str = "KnowledgeAgent") -> MagicMock:

@@ -13,9 +13,9 @@ próximas partes.
 
 from google.adk.agents import LlmAgent
 
-from app.agents._guardrails import block_unauthorized_transfer
-from app.config.models import get_model_for_role
-from app.session.state_schema import STATE_MEETING_SLOT
+from ._guardrails import block_unauthorized_transfer
+from .config.models import get_model_for_role
+from .session.state_schema import STATE_MEETING_SLOT
 
 _MOCK_SLOTS = ["terça-feira às 10h", "quarta-feira às 15h", "quinta-feira às 11h"]
 
