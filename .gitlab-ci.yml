@@ -1,0 +1,179 @@
+# .gitlab-ci.yml
+#
+# Pipeline evolutivo: lint + test + validação de Dockerfile rodam SEMPRE
+# e não dependem de nenhuma credencial. Os estágios de push/deploy na GCP
+# só entram no pipeline quando as variáveis de CI/CD abaixo estiverem
+# configuradas em Settings > CI/CD > Variables — até lá, o pipeline fica
+# verde só com lint+test+build_check, sem quebrar por falta de credencial.
+#
+# Variáveis de CI/CD esperadas (configurar quando for ativar o deploy):
+#   GCP_PROJECT_ID       - ID do projeto GCP de destino
+#   GCP_PROJECT_NUMBER   - número do projeto (necessário pro WIF)
+#   GCP_REGION           - ex: us-central1
+#   AR_REGION            - região do Artifact Registry, ex: us-central1
+#   AR_REPOSITORY        - nome do repositório Docker no Artifact Registry
+#   WIF_POOL_ID          - ID do Workload Identity Pool
+#   WIF_PROVIDER_ID      - ID do Provider dentro do pool
+#   WIF_SERVICE_ACCOUNT  - email da service account impersonada
+#
+# Autenticação: usamos Workload Identity Federation (OIDC), não uma chave
+# JSON de service account estática — os tokens são de curta duração e
+# emitidos por job, o que elimina o risco de uma chave de longa duração
+# vazar de uma variável de CI. Ver README.md > "Configurando deploy na GCP"
+# para o setup do lado GCP (feito uma vez, fora do pipeline).
+# Referência: https://docs.gitlab.com/ci/cloud_services/google_cloud/
+
+stages:
+  - lint
+  - test
+  - build
+  - deploy
+
+variables:
+  API_IMAGE_TAG: "${AR_REGION}-docker.pkg.dev/${GCP_PROJECT_ID}/${AR_REPOSITORY}/sdr-bot-api:${CI_COMMIT_SHORT_SHA}"
+  PROXY_IMAGE_TAG: "${AR_REGION}-docker.pkg.dev/${GCP_PROJECT_ID}/${AR_REPOSITORY}/litellm-proxy:${CI_COMMIT_SHORT_SHA}"
+
+# Bloco reutilizado pelos jobs que precisam autenticar na GCP via WIF.
+# Troca o ID token do GitLab por uma credencial federada de curta duração,
+# via impersonation da service account configurada.
+.gcp_auth: &gcp_auth
+  - echo "$GCP_ID_TOKEN" > "${CI_PROJECT_DIR}/gcp_id_token"
+  - >
+    gcloud iam workload-identity-pools create-cred-config
+    "projects/${GCP_PROJECT_NUMBER}/locations/global/workloadIdentityPools/${WIF_POOL_ID}/providers/${WIF_PROVIDER_ID}"
+    --service-account="${WIF_SERVICE_ACCOUNT}"
+    --service-account-token-lifetime-seconds=600
+    --output-file="${CI_PROJECT_DIR}/gcp_cred_config.json"
+    --credential-source-file="${CI_PROJECT_DIR}/gcp_id_token"
+  - export GOOGLE_APPLICATION_CREDENTIALS="${CI_PROJECT_DIR}/gcp_cred_config.json"
+  - gcloud auth login --cred-file="${GOOGLE_APPLICATION_CREDENTIALS}" --quiet
+  - gcloud config set project "${GCP_PROJECT_ID}" --quiet
+
+# ---------------------------------------------------------------------
+# Sempre rodam (não precisam de nenhuma credencial de GCP)
+# ---------------------------------------------------------------------
+
+lint:
+  stage: lint
+  image: ghcr.io/astral-sh/uv:python3.12-bookworm-slim
+  script:
+    - uv sync --frozen
+    - uv run ruff check app tests
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
+
+test:
+  stage: test
+  image: ghcr.io/astral-sh/uv:python3.12-bookworm-slim
+  script:
+    - uv sync --frozen
+    - uv run pytest tests/ -v
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
+  # Nota: os testes atuais (smoke test da topologia de agentes + /health
+  # da API) não fazem nenhuma chamada real de LLM nem precisam de
+  # OPENROUTER_API_KEY — seguro rodar em qualquer pipeline, inclusive de
+  # merge request de contribuidor externo.
+  # A Parte 6 (golden eval set / LLM-as-judge) vai virar um job separado,
+  # explicitamente marcado como "consome API de verdade e custa dinheiro",
+  # não misturado com este smoke test.
+
+docker_build_check:
+  stage: build
+  image: docker:27
+  services:
+    - docker:27-dind
+  script:
+    - docker build -t sdr-bot-api:ci-check .
+    - docker build -t litellm-proxy:ci-check ./litellm_proxy
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
+  # Roda SEMPRE, mesmo sem GCP configurado — só valida que os Dockerfiles
+  # buildam de verdade. Pega Dockerfile quebrado antes de qualquer
+  # tentativa de deploy, sem precisar de nenhuma credencial de nuvem.
+
+# ---------------------------------------------------------------------
+# Só entram no pipeline quando GCP_PROJECT_ID estiver configurado
+# ---------------------------------------------------------------------
+
+build_and_push:
+  stage: build
+  image: google/cloud-sdk:slim
+  services:
+    - docker:27-dind
+  id_tokens:
+    GCP_ID_TOKEN:
+      aud: "https://iam.googleapis.com/projects/${GCP_PROJECT_NUMBER}/locations/global/workloadIdentityPools/${WIF_POOL_ID}/providers/${WIF_PROVIDER_ID}"
+  before_script:
+    - *gcp_auth
+    - gcloud auth configure-docker "${AR_REGION}-docker.pkg.dev" --quiet
+  script:
+    - docker build -t "${API_IMAGE_TAG}" .
+    - docker push "${API_IMAGE_TAG}"
+    - docker build -t "${PROXY_IMAGE_TAG}" ./litellm_proxy
+    - docker push "${PROXY_IMAGE_TAG}"
+  rules:
+    - if: '$GCP_PROJECT_ID && $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH'
+
+deploy_litellm_proxy:
+  stage: deploy
+  image: google/cloud-sdk:slim
+  id_tokens:
+    GCP_ID_TOKEN:
+      aud: "https://iam.googleapis.com/projects/${GCP_PROJECT_NUMBER}/locations/global/workloadIdentityPools/${WIF_POOL_ID}/providers/${WIF_PROVIDER_ID}"
+  before_script:
+    - *gcp_auth
+  script:
+    # NOTA de segurança (deliberadamente simplificado nesta fase):
+    # --allow-unauthenticated aqui porque a autenticação de fato é o
+    # LITELLM_PROXY_KEY validado dentro da aplicação (general_settings.
+    # master_key), não IAM do Cloud Run. O endurecimento correto é usar
+    # --no-allow-unauthenticated + conceder roles/run.invoker só para a
+    # service account do sdr-bot-api, com o cliente anexando um ID token
+    # do Google na chamada — isso fica como TODO de hardening, junto com
+    # os guardrails da Parte 3.
+    - >
+      gcloud run deploy litellm-proxy
+      --image="${PROXY_IMAGE_TAG}"
+      --region="${GCP_REGION}"
+      --platform=managed
+      --port=4000
+      --allow-unauthenticated
+      --set-secrets="OPENROUTER_API_KEY=openrouter-api-key:latest,LITELLM_PROXY_KEY=litellm-proxy-key:latest"
+  environment:
+    name: production/litellm-proxy
+  needs: ["build_and_push"]
+  rules:
+    - if: '$GCP_PROJECT_ID && $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH'
+      when: manual
+
+deploy_sdr_bot_api:
+  stage: deploy
+  image: google/cloud-sdk:slim
+  id_tokens:
+    GCP_ID_TOKEN:
+      aud: "https://iam.googleapis.com/projects/${GCP_PROJECT_NUMBER}/locations/global/workloadIdentityPools/${WIF_POOL_ID}/providers/${WIF_PROVIDER_ID}"
+  before_script:
+    - *gcp_auth
+  script:
+    - >
+      PROXY_URL=$(gcloud run services describe litellm-proxy
+      --region="${GCP_REGION}" --format='value(status.url)')
+    - >
+      gcloud run deploy sdr-bot-api
+      --image="${API_IMAGE_TAG}"
+      --region="${GCP_REGION}"
+      --platform=managed
+      --port=8080
+      --allow-unauthenticated
+      --set-env-vars="LITELLM_PROXY_URL=${PROXY_URL},SDR_APP_NAME=sdr-bot"
+      --set-secrets="LITELLM_PROXY_KEY=litellm-proxy-key:latest"
+  environment:
+    name: production/sdr-bot-api
+  needs: ["deploy_litellm_proxy"]
+  rules:
+    - if: '$GCP_PROJECT_ID && $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH'
+      when: manual
