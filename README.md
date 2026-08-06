@@ -174,15 +174,47 @@ OpenRouter ──► Claude 3.5 Sonnet / GPT-4o-mini / Llama 3.1 (fallback)
 
 ## CI/CD (GitLab) e deploy na GCP
 
+### Modelo de branches
+
+```
+feature branches ──MR──► develop ──MR──► main
+   (trabalho acontece)   (integração,      (só deploy — nada mais)
+                          default branch
+                          do repositório)
+```
+
+- **`develop`** é a branch padrão do repositório (configurar em Settings
+  → Repository → Default branch). Toda feature branch abre MR contra
+  ela. `lint`/`test`/`docker_build_check` rodam em qualquer MR e em todo
+  push pra `develop` — feedback rápido, sem tocar em nada de GCP.
+- **`main`** só recebe merge vindo de `develop`, quando o conjunto de
+  mudanças está pronto pra ir pro ar. É a **única** branch que os jobs
+  `build_and_push`/`deploy_*` reconhecem — um push direto em `develop`
+  nunca aciona deploy, só em `main`.
+- Deliberadamente **não** é GitFlow completo (sem release/hotfix
+  branches) — pra um projeto deste porte, esse processo extra não paga
+  o custo de manutenção.
+- Recomendado: proteger `main` em Settings → Repository → Protected
+  branches (só merge via MR, sem push direto).
+
+Isso é o motivo de `.gitlab-ci.yml` usar nomes de branch explícitos
+(`"develop"`, `"main"`) nas regras, em vez de `$CI_DEFAULT_BRANCH` — uma
+vez que "branch padrão" e "branch que decide deploy" são conceitos
+diferentes aqui, uma variável só não cobre os dois.
+
+### Pipeline
+
 O pipeline (`.gitlab-ci.yml`) é evolutivo, em duas camadas:
 
 1. **Sempre roda, sem credencial nenhuma**: `lint`, `test` (smoke tests,
    sem chamada real de LLM) e `docker_build_check` (valida que os
-   Dockerfiles buildam). Isso mantém o pipeline verde desde o primeiro
-   commit, mesmo antes de qualquer configuração de nuvem.
-2. **Só aparece quando a GCP estiver configurada**: `build_and_push`
-   (Artifact Registry) e os dois `deploy_*` (Cloud Run), condicionados à
-   variável `$GCP_PROJECT_ID` existir no projeto GitLab.
+   Dockerfiles buildam) — em qualquer MR e em push pra `develop` ou
+   `main`. Isso mantém o pipeline verde desde o primeiro commit, mesmo
+   antes de qualquer configuração de nuvem.
+2. **Só aparece quando a GCP estiver configurada E o commit for em
+   `main`**: `build_and_push` (Artifact Registry) e os dois `deploy_*`
+   (Cloud Run), condicionados à variável `$GCP_PROJECT_ID` existir no
+   projeto GitLab.
 
 Arquitetura de deploy: dois serviços Cloud Run — `litellm-proxy` (o
 gateway pra OpenRouter) e `sdr-bot-api` (a API FastAPI sobre o sistema de
