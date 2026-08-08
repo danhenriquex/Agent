@@ -231,11 +231,27 @@ echo "  - .gitlab-ci.yml"
 cat > "$TARGET_DIR/.gitlab-ci.yml" <<'SDR_CICD_EOF'
 # .gitlab-ci.yml
 #
+# Modelo de branches deste projeto (deliberadamente simples, não é
+# GitFlow completo — não há release/hotfix branches, o que seria
+# overhead desproporcional para um projeto deste porte):
+#
+#   feature branches ──MR──► develop ──MR──► main
+#      (trabalho acontece)   (integração,     (só deploy —
+#                             default branch    nada mais)
+#                             do repositório)
+#
+# Por isso as regras abaixo usam nomes de branch explícitos
+# ("develop", "main"), não $CI_DEFAULT_BRANCH — uma vez que
+# "branch padrão do repositório" (develop) e "branch que decide o
+# deploy" (main) passam a ser conceitos diferentes, uma variável só não
+# dá conta dos dois.
+#
 # Pipeline evolutivo: lint + test + validação de Dockerfile rodam SEMPRE
-# e não dependem de nenhuma credencial. Os estágios de push/deploy na GCP
-# só entram no pipeline quando as variáveis de CI/CD abaixo estiverem
-# configuradas em Settings > CI/CD > Variables — até lá, o pipeline fica
-# verde só com lint+test+build_check, sem quebrar por falta de credencial.
+# em MR e em push pra develop/main, e não dependem de nenhuma credencial.
+# Os estágios de push/deploy na GCP só entram no pipeline quando as
+# variáveis de CI/CD abaixo estiverem configuradas E o commit for em
+# main especificamente — até lá, o pipeline fica verde só com
+# lint+test+build_check.
 #
 # Variáveis de CI/CD esperadas (configurar quando for ativar o deploy):
 #   GCP_PROJECT_ID       - ID do projeto GCP de destino
@@ -292,7 +308,8 @@ lint:
     - uv run ruff check app tests
   rules:
     - if: $CI_PIPELINE_SOURCE == "merge_request_event"
-    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
+    - if: $CI_COMMIT_BRANCH == "develop"
+    - if: $CI_COMMIT_BRANCH == "main"
 
 test:
   stage: test
@@ -302,7 +319,8 @@ test:
     - uv run pytest tests/ -v
   rules:
     - if: $CI_PIPELINE_SOURCE == "merge_request_event"
-    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
+    - if: $CI_COMMIT_BRANCH == "develop"
+    - if: $CI_COMMIT_BRANCH == "main"
   # Nota: os testes atuais (smoke test da topologia de agentes + /health
   # da API) não fazem nenhuma chamada real de LLM nem precisam de
   # OPENROUTER_API_KEY — seguro rodar em qualquer pipeline, inclusive de
@@ -321,7 +339,8 @@ docker_build_check:
     - docker build -t litellm-proxy:ci-check ./litellm_proxy
   rules:
     - if: $CI_PIPELINE_SOURCE == "merge_request_event"
-    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
+    - if: $CI_COMMIT_BRANCH == "develop"
+    - if: $CI_COMMIT_BRANCH == "main"
   # Roda SEMPRE, mesmo sem GCP configurado — só valida que os Dockerfiles
   # buildam de verdade. Pega Dockerfile quebrado antes de qualquer
   # tentativa de deploy, sem precisar de nenhuma credencial de nuvem.
@@ -347,7 +366,7 @@ build_and_push:
     - docker build -t "${PROXY_IMAGE_TAG}" ./litellm_proxy
     - docker push "${PROXY_IMAGE_TAG}"
   rules:
-    - if: '$GCP_PROJECT_ID && $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH'
+    - if: '$GCP_PROJECT_ID && $CI_COMMIT_BRANCH == "main"'
 
 deploy_litellm_proxy:
   stage: deploy
@@ -378,7 +397,7 @@ deploy_litellm_proxy:
     name: production/litellm-proxy
   needs: ["build_and_push"]
   rules:
-    - if: '$GCP_PROJECT_ID && $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH'
+    - if: '$GCP_PROJECT_ID && $CI_COMMIT_BRANCH == "main"'
       when: manual
 
 deploy_sdr_bot_api:
@@ -406,7 +425,7 @@ deploy_sdr_bot_api:
     name: production/sdr-bot-api
   needs: ["deploy_litellm_proxy"]
   rules:
-    - if: '$GCP_PROJECT_ID && $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH'
+    - if: '$GCP_PROJECT_ID && $CI_COMMIT_BRANCH == "main"'
       when: manual
 SDR_CICD_EOF
 
@@ -2895,15 +2914,47 @@ OpenRouter ──► Claude 3.5 Sonnet / GPT-4o-mini / Llama 3.1 (fallback)
 
 ## CI/CD (GitLab) e deploy na GCP
 
+### Modelo de branches
+
+```
+feature branches ──MR──► develop ──MR──► main
+   (trabalho acontece)   (integração,      (só deploy — nada mais)
+                          default branch
+                          do repositório)
+```
+
+- **`develop`** é a branch padrão do repositório (configurar em Settings
+  → Repository → Default branch). Toda feature branch abre MR contra
+  ela. `lint`/`test`/`docker_build_check` rodam em qualquer MR e em todo
+  push pra `develop` — feedback rápido, sem tocar em nada de GCP.
+- **`main`** só recebe merge vindo de `develop`, quando o conjunto de
+  mudanças está pronto pra ir pro ar. É a **única** branch que os jobs
+  `build_and_push`/`deploy_*` reconhecem — um push direto em `develop`
+  nunca aciona deploy, só em `main`.
+- Deliberadamente **não** é GitFlow completo (sem release/hotfix
+  branches) — pra um projeto deste porte, esse processo extra não paga
+  o custo de manutenção.
+- Recomendado: proteger `main` em Settings → Repository → Protected
+  branches (só merge via MR, sem push direto).
+
+Isso é o motivo de `.gitlab-ci.yml` usar nomes de branch explícitos
+(`"develop"`, `"main"`) nas regras, em vez de `$CI_DEFAULT_BRANCH` — uma
+vez que "branch padrão" e "branch que decide deploy" são conceitos
+diferentes aqui, uma variável só não cobre os dois.
+
+### Pipeline
+
 O pipeline (`.gitlab-ci.yml`) é evolutivo, em duas camadas:
 
 1. **Sempre roda, sem credencial nenhuma**: `lint`, `test` (smoke tests,
    sem chamada real de LLM) e `docker_build_check` (valida que os
-   Dockerfiles buildam). Isso mantém o pipeline verde desde o primeiro
-   commit, mesmo antes de qualquer configuração de nuvem.
-2. **Só aparece quando a GCP estiver configurada**: `build_and_push`
-   (Artifact Registry) e os dois `deploy_*` (Cloud Run), condicionados à
-   variável `$GCP_PROJECT_ID` existir no projeto GitLab.
+   Dockerfiles buildam) — em qualquer MR e em push pra `develop` ou
+   `main`. Isso mantém o pipeline verde desde o primeiro commit, mesmo
+   antes de qualquer configuração de nuvem.
+2. **Só aparece quando a GCP estiver configurada E o commit for em
+   `main`**: `build_and_push` (Artifact Registry) e os dois `deploy_*`
+   (Cloud Run), condicionados à variável `$GCP_PROJECT_ID` existir no
+   projeto GitLab.
 
 Arquitetura de deploy: dois serviços Cloud Run — `litellm-proxy` (o
 gateway pra OpenRouter) e `sdr-bot-api` (a API FastAPI sobre o sistema de

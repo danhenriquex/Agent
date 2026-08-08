@@ -1,3 +1,1204 @@
+#!/usr/bin/env bash
+#
+# part2_setup.sh — PII masking: Presidio + recognizers BR (CPF/CNPJ
+# com dígito verificador real) + PhoneRecognizer (BR) + spaCy
+# pt_core_news_lg para nomes. Callbacks mask_pii/unmask_pii wireados
+# em todos os 6 agentes (unmask só no Orchestrator).
+#
+# Pré-requisito: rode isso DEPOIS de part1_setup.sh e cicd_setup.sh —
+# pyproject.toml/uv.lock aqui já incluem as dependências de todas as
+# camadas anteriores, não só as de PII.
+#
+# Uso:
+#   bash part2_setup.sh [diretorio-do-projeto]
+#
+# É seguro rodar de novo: sobrescreve só os arquivos listados acima.
+
+set -euo pipefail
+
+TARGET_DIR="${1:-sdr-agent}"
+
+if [ ! -d "$TARGET_DIR" ]; then
+  echo "ERRO: \"$TARGET_DIR\" não existe. Rode part1_setup.sh primeiro."
+  exit 1
+fi
+
+echo "==> Adicionando mascaramento de PII (Parte 2) em: $TARGET_DIR"
+
+mkdir -p "$TARGET_DIR/app/agents/pii"
+mkdir -p "$TARGET_DIR/app/agents"
+mkdir -p "$TARGET_DIR/tests"
+
+echo "  - app/agents/pii/__init__.py"
+cat > "$TARGET_DIR/app/agents/pii/__init__.py" <<'SDR_PART2_EOF'
+SDR_PART2_EOF
+
+echo "  - app/agents/pii/recognizers.py"
+cat > "$TARGET_DIR/app/agents/pii/recognizers.py" <<'SDR_PART2_EOF'
+"""
+Recognizers customizados para PII brasileira que o Presidio não cobre
+nativamente — os recognizers built-in são calibrados pra formatos
+US/EU (CREDIT_CARD, EMAIL_ADDRESS funcionam como estão; PERSON precisa
+de um backend de NLP em português, ver engine.py).
+
+Telefone brasileiro NÃO tem recognizer customizado aqui — o Presidio já
+inclui PhoneRecognizer (usa python-phonenumbers, o mesmo motor por trás
+do libphonenumber do Google), que já suporta a região 'BR' nativamente
+e valida DDD/formato de verdade, o que é mais robusto que qualquer regex
+que escreveríamos à mão. Configuração dele fica em engine.py.
+
+CPF e CNPJ usam PatternRecognizer com validação de dígito verificador
+de verdade, não só formato. Um número no formato de CPF que falha o
+dígito verificador não é um CPF real — tratá-lo como PII geraria falsos
+positivos desnecessários (ex: qualquer ID de pedido de 11 dígitos seria
+capturado).
+
+Os algoritmos de dígito verificador foram validados contra números de
+teste publicamente conhecidos antes de entrar aqui (111.444.777-35 para
+CPF, 11.222.333/0001-81 para CNPJ) — ver histórico de desenvolvimento.
+"""
+
+
+from presidio_analyzer import Pattern, PatternRecognizer
+
+
+def _cpf_check_digits(base9: str) -> str:
+    """Calcula os 2 dígitos verificadores de um CPF a partir dos 9 dígitos base."""
+    digits = [int(d) for d in base9]
+    s = sum(d * w for d, w in zip(digits, range(10, 1, -1)))
+    r = s % 11
+    d1 = 0 if r < 2 else 11 - r
+    digits10 = digits + [d1]
+    s2 = sum(d * w for d, w in zip(digits10, range(11, 1, -1)))
+    r2 = s2 % 11
+    d2 = 0 if r2 < 2 else 11 - r2
+    return f"{d1}{d2}"
+
+
+def _cnpj_check_digits(base12: str) -> str:
+    """Calcula os 2 dígitos verificadores de um CNPJ a partir dos 12 dígitos base."""
+    digits = [int(d) for d in base12]
+    w1 = [5, 4, 3, 2, 9, 8, 7, 6, 5, 4, 3, 2]
+    s = sum(d * w for d, w in zip(digits, w1))
+    r = s % 11
+    d1 = 0 if r < 2 else 11 - r
+    digits13 = digits + [d1]
+    w2 = [6, 5, 4, 3, 2, 9, 8, 7, 6, 5, 4, 3, 2]
+    s2 = sum(d * w for d, w in zip(digits13, w2))
+    r2 = s2 % 11
+    d2 = 0 if r2 < 2 else 11 - r2
+    return f"{d1}{d2}"
+
+
+class CpfBrRecognizer(PatternRecognizer):
+    """Detecta CPF (pessoa física), validando o dígito verificador de
+    verdade — e rejeitando explicitamente sequências de dígito repetido
+    (ex: 111.111.111-11), que passam no checksum matematicamente mas
+    nunca são CPFs válidos emitidos na prática."""
+
+    PATTERNS = [
+        Pattern(name="cpf (com pontuação)", regex=r"\b\d{3}\.\d{3}\.\d{3}-\d{2}\b", score=0.5),
+        Pattern(name="cpf (só dígitos)", regex=r"\b\d{11}\b", score=0.3),
+    ]
+
+    CONTEXT = ["cpf", "documento", "identidade"]
+
+    def __init__(self):
+        super().__init__(
+            supported_entity="CPF_BR",
+            patterns=self.PATTERNS,
+            context=self.CONTEXT,
+            supported_language="pt",
+        )
+
+    def validate_result(self, pattern_text: str) -> bool | None:
+        digits = "".join(ch for ch in pattern_text if ch.isdigit())
+        if len(digits) != 11:
+            return False
+        if len(set(digits)) == 1:
+            return False
+        return _cpf_check_digits(digits[:9]) == digits[9:]
+
+
+class CnpjBrRecognizer(PatternRecognizer):
+    """Detecta CNPJ (pessoa jurídica), com a mesma lógica de validação
+    real de dígito verificador."""
+
+    PATTERNS = [
+        Pattern(
+            name="cnpj (com pontuação)",
+            regex=r"\b\d{2}\.\d{3}\.\d{3}/\d{4}-\d{2}\b",
+            score=0.5,
+        ),
+        Pattern(name="cnpj (só dígitos)", regex=r"\b\d{14}\b", score=0.3),
+    ]
+
+    CONTEXT = ["cnpj", "empresa", "razão social"]
+
+    def __init__(self):
+        super().__init__(
+            supported_entity="CNPJ_BR",
+            patterns=self.PATTERNS,
+            context=self.CONTEXT,
+            supported_language="pt",
+        )
+
+    def validate_result(self, pattern_text: str) -> bool | None:
+        digits = "".join(ch for ch in pattern_text if ch.isdigit())
+        if len(digits) != 14:
+            return False
+        if len(set(digits)) == 1:
+            return False
+        return _cnpj_check_digits(digits[:12]) == digits[12:]
+SDR_PART2_EOF
+
+echo "  - app/agents/pii/engine.py"
+cat > "$TARGET_DIR/app/agents/pii/engine.py" <<'SDR_PART2_EOF'
+"""
+Constrói e cacheia (como singletons a nível de módulo) o AnalyzerEngine
+e o AnonymizerEngine do Presidio usados em toda a camada de mascaramento
+de PII.
+
+Carregar o modelo spaCy é caro (segundos, centenas de MB de memória) —
+fazemos isso UMA VEZ por processo, não a cada mensagem. As funções
+get_*_engine() são thread-safe e lazy: o modelo só carrega na primeira
+chamada real, não na importação do módulo (importante pros testes que
+não precisam de PERSON/NER — CPF/CNPJ/telefone são regex puro).
+"""
+
+import threading
+
+from presidio_analyzer import AnalyzerEngine, RecognizerRegistry
+from presidio_analyzer.nlp_engine import NlpEngineProvider
+from presidio_analyzer.predefined_recognizers import CreditCardRecognizer, PhoneRecognizer
+from presidio_anonymizer import AnonymizerEngine
+
+from .recognizers import CnpjBrRecognizer, CpfBrRecognizer
+
+_analyzer_engine: AnalyzerEngine | None = None
+_anonymizer_engine: AnonymizerEngine | None = None
+_lock = threading.Lock()
+
+# Entidades que a camada de masking (masking.py) sabe tratar. Mantido aqui
+# para as duas pontas (engine e masking) citarem a mesma lista de nomes,
+# em vez de strings soltas duplicadas nos dois arquivos.
+SUPPORTED_ENTITIES = [
+    "PERSON",
+    "EMAIL_ADDRESS",
+    "TELEFONE_BR",
+    "CPF_BR",
+    "CNPJ_BR",
+    "CREDIT_CARD",
+]
+
+
+def get_analyzer_engine() -> AnalyzerEngine:
+    global _analyzer_engine
+    if _analyzer_engine is None:
+        with _lock:
+            if _analyzer_engine is None:
+                _analyzer_engine = _build_analyzer_engine()
+    return _analyzer_engine
+
+
+def get_anonymizer_engine() -> AnonymizerEngine:
+    global _anonymizer_engine
+    if _anonymizer_engine is None:
+        with _lock:
+            if _anonymizer_engine is None:
+                _anonymizer_engine = AnonymizerEngine()
+    return _anonymizer_engine
+
+
+def _build_analyzer_engine() -> AnalyzerEngine:
+    nlp_configuration = {
+        "nlp_engine_name": "spacy",
+        "models": [{"lang_code": "pt", "model_name": "pt_core_news_lg"}],
+    }
+    provider = NlpEngineProvider(nlp_configuration=nlp_configuration)
+    nlp_engine = provider.create_engine()
+
+    registry = RecognizerRegistry(supported_languages=["pt"])
+    # Carrega os recognizers built-in do Presidio (inclui EMAIL_ADDRESS,
+    # CREDIT_CARD, e PERSON já usando o nlp_engine em português acima).
+    registry.load_predefined_recognizers(languages=["pt"], nlp_engine=nlp_engine)
+
+    # Telefone BR: built-in do Presidio (python-phonenumbers), só
+    # reconfigurado pra região BR e pro nome de entidade que usamos no
+    # resto do sistema — mais robusto que qualquer regex escrita à mão
+    # (valida DDD e formato de verdade, não só padrão visual).
+    registry.add_recognizer(
+        PhoneRecognizer(
+            supported_entity="TELEFONE_BR",
+            supported_regions=("BR",),
+            supported_language="pt",
+        )
+    )
+
+    # CPF/CNPJ: sem equivalente built-in, precisam ser nossos mesmo.
+    registry.add_recognizer(CpfBrRecognizer())
+    registry.add_recognizer(CnpjBrRecognizer())
+
+    # CREDIT_CARD: apesar do formato ser universal (não depende de
+    # idioma), o CreditCardRecognizer padrão do Presidio tem
+    # supported_language="en" — load_predefined_recognizers(languages=
+    # ["pt"]) SILENCIOSAMENTE pula ele (só loga um warning, não falha),
+    # então sem isso o bloqueio de tier 3 nunca dispara. Descoberto via
+    # teste automatizado, não documentação — vale registrar aqui.
+    registry.add_recognizer(CreditCardRecognizer(supported_language="pt"))
+
+    return AnalyzerEngine(
+        registry=registry,
+        nlp_engine=nlp_engine,
+        supported_languages=["pt"],
+    )
+SDR_PART2_EOF
+
+echo "  - app/agents/pii/masking.py"
+cat > "$TARGET_DIR/app/agents/pii/masking.py" <<'SDR_PART2_EOF'
+"""
+before_model_callback / after_model_callback que implementam o
+mascaramento de PII em todo o sistema, seguindo o desenho de
+"perímetro": mascarar uma vez na entrada do OrchestratorAgent (e, como
+defesa em profundidade, em todo agente — idempotente, não-operação em
+texto já mascarado), desmascarar só uma vez, na saída do
+OrchestratorAgent.
+
+Camadas (ver arquitetura da Parte 2 no README):
+  1. Reversível (token)      -> PERSON, EMAIL_ADDRESS, TELEFONE_BR
+  2. Hash com salt (correlação, nunca reversível) -> CPF_BR, CNPJ_BR
+  3. Bloqueio total da mensagem -> CREDIT_CARD
+
+O mapa de tokens vive só em session.state[STATE_PII_TOKEN_MAP] — nunca é
+serializado em log, trace ou qualquer lugar fora da sessão em execução.
+"""
+
+import os
+
+from google.adk.agents.callback_context import CallbackContext
+from google.adk.models import LlmRequest, LlmResponse
+from google.genai import types
+from presidio_anonymizer.entities import OperatorConfig
+
+from ..session.state_schema import STATE_GUARDRAIL_FLAGS, STATE_PII_TOKEN_MAP
+from .engine import SUPPORTED_ENTITIES, get_analyzer_engine, get_anonymizer_engine
+
+_TOKEN_TIER_PREFIXES = {
+    "PERSON": "PERSON",
+    "EMAIL_ADDRESS": "EMAIL",
+    "TELEFONE_BR": "PHONE",
+}
+_HASH_TIER_ENTITIES = {"CPF_BR", "CNPJ_BR"}
+_BLOCK_TIER_ENTITIES = {"CREDIT_CARD"}
+
+_BLOCKED_MESSAGE_TEXT = (
+    "Por segurança, não consigo processar mensagens com dados de cartão. "
+    "Se precisar tratar de pagamento, um especialista humano vai te ajudar "
+    "com isso separadamente."
+)
+
+
+def _get_pii_hash_salt() -> bytes:
+    """Salt fixo usado no hash de CPF/CNPJ (tier 2).
+
+    Precisa ser fixo (não aleatório por sessão) pra permitir correlação
+    entre sessões ("é o mesmo lead de antes?"), e precisa ser secreto
+    pra isso realmente proteger contra força bruta -- CPF tem um espaço
+    de busca pequeno (11 dígitos), então um hash sem salt secreto é
+    praticamente reversível.
+    """
+    salt = os.environ.get("PII_HASH_SALT")
+    if not salt:
+        raise RuntimeError(
+            "PII_HASH_SALT não configurado. É obrigatório: sem um salt fixo "
+            "e secreto, o hash de CPF/CNPJ ou usaria salt aleatório por "
+            "execução (quebrando correlação entre sessões) ou um salt "
+            "hardcoded (anulando a proteção contra força bruta). Gere um "
+            'com: python -c "import secrets; print(secrets.token_hex(32))" '
+            "e guarde em .env (local) / Secret Manager (produção)."
+        )
+    salt_bytes = salt.encode()
+    if len(salt_bytes) < 16:
+        raise RuntimeError("PII_HASH_SALT precisa ter pelo menos 16 bytes (32 caracteres hex).")
+    return salt_bytes
+
+
+def _get_or_create_token(token_map: dict, prefix: str, original_value: str) -> str:
+    """Reusa o token existente se esse valor já apareceu nesta sessão;
+    senão cria um novo, numerado sequencialmente por prefixo."""
+    for token, value in token_map.items():
+        if value == original_value and token.startswith(f"[{prefix}_"):
+            return token
+
+    existing = [t for t in token_map if t.startswith(f"[{prefix}_")]
+    new_token = f"[{prefix}_{len(existing) + 1}]"
+    token_map[new_token] = original_value
+    return new_token
+
+
+def _build_operators(token_map: dict) -> dict:
+    operators = {}
+
+    for entity_type, prefix in _TOKEN_TIER_PREFIXES.items():
+        operators[entity_type] = OperatorConfig(
+            "custom",
+            {"lambda": lambda text, p=prefix: _get_or_create_token(token_map, p, text)},
+        )
+
+    for entity_type in _HASH_TIER_ENTITIES:
+        operators[entity_type] = OperatorConfig(
+            "hash",
+            {"hash_type": "sha256", "salt": _get_pii_hash_salt()},
+        )
+
+    return operators
+
+
+def _mask_text(text: str, token_map: dict) -> tuple[str, bool]:
+    """Retorna (texto_processado, foi_bloqueado). Se foi_bloqueado for
+    True, texto_processado é irrelevante -- a mensagem inteira deve ser
+    substituída pela resposta de bloqueio."""
+    analyzer = get_analyzer_engine()
+    results = analyzer.analyze(text=text, language="pt", entities=SUPPORTED_ENTITIES)
+
+    if any(r.entity_type in _BLOCK_TIER_ENTITIES for r in results):
+        return "", True
+
+    relevant = [r for r in results if r.entity_type not in _BLOCK_TIER_ENTITIES]
+    if not relevant:
+        return text, False
+
+    anonymizer = get_anonymizer_engine()
+    operators = _build_operators(token_map)
+    anonymized = anonymizer.anonymize(text=text, analyzer_results=relevant, operators=operators)
+    return anonymized.text, False
+
+
+def mask_pii(callback_context: CallbackContext, llm_request: LlmRequest) -> LlmResponse | None:
+    """before_model_callback: mascara PII em todas as partes de texto da
+    requisição antes de ir para o LLM. Retorna uma LlmResponse (curto-
+    circuitando a chamada real) se alguma parte continha dado bloqueado
+    (tier 3); senão modifica llm_request in-place e retorna None."""
+    if not llm_request.contents:
+        return None
+
+    token_map = callback_context.state.get(STATE_PII_TOKEN_MAP, {})
+
+    for content in llm_request.contents:
+        if not content.parts:
+            continue
+
+        new_parts = []
+        for part in content.parts:
+            if part.text is None:
+                new_parts.append(part)
+                continue
+
+            masked_text, blocked = _mask_text(part.text, token_map)
+
+            if blocked:
+                flags = callback_context.state.get(STATE_GUARDRAIL_FLAGS, [])
+                flags.append(
+                    f"{callback_context.agent_name}: mensagem bloqueada "
+                    "(continha dado de cartão)"
+                )
+                callback_context.state[STATE_GUARDRAIL_FLAGS] = flags
+                callback_context.state[STATE_PII_TOKEN_MAP] = token_map
+
+                return LlmResponse(
+                    content=types.Content(
+                        role="model",
+                        parts=[types.Part(text=_BLOCKED_MESSAGE_TEXT)],
+                    )
+                )
+
+            new_parts.append(types.Part(text=masked_text))
+
+        content.parts = new_parts
+
+    callback_context.state[STATE_PII_TOKEN_MAP] = token_map
+    return None
+
+
+def unmask_pii(callback_context: CallbackContext, llm_response: LlmResponse) -> LlmResponse | None:
+    """after_model_callback: reverte os tokens reversíveis (tier 1) de
+    volta aos valores originais. Só deve ser registrado no
+    OrchestratorAgent -- ver docstring de orchestrator.py."""
+    if not llm_response.content or not llm_response.content.parts:
+        return None
+
+    token_map = callback_context.state.get(STATE_PII_TOKEN_MAP, {})
+    if not token_map:
+        return None
+
+    changed = False
+    new_parts = []
+    for part in llm_response.content.parts:
+        if part.text is None:
+            new_parts.append(part)
+            continue
+
+        text = part.text
+        for token, original in token_map.items():
+            if token in text:
+                text = text.replace(token, original)
+                changed = True
+
+        new_parts.append(types.Part(text=text))
+
+    if not changed:
+        return None
+
+    return LlmResponse(content=types.Content(role="model", parts=new_parts))
+SDR_PART2_EOF
+
+echo "  - app/agents/orchestrator.py"
+cat > "$TARGET_DIR/app/agents/orchestrator.py" <<'SDR_PART2_EOF'
+"""
+Orchestrator Agent — raiz da hierarquia. Consulta os agentes
+especialistas como TOOLS (via AgentTool), não via sub_agents/
+transfer_to_agent.
+
+Por que essa mudança (Parte 1, revisão pós-debug manual): o desenho
+original usava sub_agents, que no ADK significa "transferência
+permanente de controle" — o especialista assume a conversa e o
+Orchestrator sai do circuito. Isso nunca foi o comportamento que
+queríamos (o objetivo sempre foi "o Orchestrator consulta um
+especialista e decide a resposta final", não "o especialista assume
+para sempre") — e na prática causou dois bugs reais em teste manual:
+
+1. Um crash de JSON malformado ao processar uma chamada de
+   transfer_to_agent (google/adk-python#1038 — argumentos de tool call
+   concatenados/duplicados).
+2. Uma tentativa de transferência não autorizada entre agentes irmãos,
+   mesmo com disallow_transfer_to_peers=True — porque essa flag só edita
+   o texto do prompt, não remove a ferramenta de fato
+   (google/adk-python#3850, ainda aberto).
+
+AgentTool não tem esse mecanismo: os agentes especialistas nunca ganham
+a ferramenta transfer_to_agent, porque não fazem parte da árvore de
+sub_agents — o Orchestrator os chama como função, recebe o resultado, e
+permanece no controle da conversa. Isso elimina a categoria inteira do
+bug, em vez de tentar bloqueá-lo depois que já aconteceu.
+
+Trade-off conhecido: o autor do evento de resposta final agora é sempre
+"OrchestratorAgent" (ele reprocessa o resultado do especialista antes de
+responder ao usuário) — o debug via CLI ("[NomeDoAgente] ...") perde a
+visibilidade direta de qual especialista respondeu uma pergunta
+específica. Aceitável por ora; pode ser recuperado depois inspecionando
+eventos intermediários, se necessário.
+
+Documentação: https://google.github.io/adk-docs/agents/multi-agents/#agents-as-tools
+
+Parte 2 — mascaramento de PII: este agente é o único ponto de entrada
+(recebe a mensagem crua do usuário) e o único ponto de saída (entrega a
+resposta final) de todo o sistema. Por isso ele é o único que registra
+unmask_pii — reverter tokens em qualquer outro lugar arriscaria vazar
+PII de volta pro contexto antes da resposta final estar pronta. Todos
+os agentes (incluindo este) registram mask_pii, para que nenhum deles
+jamais veja PII crua, mesmo que uma ferramenta futura (Parte 4+) traga
+dado bruto de algum lugar. Ver app/agents/pii/masking.py.
+"""
+
+from google.adk.agents import LlmAgent
+from google.adk.tools.agent_tool import AgentTool
+
+from .config.models import get_model_for_role
+from .escalate import escalate_agent
+from .knowledge import knowledge_agent
+from .objection import objection_agent
+from .pii.masking import mask_pii, unmask_pii
+from .qualification import qualification_agent
+from .scheduling import scheduling_agent
+
+root_agent = LlmAgent(
+    name="OrchestratorAgent",
+    model=get_model_for_role("orchestrator"),
+    description=(
+        "Coordenador do atendimento SDR. Recebe toda mensagem do lead e "
+        "decide qual especialista consultar antes de responder."
+    ),
+    instruction=(
+        "Você é o orquestrador de um time de vendas (SDR) automatizado. "
+        "Para a maioria das mensagens, você deve CONSULTAR o especialista "
+        "certo (chamando-o como ferramenta) antes de responder — não "
+        "responda de memória sobre produto, preço, objeções ou "
+        "agendamento.\n\n"
+        "Regras de consulta:\n"
+        "1) Se é o início da conversa ou ainda não sabemos se o lead é "
+        "qualificado, consulte QualificationAgent.\n"
+        "2) Se o lead pergunta sobre produto, funcionalidade ou preço, "
+        "consulte KnowledgeAgent.\n"
+        "3) Se o lead expressa hesitação, recusa ou objeção, consulte "
+        "ObjectionHandlingAgent.\n"
+        "4) Se o lead concorda em avançar / quer marcar uma conversa, "
+        "consulte SchedulingAgent.\n"
+        "5) Se o pedido está fora do escopo comercial, ou o lead pede "
+        "explicitamente um humano, consulte EscalateToHumanAgent.\n\n"
+        "Depois de consultar o especialista, entregue a resposta dele ao "
+        "lead de forma natural (pode repassar quase literalmente — não "
+        "precisa reescrever tudo). Só responda diretamente, sem consultar "
+        "ninguém, para saudações simples."
+    ),
+    tools=[
+        AgentTool(agent=qualification_agent),
+        AgentTool(agent=knowledge_agent),
+        AgentTool(agent=objection_agent),
+        AgentTool(agent=scheduling_agent),
+        AgentTool(agent=escalate_agent),
+    ],
+    before_model_callback=mask_pii,
+    after_model_callback=unmask_pii,
+)
+SDR_PART2_EOF
+
+echo "  - app/agents/qualification.py"
+cat > "$TARGET_DIR/app/agents/qualification.py" <<'SDR_PART2_EOF'
+"""
+Qualification Agent — conduz a descoberta inicial (framework BANT) para
+decidir se o lead deveria avançar no funil comercial.
+
+Nesta Parte 1, o agente só conversa e escreve um resumo em texto livre no
+estado (via output_key). A Parte 6 (eval set) vai cobrar qualificação mais
+estruturada e mensurável — ajustaremos o schema então.
+"""
+
+from google.adk.agents import LlmAgent
+
+from ._guardrails import block_unauthorized_transfer
+from .config.models import get_model_for_role
+from .pii.masking import mask_pii
+from .session.state_schema import STATE_QUALIFICATION_NOTES
+
+qualification_agent = LlmAgent(
+    name="QualificationAgent",
+    model=get_model_for_role("qualification"),
+    description=(
+        "Conduz a qualificação inicial do lead usando perguntas de "
+        "descoberta (orçamento, autoridade de decisão, necessidade, "
+        "prazo). Use quando o lead está no início da conversa ou quando "
+        "ainda não sabemos se ele é um bom fit."
+    ),
+    instruction=(
+        "Você é um SDR conduzindo a qualificação inicial de um lead B2B. "
+        "Faça perguntas curtas e naturais, uma de cada vez, cobrindo ao "
+        "longo da conversa: qual problema o lead quer resolver, se ele "
+        "tem orçamento definido, se ele é o decisor ou influencia a "
+        "decisão, e em que prazo pretende resolver isso. "
+        "Não faça um interrogatório — intercale com contexto útil sobre "
+        "como ajudamos empresas parecidas. "
+        "Se o lead perguntar algo sobre o produto/preço que você não "
+        "sabe, diga que vai verificar (o Orchestrator vai rotear para o "
+        "agente certo)."
+    ),
+    output_key=STATE_QUALIFICATION_NOTES,
+    # Chamado via AgentTool a partir do Orchestrator (ver orchestrator.py),
+    # não via sub_agents — então este agente nunca ganha a ferramenta
+    # transfer_to_agent para começar; não há transferência a bloquear. O
+    # guardrail abaixo fica como defesa em profundidade, não a proteção
+    # primária (ver docstring de _guardrails.py para o histórico do bug).
+    before_model_callback=mask_pii,
+    after_model_callback=block_unauthorized_transfer,
+)
+SDR_PART2_EOF
+
+echo "  - app/agents/knowledge.py"
+cat > "$TARGET_DIR/app/agents/knowledge.py" <<'SDR_PART2_EOF'
+"""
+Knowledge Agent — responde dúvidas sobre produto, preço e cases.
+
+Nesta Parte 1 ele ainda NÃO tem RAG de verdade (isso é a Parte 4, via um
+MCP server dedicado rodando sobre ChromaDB). Por enquanto ele responde só
+com o que está na instruction, deixando claro ao lead quando não tem
+certeza — importante para não estabelecer hábito de alucinar antes de
+termos avaliação de faithfulness (Parte 6).
+"""
+
+from google.adk.agents import LlmAgent
+
+from ._guardrails import block_unauthorized_transfer
+from .config.models import get_model_for_role
+from .pii.masking import mask_pii
+from .session.state_schema import STATE_LAST_RETRIEVED_CONTEXT
+
+knowledge_agent = LlmAgent(
+    name="KnowledgeAgent",
+    model=get_model_for_role("knowledge"),
+    description=(
+        "Responde perguntas sobre o produto, funcionalidades, planos e "
+        "preços. Use quando o lead pergunta 'o que vocês fazem', 'quanto "
+        "custa', 'vocês integram com X', etc."
+    ),
+    instruction=(
+        "Você responde perguntas sobre nosso produto SaaS de forma "
+        "precisa e concisa. "
+        "IMPORTANTE (temporário — Parte 1): você ainda não tem acesso à "
+        "base de conhecimento real. Se não tiver certeza absoluta da "
+        "resposta, diga explicitamente que vai confirmar com o time e "
+        "NÃO invente números de preço ou funcionalidades. "
+        "TODO Parte 4: este agente vai receber um MCPToolset apontando "
+        "para um servidor MCP de retrieval (ChromaDB) — ver arquitetura "
+        "no README."
+    ),
+    output_key=STATE_LAST_RETRIEVED_CONTEXT,
+    # Chamado via AgentTool a partir do Orchestrator (ver orchestrator.py),
+    # não via sub_agents — então este agente nunca ganha a ferramenta
+    # transfer_to_agent para começar; não há transferência a bloquear. O
+    # guardrail abaixo fica como defesa em profundidade, não a proteção
+    # primária (ver docstring de _guardrails.py para o histórico do bug).
+    before_model_callback=mask_pii,
+    after_model_callback=block_unauthorized_transfer,
+)
+SDR_PART2_EOF
+
+echo "  - app/agents/objection.py"
+cat > "$TARGET_DIR/app/agents/objection.py" <<'SDR_PART2_EOF'
+"""
+Objection Handling Agent — lida com objeções comuns (preço, concorrente,
+"preciso falar com meu time", timing).
+"""
+
+from google.adk.agents import LlmAgent
+
+from ._guardrails import block_unauthorized_transfer
+from .config.models import get_model_for_role
+from .pii.masking import mask_pii
+from .session.state_schema import STATE_OBJECTIONS_RAISED
+
+objection_agent = LlmAgent(
+    name="ObjectionHandlingAgent",
+    model=get_model_for_role("objection"),
+    description=(
+        "Lida com objeções e resistências do lead (preço alto, já usa "
+        "concorrente, precisa de aprovação interna, não é prioridade "
+        "agora). Use quando o lead expressar hesitação ou recusa."
+    ),
+    instruction=(
+        "Você lida com objeções de forma empática, sem ser insistente. "
+        "Reconheça a objeção antes de responder a ela. Nunca ofereça "
+        "desconto, condição especial ou prazo que não foi explicitamente "
+        "autorizado — se o lead pedir desconto, diga que pode conectar "
+        "com um account executive para discutir condições comerciais. "
+        "TODO Parte 3: essa regra de 'nunca ofereça desconto' precisa "
+        "virar um guardrail verificável (after_model_callback), não só "
+        "uma instrução no prompt — instrução sozinha não é garantia "
+        "contra prompt injection."
+    ),
+    output_key=STATE_OBJECTIONS_RAISED,
+    # Chamado via AgentTool a partir do Orchestrator (ver orchestrator.py),
+    # não via sub_agents — então este agente nunca ganha a ferramenta
+    # transfer_to_agent para começar; não há transferência a bloquear. O
+    # guardrail abaixo fica como defesa em profundidade, não a proteção
+    # primária (ver docstring de _guardrails.py para o histórico do bug).
+    before_model_callback=mask_pii,
+    after_model_callback=block_unauthorized_transfer,
+)
+SDR_PART2_EOF
+
+echo "  - app/agents/scheduling.py"
+cat > "$TARGET_DIR/app/agents/scheduling.py" <<'SDR_PART2_EOF'
+"""
+Scheduling Agent — tarefa estruturada: verifica disponibilidade e
+"agenda" a reunião (mock nesta Parte 1, sem calendário real).
+
+Modelo: barato/rápido (ver app/config/models.py) porque a tarefa é
+majoritariamente extração estruturada, não raciocínio aberto.
+
+Este é o único agente com tools nesta Parte 1 — propositalmente, para
+validar que tool-calling funciona ponta a ponta através do LiteLLM Proxy
++ OpenRouter antes de adicionarmos tools mais sensíveis (RAG, MCP) nas
+próximas partes.
+"""
+
+from google.adk.agents import LlmAgent
+
+from ._guardrails import block_unauthorized_transfer
+from .config.models import get_model_for_role
+from .pii.masking import mask_pii
+from .session.state_schema import STATE_MEETING_SLOT
+
+_MOCK_SLOTS = ["terça-feira às 10h", "quarta-feira às 15h", "quinta-feira às 11h"]
+
+
+def check_availability() -> dict:
+    """Retorna os horários disponíveis para reunião com um account executive.
+
+    Returns:
+        dict: status e lista de horários disponíveis.
+    """
+    return {"status": "success", "available_slots": _MOCK_SLOTS}
+
+
+def book_meeting(slot: str) -> dict:
+    """Confirma o agendamento de uma reunião em um horário específico.
+
+    Args:
+        slot: um dos horários retornados por check_availability
+            (ex: "terça-feira às 10h").
+
+    Returns:
+        dict: status da confirmação.
+    """
+    if slot not in _MOCK_SLOTS:
+        return {
+            "status": "error",
+            "error_message": (
+                f"Horário '{slot}' não está disponível. "
+                "Use check_availability primeiro."
+            ),
+        }
+
+    # TODO Parte 3: antes de confirmar de verdade, isso deveria passar por
+    # um before_tool_callback validando que o lead está QUALIFICADO
+    # (session.state[STATE_QUALIFICATION_STATUS] == "qualified") —
+    # allowlist de AÇÃO, não só allowlist de tool disponível.
+    return {"status": "success", "confirmed_slot": slot}
+
+
+scheduling_agent = LlmAgent(
+    name="SchedulingAgent",
+    model=get_model_for_role("scheduling"),
+    description=(
+        "Agenda reuniões de apresentação com um account executive. Use "
+        "quando o lead já demonstrou interesse em marcar uma conversa ou "
+        "avançar para uma próxima etapa comercial."
+    ),
+    instruction=(
+        "Você ajuda o lead a marcar uma reunião. Primeiro chame "
+        "check_availability para ver os horários livres, apresente as "
+        "opções de forma natural, e depois chame book_meeting com o "
+        "horário escolhido. Seja objetivo — esse não é o momento de "
+        "reabrir a qualificação ou discutir preço."
+    ),
+    tools=[check_availability, book_meeting],
+    output_key=STATE_MEETING_SLOT,
+    # Chamado via AgentTool a partir do Orchestrator (ver orchestrator.py),
+    # não via sub_agents — então este agente nunca ganha a ferramenta
+    # transfer_to_agent para começar; não há transferência a bloquear. O
+    # guardrail abaixo fica como defesa em profundidade, não a proteção
+    # primária (ver docstring de _guardrails.py para o histórico do bug).
+    before_model_callback=mask_pii,
+    after_model_callback=block_unauthorized_transfer,
+)
+SDR_PART2_EOF
+
+echo "  - app/agents/escalate.py"
+cat > "$TARGET_DIR/app/agents/escalate.py" <<'SDR_PART2_EOF'
+"""
+Escalate to Human Agent — saída explícita do sistema.
+
+Todo sistema de produção regulado precisa de um caminho claro para "eu não
+devo responder isso sozinho". Ele existe como agente próprio (não como um
+fallback silencioso dentro de outro agente) para que:
+
+  (a) apareça no tracing (LangFuse/Phoenix, Parte 5) como um evento
+      nomeado e auditável, e
+  (b) o eval set (Parte 6) consiga medir separadamente "taxa de
+      escalonamento correto" vs. "taxa de escalonamento perdido"
+      (deveria ter escalado e não escalou).
+"""
+
+from google.adk.agents import LlmAgent
+
+from ._guardrails import block_unauthorized_transfer
+from .config.models import get_model_for_role
+from .pii.masking import mask_pii
+from .session.state_schema import STATE_ESCALATED
+
+escalate_agent = LlmAgent(
+    name="EscalateToHumanAgent",
+    model=get_model_for_role("escalate"),
+    description=(
+        "Encerra o atendimento automatizado e transfere para um humano. "
+        "Use quando: o guardrail bloquear uma mensagem (Parte 3), o lead "
+        "pedir explicitamente para falar com uma pessoa, ou a conversa "
+        "sair do escopo comercial (suporte técnico, reclamação, assunto "
+        "não relacionado a vendas)."
+    ),
+    instruction=(
+        "Informe de forma clara e cordial que você vai conectar o lead "
+        "com um especialista humano, e que alguém do time vai continuar "
+        "a conversa em breve. Não tente resolver o pedido original você "
+        "mesmo."
+    ),
+    output_key=STATE_ESCALATED,
+    # Chamado via AgentTool a partir do Orchestrator (ver orchestrator.py),
+    # não via sub_agents — então este agente nunca ganha a ferramenta
+    # transfer_to_agent para começar; não há transferência a bloquear. O
+    # guardrail abaixo fica como defesa em profundidade, não a proteção
+    # primária (ver docstring de _guardrails.py para o histórico do bug).
+    before_model_callback=mask_pii,
+    after_model_callback=block_unauthorized_transfer,
+)
+SDR_PART2_EOF
+
+echo "  - tests/test_pii_masking.py"
+cat > "$TARGET_DIR/tests/test_pii_masking.py" <<'SDR_PART2_EOF'
+"""
+Testes da camada de mascaramento de PII (Parte 2). Como em
+test_guardrails.py: construímos LlmRequest/LlmResponse reais direto,
+sem nenhuma chamada de LLM -- a lógica de detecção/mascaramento roda
+localmente via Presidio + spaCy.
+
+Nota: estes testes carregam o modelo spaCy pt_core_news_lg na primeira
+vez que tocam PERSON (~15s, uma vez por sessão de teste, cacheado depois
+disso pelo singleton em engine.py). CPF/CNPJ/telefone não precisam do
+modelo carregado (são recognizers baseados em regex/phonenumbers).
+"""
+
+import os
+from unittest.mock import MagicMock
+
+import pytest
+from google.adk.models import LlmRequest
+from google.genai import types
+
+from app.agents.pii.masking import mask_pii, unmask_pii
+from app.agents.session.state_schema import STATE_GUARDRAIL_FLAGS, STATE_PII_TOKEN_MAP
+
+# Salt de teste -- nunca usar isso fora de testes. Setado antes de
+# qualquer teste que dependa de hashing (CPF/CNPJ).
+os.environ.setdefault("PII_HASH_SALT", "test-salt-not-for-production-use-32b")
+
+
+def _fake_context(agent_name: str = "OrchestratorAgent") -> MagicMock:
+    ctx = MagicMock()
+    ctx.agent_name = agent_name
+    ctx.state = {}
+    return ctx
+
+
+def _request_with_text(text: str) -> LlmRequest:
+    return LlmRequest(
+        contents=[types.Content(role="user", parts=[types.Part(text=text)])]
+    )
+
+
+def test_masks_person_name():
+    ctx = _fake_context()
+    request = _request_with_text("Oi, meu nome é Danilo Henrique, quero saber mais.")
+
+    result = mask_pii(ctx, request)
+
+    assert result is None  # não bloqueou, deixa a request (agora mascarada) seguir
+    masked_text = request.contents[0].parts[0].text
+    assert "Danilo Henrique" not in masked_text
+    assert "[PERSON_1]" in masked_text
+    assert ctx.state[STATE_PII_TOKEN_MAP]["[PERSON_1]"] == "Danilo Henrique"
+
+
+def test_masks_email():
+    ctx = _fake_context()
+    request = _request_with_text("meu email é danilo@empresa.com.br")
+
+    mask_pii(ctx, request)
+
+    masked_text = request.contents[0].parts[0].text
+    assert "danilo@empresa.com.br" not in masked_text
+    assert "[EMAIL_1]" in masked_text
+
+
+def test_masks_phone():
+    ctx = _fake_context()
+    request = _request_with_text("pode ligar no (83) 99419-8558")
+
+    mask_pii(ctx, request)
+
+    masked_text = request.contents[0].parts[0].text
+    assert "99419-8558" not in masked_text
+    assert "[PHONE_1]" in masked_text
+
+
+def test_reuses_same_token_for_repeated_value():
+    ctx = _fake_context()
+    request = _request_with_text("Danilo aqui. É, o Danilo mesmo, de novo.")
+
+    mask_pii(ctx, request)
+
+    masked_text = request.contents[0].parts[0].text
+    # Duas menções ao mesmo nome devem virar o MESMO token, não
+    # [PERSON_1] e [PERSON_2] -- senão a conversa fica incoerente.
+    assert masked_text.count("[PERSON_1]") == 2
+    assert "[PERSON_2]" not in masked_text
+
+
+def test_cpf_is_hashed_not_tokenized():
+    ctx = _fake_context()
+    request = _request_with_text("meu cpf é 111.444.777-35")
+
+    mask_pii(ctx, request)
+
+    masked_text = request.contents[0].parts[0].text
+    assert "111.444.777-35" not in masked_text
+    # CPF é tier 2 (hash), não deveria aparecer como token reversível
+    assert "[CPF" not in masked_text
+    # Não deveria ter sido adicionado ao mapa de tokens reversíveis
+    assert not any("111.444.777-35" == v for v in ctx.state.get(STATE_PII_TOKEN_MAP, {}).values())
+
+
+def test_cpf_hash_is_deterministic_with_same_salt():
+    ctx1 = _fake_context()
+    ctx2 = _fake_context()
+    request1 = _request_with_text("cpf 111.444.777-35")
+    request2 = _request_with_text("cpf 111.444.777-35")
+
+    mask_pii(ctx1, request1)
+    mask_pii(ctx2, request2)
+
+    text1 = request1.contents[0].parts[0].text
+    text2 = request2.contents[0].parts[0].text
+    # Mesmo CPF, mesmo salt (fixo via env var) -> mesmo hash em sessões
+    # diferentes -- é isso que permite correlação sem guardar o CPF cru.
+    assert text1 == text2
+
+
+def test_credit_card_blocks_entire_message():
+    ctx = _fake_context()
+    request = _request_with_text("meu cartão é 4532 0151 1283 0366, pode cobrar?")
+
+    result = mask_pii(ctx, request)
+
+    assert result is not None  # curto-circuitou a chamada ao LLM
+    assert "cancel" not in result.content.parts[0].text.lower()
+    assert len(ctx.state[STATE_GUARDRAIL_FLAGS]) == 1
+    assert "cartão" in ctx.state[STATE_GUARDRAIL_FLAGS][0]
+
+
+def test_ordinary_text_passes_through_unchanged():
+    ctx = _fake_context()
+    request = _request_with_text("gostaria de saber sobre os planos de vocês")
+    original_text = request.contents[0].parts[0].text
+
+    result = mask_pii(ctx, request)
+
+    assert result is None
+    assert request.contents[0].parts[0].text == original_text
+
+
+def test_unmask_reverses_tokens():
+    ctx = _fake_context()
+    # Simula um token map já populado por uma mensagem anterior
+    ctx.state[STATE_PII_TOKEN_MAP] = {"[PERSON_1]": "Danilo Henrique"}
+
+    response = types.Content(
+        role="model",
+        parts=[types.Part(text="Olá [PERSON_1], tudo bem?")],
+    )
+    from google.adk.models import LlmResponse
+
+    llm_response = LlmResponse(content=response)
+
+    result = unmask_pii(ctx, llm_response)
+
+    assert result is not None
+    assert result.content.parts[0].text == "Olá Danilo Henrique, tudo bem?"
+
+
+def test_unmask_is_noop_without_token_map():
+    ctx = _fake_context()
+    from google.adk.models import LlmResponse
+
+    llm_response = LlmResponse(
+        content=types.Content(role="model", parts=[types.Part(text="Olá!")])
+    )
+
+    result = unmask_pii(ctx, llm_response)
+
+    assert result is None
+
+
+def test_missing_salt_raises_clear_error(monkeypatch):
+    monkeypatch.delenv("PII_HASH_SALT", raising=False)
+    ctx = _fake_context()
+    request = _request_with_text("cpf 111.444.777-35")
+
+    with pytest.raises(RuntimeError, match="PII_HASH_SALT"):
+        mask_pii(ctx, request)
+SDR_PART2_EOF
+
+echo "  - tests/test_smoke.py"
+cat > "$TARGET_DIR/tests/test_smoke.py" <<'SDR_PART2_EOF'
+"""
+Smoke test — valida a topologia do sistema multi-agente SEM fazer nenhuma
+chamada real de API. Isso é intencional: esse teste roda em CI sem
+precisar de OPENROUTER_API_KEY, e existe só pra travar erros estruturais
+(ex: alguém troca um AgentTool pelo agente errado, ou description fica
+vazia).
+
+Nota de arquitetura: o Orchestrator consulta os especialistas via
+AgentTool (root_agent.tools), não via sub_agents/transfer_to_agent — ver
+docstring de app/agents/orchestrator.py para o porquê dessa escolha.
+
+A Parte 6 vai adicionar testes de comportamento de verdade (eval set +
+LLM-as-judge), que aí sim fazem chamadas reais e custam dinheiro/tempo —
+por isso ficam separados deste smoke test.
+"""
+
+from google.adk.tools.agent_tool import AgentTool
+
+from app.agents import root_agent
+
+_EXPECTED_SPECIALIST_NAMES = {
+    "QualificationAgent",
+    "KnowledgeAgent",
+    "ObjectionHandlingAgent",
+    "SchedulingAgent",
+    "EscalateToHumanAgent",
+}
+
+
+def _specialist_agents():
+    """Extrai os agentes especialistas de dentro dos AgentTool do Orchestrator."""
+    return [tool.agent for tool in root_agent.tools if isinstance(tool, AgentTool)]
+
+
+def test_orchestrator_has_no_sub_agents():
+    # Confirma a escolha de arquitetura: o Orchestrator não usa
+    # sub_agents (transferência permanente), só AgentTool (consulta
+    # pontual). Um sub_agent aparecendo aqui seria sinal de regressão
+    # para o padrão antigo que causou os bugs de transfer_to_agent.
+    assert root_agent.sub_agents == []
+
+
+def test_orchestrator_consults_all_specialists_via_agent_tool():
+    actual_names = {agent.name for agent in _specialist_agents()}
+    assert actual_names == _EXPECTED_SPECIALIST_NAMES
+
+
+def test_every_specialist_has_a_routable_description():
+    # Sem description, o Orchestrator não tem base pra decidir qual
+    # AgentTool chamar — isso quebra o sistema silenciosamente.
+    for agent in _specialist_agents():
+        assert agent.description and len(agent.description.strip()) > 20, (
+            f"{agent.name} tem description ausente ou curta demais para "
+            "roteamento confiável"
+        )
+
+
+def test_specialists_have_no_parent_agent():
+    # Confirma que os especialistas NÃO fazem parte de uma árvore de
+    # sub_agents — é isso que garante que eles nunca ganham a ferramenta
+    # transfer_to_agent para começar (a causa raiz dos dois bugs que já
+    # depuramos manualmente: google/adk-python#1038 e #3850).
+    for agent in _specialist_agents():
+        assert agent.parent_agent is None, (
+            f"{agent.name} tem parent_agent definido — isso reintroduziria "
+            "a ferramenta transfer_to_agent e os bugs associados a ela"
+        )
+
+
+def test_scheduling_agent_tools_are_registered():
+    scheduling_agent = next(
+        agent for agent in _specialist_agents() if agent.name == "SchedulingAgent"
+    )
+    tool_names = {tool.__name__ for tool in scheduling_agent.tools}
+    assert tool_names == {"check_availability", "book_meeting"}
+
+
+def test_every_agent_masks_pii_before_calling_the_model():
+    # Defesa em profundidade: TODO agente (Orchestrator + especialistas)
+    # precisa mascarar PII antes de chamar seu próprio modelo — mesmo
+    # que hoje só o Orchestrator receba texto cru do usuário, um futuro
+    # tool de especialista (Parte 4+) poderia trazer PII de outro lugar.
+    from app.agents.pii.masking import mask_pii
+
+    all_agents = [root_agent, *_specialist_agents()]
+    for agent in all_agents:
+        assert agent.before_model_callback is mask_pii, (
+            f"{agent.name} não tem mask_pii registrado em before_model_callback"
+        )
+
+
+def test_only_orchestrator_unmasks_pii():
+    # unmask_pii só pode estar no Orchestrator -- ele é o único ponto de
+    # saída pro usuário. Se algum especialista também desmascarasse, PII
+    # voltaria pro contexto do Orchestrator antes da resposta final.
+    from app.agents.pii.masking import unmask_pii
+
+    assert root_agent.after_model_callback is unmask_pii
+
+    for agent in _specialist_agents():
+        assert agent.after_model_callback is not unmask_pii, (
+            f"{agent.name} não deveria desmascarar PII por conta própria"
+        )
+SDR_PART2_EOF
+
+echo "  - .env.example"
+cat > "$TARGET_DIR/.env.example" <<'SDR_PART2_EOF'
+# === OpenRouter ===
+# Chave da sua conta OpenRouter (https://openrouter.ai/keys)
+OPENROUTER_API_KEY=sk-or-v1-xxxxxxxxxxxxxxxxxxxxx
+
+# === LiteLLM Proxy ===
+# URL do proxy LiteLLM rodando localmente (docker-compose ou `litellm --config`)
+LITELLM_PROXY_URL=http://localhost:4000
+# "Master key" / virtual key configurada no proxy (ver litellm_proxy/config.yaml)
+LITELLM_PROXY_KEY=sk-local-master-key
+
+# === App ===
+SDR_APP_NAME=sdr-bot
+
+# === PII (Parte 2) ===
+# Salt fixo e secreto usado no hash de CPF/CNPJ (nunca reversível,
+# usado só pra correlação "é o mesmo lead de antes?"). Gere com:
+#   python -c "import secrets; print(secrets.token_hex(32))"
+# NUNCA reutilize o mesmo salt entre ambientes (dev/staging/produção).
+PII_HASH_SALT=
+SDR_PART2_EOF
+
+echo "  - pyproject.toml"
+cat > "$TARGET_DIR/pyproject.toml" <<'SDR_PART2_EOF'
+[project]
+name = "sdr-agent"
+version = "0.1.0"
+description = "SDR Bot multi-agente (Google ADK + LiteLLM/OpenRouter) — portfolio de engenharia de IA em produção"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "google-adk>=1.0.0",
+    "litellm>=1.55.0",
+    "python-dotenv>=1.0.1",
+    "fastapi>=0.115.0",
+    "uvicorn[standard]>=0.32.0",
+    "presidio-analyzer>=2.2.360",
+    "presidio-anonymizer>=2.2.360",
+    "spacy>=3.8.0,<3.9.0",
+    "pt-core-news-lg",
+]
+
+# pt_core_news_lg não está no PyPI (modelos do spaCy são distribuídos como
+# wheels diretas nos releases do GitHub) — apontamos a dependência acima
+# para essa URL. Versão 3.8.0 é a compatível com spacy>=3.8,<3.9 conforme
+# https://raw.githubusercontent.com/explosion/spacy-models/master/compatibility.json
+[tool.uv.sources]
+pt-core-news-lg = { url = "https://github.com/explosion/spacy-models/releases/download/pt_core_news_lg-3.8.0/pt_core_news_lg-3.8.0-py3-none-any.whl" }
+
+# Dependências de desenvolvimento/CI (PEP 735) — nunca instaladas na
+# imagem de produção. Isso é o motivo real da migração: com
+# requirements.txt, o Dockerfile instalava pytest dentro do container
+# que vai pro Cloud Run. Com dependency-groups, `uv sync --no-dev` no
+# build de produção simplesmente não inclui nada daqui.
+[dependency-groups]
+dev = [
+    "pytest>=8.0.0",
+    "pytest-asyncio>=0.24.0",
+    "httpx>=0.27.0",
+    "ruff>=0.7.0",
+]
+
+[tool.pytest.ini_options]
+pythonpath = ["."]
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP"]
+SDR_PART2_EOF
+
+echo "  - uv.lock"
+cat > "$TARGET_DIR/uv.lock" <<'SDR_PART2_EOF'
 version = 1
 revision = 3
 requires-python = ">=3.12"
@@ -2937,3 +4138,411 @@ sdist = { url = "https://files.pythonhosted.org/packages/b9/d8/eab98a517c14134c0
 wheels = [
     { url = "https://files.pythonhosted.org/packages/3a/13/547360d81e6d88d58492968ffda9f9542854f11310ee556fef14260cc886/zipp-4.1.0-py3-none-any.whl", hash = "sha256:25ad4e16390cd314347dd8f1de67a2ac538ae658ed4ab9db16029c07c188e97f", size = 10238, upload-time = "2026-05-18T20:08:57.045Z" },
 ]
+SDR_PART2_EOF
+
+echo "  - README.md"
+cat > "$TARGET_DIR/README.md" <<'SDR_PART2_EOF'
+# SDR Bot — Sistema Multi-Agente (Partes 1 e 2: Esqueleto + PII)
+
+Chatbot SDR (Sales Development Representative) construído com **Google ADK**,
+desenhado para demonstrar, na prática, os requisitos técnicos de vagas de
+LLM/AI Engineer sênior focadas em produção: orquestração multi-agente,
+guardrails, mascaramento de PII, RAG avaliado e observabilidade.
+
+Este projeto é dividido em partes incrementais. Este README cobre as
+**Partes 1 e 2**.
+
+## O que existe nesta parte
+
+- Hierarquia multi-agente real no ADK: 1 `OrchestratorAgent` (raiz) +
+  5 agentes especialistas (`QualificationAgent`, `KnowledgeAgent`,
+  `ObjectionHandlingAgent`, `SchedulingAgent`, `EscalateToHumanAgent`),
+  consultados via **AgentTool** — não via `sub_agents`/`transfer_to_agent`
+  (ver docstring de `app/agents/orchestrator.py` para o porquê: usar
+  `sub_agents` causou dois bugs reais de transferência não intencional
+  entre agentes durante testes manuais, rastreados a issues abertas do
+  ADK — google/adk-python#1038 e #3850).
+- O Orchestrator decide qual especialista **consultar** (como uma função)
+  com base na `description` de cada um, recebe a resposta de volta, e
+  permanece no controle da conversa em todo turno — nenhum especialista
+  assume a conversa permanentemente.
+- Estado compartilhado (`session.state`) com contrato documentado em
+  `app/agents/session/state_schema.py`.
+- Camada de modelo desacoplada: cada agente usa `LiteLlm` apontando para
+  um **LiteLLM Proxy self-hosted**, que por sua vez roteia para modelos na
+  **OpenRouter** — ver `litellm_proxy/config.yaml` para o mapeamento
+  modelo-por-agente e a lógica de fallback.
+- Um agente com tools reais (`SchedulingAgent`), para validar tool-calling
+  ponta a ponta através do proxy antes de mexer em tools mais sensíveis.
+- **Mascaramento de PII (Parte 2)**: Presidio + recognizers customizados
+  para CPF/CNPJ (com validação real de dígito verificador) + telefone BR
+  (via `phonenumbers`) + spaCy `pt_core_news_lg` para nomes — ver seção
+  dedicada abaixo.
+- Smoke tests da topologia + testes de PII (`tests/`) que rodam sem
+  precisar de chave de API (a única exceção é o download do modelo spaCy
+  no `uv sync`, que acontece uma vez).
+
+## O que **não** está aqui ainda (de propósito)
+
+| Falta | Onde entra |
+|---|---|
+| Guardrails completos / mitigação de prompt injection | Parte 3 |
+| RAG real + MCP Server para o KnowledgeAgent | Parte 4 |
+| LangFuse + Phoenix (observabilidade) | Parte 5 |
+| Golden eval set + LLM-as-judge + regressão | Parte 6 |
+
+Cada agente tem comentários `TODO Parte N` no código exatamente nos pontos
+onde essas camadas vão se conectar — não são promessas soltas, são pontos
+de extensão já identificados na arquitetura.
+
+## Como rodar
+
+### 1. Pré-requisitos
+
+```bash
+# Instala o uv (gerenciador de projeto/dependências), se ainda não tiver
+curl -LsSf https://astral.sh/uv/install.sh | sh
+
+# Cria o ambiente virtual e instala tudo (runtime + dev) a partir do
+# uv.lock, com versões travadas — reprodutível, não "funciona na minha
+# máquina"
+uv sync
+```
+
+Não precisa ativar o `.venv` manualmente — use `uv run <comando>` (ex:
+`uv run pytest`, `uv run python -m app.main`), que já roda dentro do
+ambiente certo.
+
+### 2. Configurar variáveis de ambiente
+
+```bash
+cp .env.example .env
+# edite .env e preencha OPENROUTER_API_KEY (https://openrouter.ai/keys)
+
+# gere e preencha também PII_HASH_SALT (obrigatório -- sem ele, o
+# mascaramento de CPF/CNPJ falha alto, de propósito, em vez de usar
+# um salt inseguro por padrão):
+python3 -c "import secrets; print(secrets.token_hex(32))"
+```
+
+### 3. Subir o LiteLLM Proxy
+
+```bash
+cd litellm_proxy
+docker compose up
+```
+
+Isso expõe um endpoint OpenAI-compatible em `http://localhost:4000`, que
+roteia cada alias (`orchestrator-model`, `qualification-model`, etc.) para
+o modelo real configurado em `config.yaml` na OpenRouter.
+
+Alternativa sem Docker:
+
+```bash
+uvx --from 'litellm[proxy]' litellm --config litellm_proxy/config.yaml --port 4000
+```
+
+### 4. Rodar o bot
+
+Em outro terminal, na raiz do projeto:
+
+```bash
+uv run python -m app.main
+```
+
+Exemplo de conversa esperada — note que o autor exibido é sempre
+`OrchestratorAgent` agora (ele consulta o especialista internamente via
+AgentTool e entrega a resposta final; ver trade-off documentado em
+`app/agents/orchestrator.py`):
+
+```
+Você: Oi, vi vocês no LinkedIn
+[OrchestratorAgent] Oi! Que bom que você chegou até a gente...
+
+Você: quanto custa o plano?
+[OrchestratorAgent] Sobre os planos...
+```
+
+### 6. Interface visual do ADK (`adk web`)
+
+O ADK inclui uma UI de desenvolvimento que mostra a árvore de agentes, o
+histórico de eventos turno a turno, e o payload exato de cada chamada de
+tool (nome, argumentos, retorno) — útil sobretudo para depurar problemas
+de tool-calling sem precisar ler traceback.
+
+```bash
+uv run adk web app/agents
+```
+
+Abra `http://127.0.0.1:8000` no navegador. O agente aparece na UI com o
+nome `agents` (nome da pasta) — isso é esperado, não é o nome de nenhum
+agente nosso especificamente.
+
+**Detalhe não-óbvio, documentado aqui porque nos custou tempo depurando**:
+o ADK decide como escanear a pasta baseado numa convenção específica —
+`is_single_agent_directory()` (em `google/adk/cli/utils/agent_loader.py`)
+procura por um arquivo chamado literalmente `agent.py` (ou
+`root_agent.yaml`) diretamente na pasta apontada. Sem isso, o ADK assume
+que a pasta é um **diretório pai contendo vários agentes** e escaneia
+*suas subpastas* como se cada uma fosse um agente separado — no nosso
+caso, isso faria o ADK escanear `config/` e `session/` (que não têm
+`root_agent`) em vez do próprio pacote `agents`, e a UI aparecia vazia,
+sem nenhum erro explícito.
+
+É por isso que existe `app/agents/agent.py` — um arquivo pequeno,
+somente com `from .orchestrator import root_agent`, cuja única função é
+satisfazer essa convenção. É também o motivo de `config/` e `session/`
+estarem aninhados dentro de `app/agents/` (não como pastas irmãs de
+`app/agents/`): o ADK isola a pasta apontada como raiz de import sem
+visibilidade nenhuma para pastas irmãs via import relativo — então tudo
+que os agentes precisam importar precisa estar dentro da própria pasta
+que o `adk web` aponta.
+
+### 7. Rodar os testes
+
+```bash
+uv run pytest
+```
+
+## Arquitetura (visão desta parte)
+
+```
+Usuário (CLI)
+      │
+      ▼
+OrchestratorAgent (LlmAgent, tools=[AgentTool(...), ...])
+      │  consulta o especialista certo com base na description,
+      │  recebe a resposta de volta, permanece no controle
+      ├── QualificationAgent
+      ├── KnowledgeAgent        (RAG real chega na Parte 4)
+      ├── ObjectionHandlingAgent
+      ├── SchedulingAgent        (único com tools nesta parte)
+      └── EscalateToHumanAgent
+      │
+      ▼  model=LiteLlm(model="litellm_proxy/<alias>", api_base=..., api_key=...)
+LiteLLM Proxy (Docker, litellm_proxy/config.yaml)
+      │  resolve alias -> modelo real + fallback
+      ▼
+OpenRouter ──► Claude 3.5 Sonnet / GPT-4o-mini / Llama 3.1 (fallback)
+```
+
+## CI/CD (GitLab) e deploy na GCP
+
+### Modelo de branches
+
+```
+feature branches ──MR──► develop ──MR──► main
+   (trabalho acontece)   (integração,      (só deploy — nada mais)
+                          default branch
+                          do repositório)
+```
+
+- **`develop`** é a branch padrão do repositório (configurar em Settings
+  → Repository → Default branch). Toda feature branch abre MR contra
+  ela. `lint`/`test`/`docker_build_check` rodam em qualquer MR e em todo
+  push pra `develop` — feedback rápido, sem tocar em nada de GCP.
+- **`main`** só recebe merge vindo de `develop`, quando o conjunto de
+  mudanças está pronto pra ir pro ar. É a **única** branch que os jobs
+  `build_and_push`/`deploy_*` reconhecem — um push direto em `develop`
+  nunca aciona deploy, só em `main`.
+- Deliberadamente **não** é GitFlow completo (sem release/hotfix
+  branches) — pra um projeto deste porte, esse processo extra não paga
+  o custo de manutenção.
+- Recomendado: proteger `main` em Settings → Repository → Protected
+  branches (só merge via MR, sem push direto).
+
+Isso é o motivo de `.gitlab-ci.yml` usar nomes de branch explícitos
+(`"develop"`, `"main"`) nas regras, em vez de `$CI_DEFAULT_BRANCH` — uma
+vez que "branch padrão" e "branch que decide deploy" são conceitos
+diferentes aqui, uma variável só não cobre os dois.
+
+### Pipeline
+
+O pipeline (`.gitlab-ci.yml`) é evolutivo, em duas camadas:
+
+1. **Sempre roda, sem credencial nenhuma**: `lint`, `test` (smoke tests,
+   sem chamada real de LLM) e `docker_build_check` (valida que os
+   Dockerfiles buildam) — em qualquer MR e em push pra `develop` ou
+   `main`. Isso mantém o pipeline verde desde o primeiro commit, mesmo
+   antes de qualquer configuração de nuvem.
+2. **Só aparece quando a GCP estiver configurada E o commit for em
+   `main`**: `build_and_push` (Artifact Registry) e os dois `deploy_*`
+   (Cloud Run), condicionados à variável `$GCP_PROJECT_ID` existir no
+   projeto GitLab.
+
+Arquitetura de deploy: dois serviços Cloud Run — `litellm-proxy` (o
+gateway pra OpenRouter) e `sdr-bot-api` (a API FastAPI sobre o sistema de
+agentes), o segundo apontando pro primeiro via `LITELLM_PROXY_URL`.
+
+### Configurando deploy na GCP (rodar uma vez, fora do pipeline)
+
+```bash
+# 1. Habilitar APIs necessárias
+gcloud services enable run.googleapis.com artifactregistry.googleapis.com \
+    iamcredentials.googleapis.com secretmanager.googleapis.com
+
+# 2. Criar repositório no Artifact Registry
+gcloud artifacts repositories create sdr-bot-repo \
+    --repository-format=docker --location=us-central1
+
+# 3. Criar service account que o pipeline vai impersonar
+gcloud iam service-accounts create gitlab-ci-deployer \
+    --display-name="GitLab CI/CD deployer"
+
+# Dar as permissões mínimas necessárias (Artifact Registry + Cloud Run)
+gcloud projects add-iam-policy-binding "$GCP_PROJECT_ID" \
+    --member="serviceAccount:gitlab-ci-deployer@${GCP_PROJECT_ID}.iam.gserviceaccount.com" \
+    --role="roles/artifactregistry.writer"
+gcloud projects add-iam-policy-binding "$GCP_PROJECT_ID" \
+    --member="serviceAccount:gitlab-ci-deployer@${GCP_PROJECT_ID}.iam.gserviceaccount.com" \
+    --role="roles/run.admin"
+gcloud projects add-iam-policy-binding "$GCP_PROJECT_ID" \
+    --member="serviceAccount:gitlab-ci-deployer@${GCP_PROJECT_ID}.iam.gserviceaccount.com" \
+    --role="roles/iam.serviceAccountUser"
+
+# 4. Criar o Workload Identity Pool + Provider pro GitLab
+gcloud iam workload-identity-pools create gitlab-pool \
+    --location="global" --display-name="GitLab CI"
+
+gcloud iam workload-identity-pools providers create-oidc gitlab-provider \
+    --location="global" --workload-identity-pool="gitlab-pool" \
+    --issuer-uri="https://gitlab.com" \
+    --attribute-mapping="google.subject=assertion.sub,attribute.repository=assertion.project_path" \
+    --attribute-condition="assertion.project_path == '<seu-namespace>/<seu-repo>'"
+
+# 5. Permitir que a identidade federada do GitLab impersone a service account
+gcloud iam service-accounts add-iam-policy-binding \
+    "gitlab-ci-deployer@${GCP_PROJECT_ID}.iam.gserviceaccount.com" \
+    --role="roles/iam.workloadIdentityUser" \
+    --member="principalSet://iam.googleapis.com/projects/${GCP_PROJECT_NUMBER}/locations/global/workloadIdentityPools/gitlab-pool/attribute.repository/<seu-namespace>/<seu-repo>"
+
+# 6. Guardar os segredos de runtime no Secret Manager (não em CI/CD variables)
+echo -n "sua-chave-openrouter" | gcloud secrets create openrouter-api-key --data-file=-
+echo -n "sua-master-key-do-proxy" | gcloud secrets create litellm-proxy-key --data-file=-
+```
+
+### Variáveis a configurar no GitLab (Settings > CI/CD > Variables)
+
+| Variável | Valor |
+|---|---|
+| `GCP_PROJECT_ID` | ID do projeto GCP |
+| `GCP_PROJECT_NUMBER` | Número do projeto (`gcloud projects describe`) |
+| `GCP_REGION` / `AR_REGION` | ex: `us-central1` |
+| `AR_REPOSITORY` | `sdr-bot-repo` |
+| `WIF_POOL_ID` | `gitlab-pool` |
+| `WIF_PROVIDER_ID` | `gitlab-provider` |
+| `WIF_SERVICE_ACCOUNT` | `gitlab-ci-deployer@<project-id>.iam.gserviceaccount.com` |
+
+Nenhuma chave JSON de service account é armazenada em lugar nenhum — a
+autenticação usa o ID token OIDC que o próprio GitLab emite por job
+(`id_tokens` no `.gitlab-ci.yml`), trocado por uma credencial federada de
+curta duração via `gcloud iam workload-identity-pools create-cred-config`.
+
+## Mascaramento de PII (Parte 2)
+
+### Onde a máscara acontece — desenho de "perímetro"
+
+O Orchestrator é o único ponto de entrada (recebe texto cru do usuário)
+e o único ponto de saída (entrega a resposta final) de todo o sistema
+— consequência direta da migração pra `AgentTool` na Parte 1. Por isso:
+
+- **Todo agente** (Orchestrator + 5 especialistas) registra `mask_pii`
+  em `before_model_callback` — mascarar em texto já mascarado é
+  idempotente (não-operação), então isso é defesa em profundidade
+  barata, não redundância real hoje. Importa quando a Parte 4 der a
+  algum especialista uma tool que traga dado de fora (ex: CRM).
+- **Só o Orchestrator** registra `unmask_pii` em `after_model_callback`
+  — desmascarar em qualquer outro lugar arriscaria PII crua voltando
+  pro contexto do Orchestrator antes da resposta final estar pronta.
+
+```
+Usuário (texto cru, pode ter PII)
+      │
+      ▼
+OrchestratorAgent.before_model_callback  ← mask_pii (entrada)
+      │  (a partir daqui, nenhum LLM do sistema vê PII crua)
+      ▼
+Orchestrator decide consultar um especialista (AgentTool)
+      │
+      ▼
+Specialist.before_model_callback  ← mask_pii (defesa em profundidade,
+      │                               normalmente não-operação)
+      ▼
+Specialist responde (ainda mascarado)
+      │
+      ▼
+Resultado volta pro Orchestrator como retorno de tool (ainda mascarado)
+      │
+      ▼
+OrchestratorAgent.after_model_callback  ← unmask_pii (só aqui)
+      │
+      ▼
+Usuário recebe o nome real, nunca um token
+```
+
+### As três camadas
+
+| Camada | Entidades | Ação | Por quê |
+|---|---|---|---|
+| 1 — Token reversível | `PERSON`, `EMAIL_ADDRESS`, `TELEFONE_BR` | `[PERSON_1]`, `[EMAIL_1]`... — mapa em `session.state`, revertido só na saída | Útil pra conversa soar natural |
+| 2 — Hash com salt | `CPF_BR`, `CNPJ_BR` | SHA-256 + salt fixo secreto, nunca revertido | O bot nunca precisa "falar" um CPF de volta — só correlacionar |
+| 3 — Bloqueio total | `CREDIT_CARD` | Mensagem nunca chega ao LLM; resposta de recusa curto-circuitada | Não existe motivo legítimo pra dado de cartão numa conversa de SDR |
+
+**Detalhe de segurança que importa citar em entrevista**: hash de CPF
+sem salt secreto não protege quase nada — 11 dígitos é um espaço de
+busca pequeno o suficiente pra força bruta trivial. O salt em
+`PII_HASH_SALT` precisa ser fixo (pra permitir correlação entre
+sessões: "é o mesmo lead de antes?") **e** secreto (fora do código,
+via `.env` local / Secret Manager em produção) — um hash sem essas duas
+propriedades juntas não é proteção de verdade.
+
+### Recognizers customizados vs. built-in do Presidio
+
+- `CPF_BR`, `CNPJ_BR`: customizados (`app/agents/pii/recognizers.py`),
+  com validação real de dígito verificador — um número no formato de
+  CPF que falha o dígito verificador não é tratado como PII (evita
+  falso positivo em qualquer ID de 11 dígitos). Também rejeita
+  explicitamente sequências tipo `111.111.111-11`, que passam no
+  checksum matematicamente mas nunca são CPFs reais.
+- `TELEFONE_BR`: built-in do Presidio (`PhoneRecognizer`, usa
+  `python-phonenumbers`), só reconfigurado pra região `BR` — mais
+  robusto que regex escrita à mão.
+- `CREDIT_CARD`: built-in do Presidio, mas exige atenção — o
+  recognizer padrão tem `supported_language="en"` e é **silenciosamente
+  descartado** ao carregar recognizers pra português (só loga um
+  warning, não falha). Descoberto via teste automatizado, corrigido
+  registrando-o explicitamente com `supported_language="pt"` em
+  `engine.py`.
+- `PERSON`: built-in do Presidio, mas com o backend de NLP trocado pra
+  `pt_core_news_lg` (spaCy) — o padrão do Presidio é treinado em
+  inglês e não reconhece nomes em português de forma confiável.
+
+### Rodando os testes de PII isoladamente
+
+```bash
+uv run pytest tests/test_pii_masking.py -v
+```
+
+A primeira execução carrega o modelo spaCy (~15s); chamadas seguintes
+na mesma sessão de teste reusam o engine cacheado (singleton em
+`engine.py`).
+
+## Próxima parte
+
+**Parte 3**: guardrails mais completos e mitigação de prompt injection —
+generaliza o padrão já usado em `_guardrails.py` (bloquear comportamento
+indesejado via callback) para cobrir tentativas de manipulação de
+prompt, allowlist de ações sensíveis (ex: `book_meeting` só deveria
+confirmar se o lead está qualificado), e validação de saída contra
+políticas de negócio (ex: nunca oferecer desconto não autorizado).
+SDR_PART2_EOF
+
+echo ""
+echo "==> Parte 2 gerada/atualizada com sucesso em $TARGET_DIR"
+echo ""
+echo "Próximos passos:"
+echo "  1. cd $TARGET_DIR && uv sync   # baixa Presidio + spaCy + modelo PT (~500MB)"
+echo "  2. Gere e configure PII_HASH_SALT no .env:"
+echo "     python3 -c \"import secrets; print(secrets.token_hex(32))\""
+echo "  3. uv run pytest tests/test_pii_masking.py -v"
+echo "  4. uv run pytest -v   # suite completa"

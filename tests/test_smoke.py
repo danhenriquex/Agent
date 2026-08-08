@@ -73,3 +73,31 @@ def test_scheduling_agent_tools_are_registered():
     )
     tool_names = {tool.__name__ for tool in scheduling_agent.tools}
     assert tool_names == {"check_availability", "book_meeting"}
+
+
+def test_every_agent_masks_pii_before_calling_the_model():
+    # Defesa em profundidade: TODO agente (Orchestrator + especialistas)
+    # precisa mascarar PII antes de chamar seu próprio modelo — mesmo
+    # que hoje só o Orchestrator receba texto cru do usuário, um futuro
+    # tool de especialista (Parte 4+) poderia trazer PII de outro lugar.
+    from app.agents.pii.masking import mask_pii
+
+    all_agents = [root_agent, *_specialist_agents()]
+    for agent in all_agents:
+        assert agent.before_model_callback is mask_pii, (
+            f"{agent.name} não tem mask_pii registrado em before_model_callback"
+        )
+
+
+def test_only_orchestrator_unmasks_pii():
+    # unmask_pii só pode estar no Orchestrator -- ele é o único ponto de
+    # saída pro usuário. Se algum especialista também desmascarasse, PII
+    # voltaria pro contexto do Orchestrator antes da resposta final.
+    from app.agents.pii.masking import unmask_pii
+
+    assert root_agent.after_model_callback is unmask_pii
+
+    for agent in _specialist_agents():
+        assert agent.after_model_callback is not unmask_pii, (
+            f"{agent.name} não deveria desmascarar PII por conta própria"
+        )

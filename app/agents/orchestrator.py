@@ -33,6 +33,15 @@ específica. Aceitável por ora; pode ser recuperado depois inspecionando
 eventos intermediários, se necessário.
 
 Documentação: https://google.github.io/adk-docs/agents/multi-agents/#agents-as-tools
+
+Parte 2 — mascaramento de PII: este agente é o único ponto de entrada
+(recebe a mensagem crua do usuário) e o único ponto de saída (entrega a
+resposta final) de todo o sistema. Por isso ele é o único que registra
+unmask_pii — reverter tokens em qualquer outro lugar arriscaria vazar
+PII de volta pro contexto antes da resposta final estar pronta. Todos
+os agentes (incluindo este) registram mask_pii, para que nenhum deles
+jamais veja PII crua, mesmo que uma ferramenta futura (Parte 4+) traga
+dado bruto de algum lugar. Ver app/agents/pii/masking.py.
 """
 
 from google.adk.agents import LlmAgent
@@ -42,6 +51,7 @@ from .config.models import get_model_for_role
 from .escalate import escalate_agent
 from .knowledge import knowledge_agent
 from .objection import objection_agent
+from .pii.masking import mask_pii, unmask_pii
 from .qualification import qualification_agent
 from .scheduling import scheduling_agent
 
@@ -81,4 +91,6 @@ root_agent = LlmAgent(
         AgentTool(agent=scheduling_agent),
         AgentTool(agent=escalate_agent),
     ],
+    before_model_callback=mask_pii,
+    after_model_callback=unmask_pii,
 )

@@ -1,11 +1,12 @@
-# SDR Bot — Sistema Multi-Agente (Parte 1: Esqueleto)
+# SDR Bot — Sistema Multi-Agente (Partes 1 e 2: Esqueleto + PII)
 
 Chatbot SDR (Sales Development Representative) construído com **Google ADK**,
 desenhado para demonstrar, na prática, os requisitos técnicos de vagas de
 LLM/AI Engineer sênior focadas em produção: orquestração multi-agente,
 guardrails, mascaramento de PII, RAG avaliado e observabilidade.
 
-Este projeto é dividido em partes incrementais. Este README cobre a **Parte 1**.
+Este projeto é dividido em partes incrementais. Este README cobre as
+**Partes 1 e 2**.
 
 ## O que existe nesta parte
 
@@ -29,15 +30,19 @@ Este projeto é dividido em partes incrementais. Este README cobre a **Parte 1**
   modelo-por-agente e a lógica de fallback.
 - Um agente com tools reais (`SchedulingAgent`), para validar tool-calling
   ponta a ponta através do proxy antes de mexer em tools mais sensíveis.
-- Smoke test da topologia (`tests/test_smoke.py`) que roda sem precisar de
-  chave de API.
+- **Mascaramento de PII (Parte 2)**: Presidio + recognizers customizados
+  para CPF/CNPJ (com validação real de dígito verificador) + telefone BR
+  (via `phonenumbers`) + spaCy `pt_core_news_lg` para nomes — ver seção
+  dedicada abaixo.
+- Smoke tests da topologia + testes de PII (`tests/`) que rodam sem
+  precisar de chave de API (a única exceção é o download do modelo spaCy
+  no `uv sync`, que acontece uma vez).
 
 ## O que **não** está aqui ainda (de propósito)
 
 | Falta | Onde entra |
 |---|---|
-| Mascaramento de PII (Presidio + recognizers BR) | Parte 2 |
-| Guardrails / mitigação de prompt injection | Parte 3 |
+| Guardrails completos / mitigação de prompt injection | Parte 3 |
 | RAG real + MCP Server para o KnowledgeAgent | Parte 4 |
 | LangFuse + Phoenix (observabilidade) | Parte 5 |
 | Golden eval set + LLM-as-judge + regressão | Parte 6 |
@@ -69,6 +74,11 @@ ambiente certo.
 ```bash
 cp .env.example .env
 # edite .env e preencha OPENROUTER_API_KEY (https://openrouter.ai/keys)
+
+# gere e preencha também PII_HASH_SALT (obrigatório -- sem ele, o
+# mascaramento de CPF/CNPJ falha alto, de propósito, em vez de usar
+# um salt inseguro por padrão):
+python3 -c "import secrets; print(secrets.token_hex(32))"
 ```
 
 ### 3. Subir o LiteLLM Proxy
@@ -284,10 +294,100 @@ autenticação usa o ID token OIDC que o próprio GitLab emite por job
 (`id_tokens` no `.gitlab-ci.yml`), trocado por uma credencial federada de
 curta duração via `gcloud iam workload-identity-pools create-cred-config`.
 
+## Mascaramento de PII (Parte 2)
+
+### Onde a máscara acontece — desenho de "perímetro"
+
+O Orchestrator é o único ponto de entrada (recebe texto cru do usuário)
+e o único ponto de saída (entrega a resposta final) de todo o sistema
+— consequência direta da migração pra `AgentTool` na Parte 1. Por isso:
+
+- **Todo agente** (Orchestrator + 5 especialistas) registra `mask_pii`
+  em `before_model_callback` — mascarar em texto já mascarado é
+  idempotente (não-operação), então isso é defesa em profundidade
+  barata, não redundância real hoje. Importa quando a Parte 4 der a
+  algum especialista uma tool que traga dado de fora (ex: CRM).
+- **Só o Orchestrator** registra `unmask_pii` em `after_model_callback`
+  — desmascarar em qualquer outro lugar arriscaria PII crua voltando
+  pro contexto do Orchestrator antes da resposta final estar pronta.
+
+```
+Usuário (texto cru, pode ter PII)
+      │
+      ▼
+OrchestratorAgent.before_model_callback  ← mask_pii (entrada)
+      │  (a partir daqui, nenhum LLM do sistema vê PII crua)
+      ▼
+Orchestrator decide consultar um especialista (AgentTool)
+      │
+      ▼
+Specialist.before_model_callback  ← mask_pii (defesa em profundidade,
+      │                               normalmente não-operação)
+      ▼
+Specialist responde (ainda mascarado)
+      │
+      ▼
+Resultado volta pro Orchestrator como retorno de tool (ainda mascarado)
+      │
+      ▼
+OrchestratorAgent.after_model_callback  ← unmask_pii (só aqui)
+      │
+      ▼
+Usuário recebe o nome real, nunca um token
+```
+
+### As três camadas
+
+| Camada | Entidades | Ação | Por quê |
+|---|---|---|---|
+| 1 — Token reversível | `PERSON`, `EMAIL_ADDRESS`, `TELEFONE_BR` | `[PERSON_1]`, `[EMAIL_1]`... — mapa em `session.state`, revertido só na saída | Útil pra conversa soar natural |
+| 2 — Hash com salt | `CPF_BR`, `CNPJ_BR` | SHA-256 + salt fixo secreto, nunca revertido | O bot nunca precisa "falar" um CPF de volta — só correlacionar |
+| 3 — Bloqueio total | `CREDIT_CARD` | Mensagem nunca chega ao LLM; resposta de recusa curto-circuitada | Não existe motivo legítimo pra dado de cartão numa conversa de SDR |
+
+**Detalhe de segurança que importa citar em entrevista**: hash de CPF
+sem salt secreto não protege quase nada — 11 dígitos é um espaço de
+busca pequeno o suficiente pra força bruta trivial. O salt em
+`PII_HASH_SALT` precisa ser fixo (pra permitir correlação entre
+sessões: "é o mesmo lead de antes?") **e** secreto (fora do código,
+via `.env` local / Secret Manager em produção) — um hash sem essas duas
+propriedades juntas não é proteção de verdade.
+
+### Recognizers customizados vs. built-in do Presidio
+
+- `CPF_BR`, `CNPJ_BR`: customizados (`app/agents/pii/recognizers.py`),
+  com validação real de dígito verificador — um número no formato de
+  CPF que falha o dígito verificador não é tratado como PII (evita
+  falso positivo em qualquer ID de 11 dígitos). Também rejeita
+  explicitamente sequências tipo `111.111.111-11`, que passam no
+  checksum matematicamente mas nunca são CPFs reais.
+- `TELEFONE_BR`: built-in do Presidio (`PhoneRecognizer`, usa
+  `python-phonenumbers`), só reconfigurado pra região `BR` — mais
+  robusto que regex escrita à mão.
+- `CREDIT_CARD`: built-in do Presidio, mas exige atenção — o
+  recognizer padrão tem `supported_language="en"` e é **silenciosamente
+  descartado** ao carregar recognizers pra português (só loga um
+  warning, não falha). Descoberto via teste automatizado, corrigido
+  registrando-o explicitamente com `supported_language="pt"` em
+  `engine.py`.
+- `PERSON`: built-in do Presidio, mas com o backend de NLP trocado pra
+  `pt_core_news_lg` (spaCy) — o padrão do Presidio é treinado em
+  inglês e não reconhece nomes em português de forma confiável.
+
+### Rodando os testes de PII isoladamente
+
+```bash
+uv run pytest tests/test_pii_masking.py -v
+```
+
+A primeira execução carrega o modelo spaCy (~15s); chamadas seguintes
+na mesma sessão de teste reusam o engine cacheado (singleton em
+`engine.py`).
+
 ## Próxima parte
 
-**Parte 2**: camada de PII (Presidio + recognizers customizados para CPF,
-telefone e CNPJ brasileiros) integrada via `before_model_callback` /
-`after_model_callback` do ADK — mascaramento reversível para dados
-"úteis à conversa" (nome, empresa) e redação irreversível para dados que
-nunca deveriam estar ali (número de cartão completo).
+**Parte 3**: guardrails mais completos e mitigação de prompt injection —
+generaliza o padrão já usado em `_guardrails.py` (bloquear comportamento
+indesejado via callback) para cobrir tentativas de manipulação de
+prompt, allowlist de ações sensíveis (ex: `book_meeting` só deveria
+confirmar se o lead está qualificado), e validação de saída contra
+políticas de negócio (ex: nunca oferecer desconto não autorizado).
