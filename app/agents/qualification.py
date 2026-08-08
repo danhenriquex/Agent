@@ -11,6 +11,7 @@ from google.adk.agents import LlmAgent
 
 from ._guardrails import block_unauthorized_transfer
 from .config.models import get_model_for_role
+from .pii.masking import mask_pii
 from .session.state_schema import STATE_QUALIFICATION_NOTES
 
 qualification_agent = LlmAgent(
@@ -40,5 +41,6 @@ qualification_agent = LlmAgent(
     # transfer_to_agent para começar; não há transferência a bloquear. O
     # guardrail abaixo fica como defesa em profundidade, não a proteção
     # primária (ver docstring de _guardrails.py para o histórico do bug).
+    before_model_callback=mask_pii,
     after_model_callback=block_unauthorized_transfer,
 )
