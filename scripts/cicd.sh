@@ -8,6 +8,7 @@
 #   - pyproject.toml/uv.lock/.python-version atualizados (adiciona
 #     fastapi/uvicorn as deps de runtime e httpx/ruff ao grupo dev)
 #   - README.md atualizado com a secao de deploy na GCP
+#   - Makefile com atalhos (make web / make cli / make test / etc)
 #
 # Pré-requisito: rode isso DEPOIS de part1_setup.sh — este script só
 # adiciona a camada de CI/CD por cima do que já existe, não recria o
@@ -427,6 +428,100 @@ deploy_sdr_bot_api:
   rules:
     - if: '$GCP_PROJECT_ID && $CI_COMMIT_BRANCH == "main"'
       when: manual
+SDR_CICD_EOF
+
+echo "  - Makefile"
+cat > "$TARGET_DIR/Makefile" <<'SDR_CICD_EOF'
+SHELL := /bin/bash
+.DEFAULT_GOAL := help
+
+PROXY_COMPOSE := litellm_proxy/docker-compose.yml
+AGENTS_DIR := app/agents
+PROXY_READY_URL := http://localhost:4000/health/readiness
+PROXY_READY_TIMEOUT := 30
+
+.PHONY: help sync proxy-up proxy-down proxy-restart proxy-logs proxy-status \
+        web cli api test test-pii lint clean
+
+help:
+	@echo "Comandos disponíveis:"
+	@echo ""
+	@echo "  make sync          - uv sync (instala/atualiza dependências)"
+	@echo ""
+	@echo "  make web           - sobe o proxy (se preciso) e abre a UI do adk web"
+	@echo "  make cli           - sobe o proxy (se preciso) e roda o bot via CLI"
+	@echo "  make api           - sobe o proxy (se preciso) e roda a API FastAPI (--reload)"
+	@echo ""
+	@echo "  make proxy-up      - sobe o LiteLLM Proxy e espera ele responder de verdade"
+	@echo "  make proxy-down    - derruba o LiteLLM Proxy"
+	@echo "  make proxy-restart - derruba e sobe de novo (útil após editar .env)"
+	@echo "  make proxy-logs    - segue os logs do proxy"
+	@echo "  make proxy-status  - mostra se o container está de pé"
+	@echo ""
+	@echo "  make test          - roda a suite de testes completa"
+	@echo "  make test-pii      - roda só os testes de PII (mais rápido pra iterar)"
+	@echo "  make lint          - roda o ruff"
+	@echo "  make clean         - remove __pycache__/.pytest_cache/.ruff_cache"
+
+sync:
+	uv sync
+
+# Sobe o proxy e espera de verdade ele responder antes de liberar o
+# próximo comando -- isso existe especificamente porque "docker compose
+# up -d" retorna assim que o CONTAINER inicia, não quando o processo
+# LiteLLM lá dentro termina de registrar os modelos e está pronto pra
+# aceitar conexão. Sem esperar isso, curl/a aplicação podem chegar
+# primeiro e receber "empty reply from server" -- foi exatamente o que
+# aconteceu depurando isso manualmente antes deste Makefile existir.
+proxy-up:
+	@docker compose -f $(PROXY_COMPOSE) up -d
+	@echo -n "Esperando o proxy ficar pronto"
+	@for i in $$(seq 1 $(PROXY_READY_TIMEOUT)); do \
+		if curl -sf $(PROXY_READY_URL) > /dev/null 2>&1; then \
+			echo " OK"; \
+			exit 0; \
+		fi; \
+		echo -n "."; \
+		sleep 1; \
+	done; \
+	echo ""; \
+	echo "ERRO: proxy não respondeu após $(PROXY_READY_TIMEOUT)s."; \
+	echo "Rode 'make proxy-logs' para ver o que aconteceu."; \
+	exit 1
+
+proxy-down:
+	docker compose -f $(PROXY_COMPOSE) down
+
+proxy-restart: proxy-down proxy-up
+
+proxy-logs:
+	docker compose -f $(PROXY_COMPOSE) logs -f litellm-proxy
+
+proxy-status:
+	docker compose -f $(PROXY_COMPOSE) ps
+
+web: proxy-up
+	uv run adk web $(AGENTS_DIR)
+
+cli: proxy-up
+	uv run python -m app.main
+
+api: proxy-up
+	uv run uvicorn app.api:app --reload
+
+test:
+	uv run pytest -v
+
+test-pii:
+	uv run pytest tests/test_pii_masking.py -v
+
+lint:
+	uv run ruff check app tests
+
+clean:
+	find . -name "__pycache__" -not -path "*/.venv/*" -exec rm -rf {} + 2>/dev/null || true
+	find . -name ".pytest_cache" -not -path "*/.venv/*" -exec rm -rf {} + 2>/dev/null || true
+	find . -name ".ruff_cache" -not -path "*/.venv/*" -exec rm -rf {} + 2>/dev/null || true
 SDR_CICD_EOF
 
 echo "  - pyproject.toml"
@@ -2786,6 +2881,33 @@ Cada agente tem comentários `TODO Parte N` no código exatamente nos pontos
 onde essas camadas vão se conectar — não são promessas soltas, são pontos
 de extensão já identificados na arquitetura.
 
+## Atalhos com Makefile
+
+Depois do primeiro setup manual acima, o dia a dia fica mais rápido via
+`make` — em especial `make web` resolve o problema de "quero testar na
+UI do adk toda hora": ele sobe o proxy (se ainda não estiver de pé),
+**espera de verdade ele responder** antes de prosseguir (isso existe
+porque `docker compose up -d` retorna assim que o container inicia, não
+quando o LiteLLM lá dentro termina de registrar os modelos — sem essa
+espera, é fácil bater num "empty reply from server" por pura corrida de
+horário), e só então abre a interface:
+
+```bash
+make web    # proxy + adk web, tudo em um comando
+make cli    # proxy + CLI (app/main.py)
+make api    # proxy + FastAPI com --reload
+
+make proxy-status   # container está de pé?
+make proxy-logs     # acompanhar logs do proxy
+make proxy-restart  # derrubar e subir de novo (necessário após editar .env)
+
+make test    # suite completa
+make lint    # ruff
+make clean   # limpa __pycache__/.pytest_cache/.ruff_cache
+```
+
+Rode `make` (sem alvo) ou `make help` pra ver a lista completa.
+
 ## Como rodar
 
 ### 1. Pré-requisitos
@@ -3037,10 +3159,13 @@ echo ""
 echo "==> CI/CD gerado/atualizado com sucesso em $TARGET_DIR"
 echo ""
 echo "Próximos passos:"
+echo "  Nota: se os agentes vierem da Parte 2 em diante, rode também"
+echo "  part2_setup.sh antes de \"make test\"/\"make web\" -- os arquivos"
+echo "  de agente importam o módulo de PII independente desta camada."
+echo ""
 echo "  1. cd $TARGET_DIR && uv sync   # agora inclui fastapi/uvicorn/ruff/httpx"
-echo "  2. uv run pytest tests/ -v   # confirma que tudo passa localmente"
-echo "  3. uv run ruff check app tests"
-echo "  4. git add . && git commit -m \"ci: pipeline inicial + camada HTTP + uv\""
-echo "  5. git push -u origin main   # o pipeline roda lint+test+build_check"
-echo "  6. Quando quiser ativar deploy na GCP: seguir README.md >"
-echo "     \"Configurando deploy na GCP\" e configurar as variáveis de CI/CD"
+echo "  2. make test   # ou: uv run pytest -v"
+echo "  3. make lint   # ou: uv run ruff check app tests"
+echo "  4. make web    # sobe o proxy e abre a UI do adk web"
+echo "  5. git add . && git commit -m \"ci: pipeline inicial + camada HTTP + uv + Makefile\""
+echo "  6. git push -u origin main   # o pipeline roda lint+test+build_check"
