@@ -4,6 +4,18 @@
 # (esqueleto multi-agente com ADK + LiteLLM Proxy + OpenRouter,
 # empacotado com uv/pyproject.toml).
 #
+# IMPORTANTE: desde a Parte 2, este script SOZINHO não produz mais
+# uma árvore de agentes importável. Os 6 arquivos de agente (aqui)
+# já chamam `from .pii.masking import mask_pii` — a Parte 2 editou
+# esses arquivos NO LUGAR pra fiar o mascaramento de PII em todo
+# agente, em vez de manter isso separado. É uma escolha deliberada
+# (PII é uma preocupação transversal, faz sentido morar na
+# construção do agente), mas o efeito colateral é: rode SEMPRE
+# part1_setup.sh seguido de part2_setup.sh — nunca só o primeiro,
+# a menos que você edite manualmente os imports de PII depois.
+# cicd_setup.sh é independente disso (Docker/CI/Makefile não se
+# importam com o conteúdo interno dos agentes).
+#
 # Uso:
 #   bash part1_setup.sh [diretorio-destino]
 #
@@ -38,6 +50,13 @@ LITELLM_PROXY_KEY=sk-local-master-key
 
 # === App ===
 SDR_APP_NAME=sdr-bot
+
+# === PII (Parte 2) ===
+# Salt fixo e secreto usado no hash de CPF/CNPJ (nunca reversível,
+# usado só pra correlação "é o mesmo lead de antes?"). Gere com:
+#   python -c "import secrets; print(secrets.token_hex(32))"
+# NUNCA reutilize o mesmo salt entre ambientes (dev/staging/produção).
+PII_HASH_SALT=
 SDR_PART1_EOF
 
 echo "  - .gitignore"
@@ -2450,6 +2469,7 @@ from google.adk.agents import LlmAgent
 
 from ._guardrails import block_unauthorized_transfer
 from .config.models import get_model_for_role
+from .pii.masking import mask_pii
 from .session.state_schema import STATE_ESCALATED
 
 escalate_agent = LlmAgent(
@@ -2474,6 +2494,7 @@ escalate_agent = LlmAgent(
     # transfer_to_agent para começar; não há transferência a bloquear. O
     # guardrail abaixo fica como defesa em profundidade, não a proteção
     # primária (ver docstring de _guardrails.py para o histórico do bug).
+    before_model_callback=mask_pii,
     after_model_callback=block_unauthorized_transfer,
 )
 SDR_PART1_EOF
@@ -2494,6 +2515,7 @@ from google.adk.agents import LlmAgent
 
 from ._guardrails import block_unauthorized_transfer
 from .config.models import get_model_for_role
+from .pii.masking import mask_pii
 from .session.state_schema import STATE_LAST_RETRIEVED_CONTEXT
 
 knowledge_agent = LlmAgent(
@@ -2521,6 +2543,7 @@ knowledge_agent = LlmAgent(
     # transfer_to_agent para começar; não há transferência a bloquear. O
     # guardrail abaixo fica como defesa em profundidade, não a proteção
     # primária (ver docstring de _guardrails.py para o histórico do bug).
+    before_model_callback=mask_pii,
     after_model_callback=block_unauthorized_transfer,
 )
 SDR_PART1_EOF
@@ -2536,6 +2559,7 @@ from google.adk.agents import LlmAgent
 
 from ._guardrails import block_unauthorized_transfer
 from .config.models import get_model_for_role
+from .pii.masking import mask_pii
 from .session.state_schema import STATE_OBJECTIONS_RAISED
 
 objection_agent = LlmAgent(
@@ -2563,6 +2587,7 @@ objection_agent = LlmAgent(
     # transfer_to_agent para começar; não há transferência a bloquear. O
     # guardrail abaixo fica como defesa em profundidade, não a proteção
     # primária (ver docstring de _guardrails.py para o histórico do bug).
+    before_model_callback=mask_pii,
     after_model_callback=block_unauthorized_transfer,
 )
 SDR_PART1_EOF
@@ -2604,6 +2629,15 @@ específica. Aceitável por ora; pode ser recuperado depois inspecionando
 eventos intermediários, se necessário.
 
 Documentação: https://google.github.io/adk-docs/agents/multi-agents/#agents-as-tools
+
+Parte 2 — mascaramento de PII: este agente é o único ponto de entrada
+(recebe a mensagem crua do usuário) e o único ponto de saída (entrega a
+resposta final) de todo o sistema. Por isso ele é o único que registra
+unmask_pii — reverter tokens em qualquer outro lugar arriscaria vazar
+PII de volta pro contexto antes da resposta final estar pronta. Todos
+os agentes (incluindo este) registram mask_pii, para que nenhum deles
+jamais veja PII crua, mesmo que uma ferramenta futura (Parte 4+) traga
+dado bruto de algum lugar. Ver app/agents/pii/masking.py.
 """
 
 from google.adk.agents import LlmAgent
@@ -2613,6 +2647,7 @@ from .config.models import get_model_for_role
 from .escalate import escalate_agent
 from .knowledge import knowledge_agent
 from .objection import objection_agent
+from .pii.masking import mask_pii, unmask_pii
 from .qualification import qualification_agent
 from .scheduling import scheduling_agent
 
@@ -2652,6 +2687,8 @@ root_agent = LlmAgent(
         AgentTool(agent=scheduling_agent),
         AgentTool(agent=escalate_agent),
     ],
+    before_model_callback=mask_pii,
+    after_model_callback=unmask_pii,
 )
 SDR_PART1_EOF
 
@@ -2670,6 +2707,7 @@ from google.adk.agents import LlmAgent
 
 from ._guardrails import block_unauthorized_transfer
 from .config.models import get_model_for_role
+from .pii.masking import mask_pii
 from .session.state_schema import STATE_QUALIFICATION_NOTES
 
 qualification_agent = LlmAgent(
@@ -2699,6 +2737,7 @@ qualification_agent = LlmAgent(
     # transfer_to_agent para começar; não há transferência a bloquear. O
     # guardrail abaixo fica como defesa em profundidade, não a proteção
     # primária (ver docstring de _guardrails.py para o histórico do bug).
+    before_model_callback=mask_pii,
     after_model_callback=block_unauthorized_transfer,
 )
 SDR_PART1_EOF
@@ -2722,6 +2761,7 @@ from google.adk.agents import LlmAgent
 
 from ._guardrails import block_unauthorized_transfer
 from .config.models import get_model_for_role
+from .pii.masking import mask_pii
 from .session.state_schema import STATE_MEETING_SLOT
 
 _MOCK_SLOTS = ["terça-feira às 10h", "quarta-feira às 15h", "quinta-feira às 11h"]
@@ -2784,6 +2824,7 @@ scheduling_agent = LlmAgent(
     # transfer_to_agent para começar; não há transferência a bloquear. O
     # guardrail abaixo fica como defesa em profundidade, não a proteção
     # primária (ver docstring de _guardrails.py para o histórico do bug).
+    before_model_callback=mask_pii,
     after_model_callback=block_unauthorized_transfer,
 )
 SDR_PART1_EOF
@@ -3245,15 +3286,47 @@ def test_scheduling_agent_tools_are_registered():
     )
     tool_names = {tool.__name__ for tool in scheduling_agent.tools}
     assert tool_names == {"check_availability", "book_meeting"}
+
+
+def test_every_agent_masks_pii_before_calling_the_model():
+    # Defesa em profundidade: TODO agente (Orchestrator + especialistas)
+    # precisa mascarar PII antes de chamar seu próprio modelo — mesmo
+    # que hoje só o Orchestrator receba texto cru do usuário, um futuro
+    # tool de especialista (Parte 4+) poderia trazer PII de outro lugar.
+    from app.agents.pii.masking import mask_pii
+
+    all_agents = [root_agent, *_specialist_agents()]
+    for agent in all_agents:
+        assert agent.before_model_callback is mask_pii, (
+            f"{agent.name} não tem mask_pii registrado em before_model_callback"
+        )
+
+
+def test_only_orchestrator_unmasks_pii():
+    # unmask_pii só pode estar no Orchestrator -- ele é o único ponto de
+    # saída pro usuário. Se algum especialista também desmascarasse, PII
+    # voltaria pro contexto do Orchestrator antes da resposta final.
+    from app.agents.pii.masking import unmask_pii
+
+    assert root_agent.after_model_callback is unmask_pii
+
+    for agent in _specialist_agents():
+        assert agent.after_model_callback is not unmask_pii, (
+            f"{agent.name} não deveria desmascarar PII por conta própria"
+        )
 SDR_PART1_EOF
 
 echo ""
 echo "==> Parte 1 gerada/atualizada com sucesso em $TARGET_DIR"
 echo ""
 echo "Próximos passos:"
-echo "  1. cd $TARGET_DIR"
-echo "  2. curl -LsSf https://astral.sh/uv/install.sh | sh   # se ainda não tiver uv"
-echo "  3. uv sync"
-echo "  4. cp .env.example .env   # preencha OPENROUTER_API_KEY"
-echo "  5. (cd litellm_proxy && docker compose up -d)"
-echo "  6. uv run python -m app.main"
+echo "  ATENÇÃO: rode também part2_setup.sh antes de instalar/testar --"
+echo "  os arquivos de agente aqui já importam o módulo de PII da Parte 2."
+echo ""
+echo "  1. bash part2_setup.sh $TARGET_DIR   # (e cicd_setup.sh, se quiser)"
+echo "  2. cd $TARGET_DIR"
+echo "  3. curl -LsSf https://astral.sh/uv/install.sh | sh   # se ainda não tiver uv"
+echo "  4. uv sync"
+echo "  5. cp .env.example .env   # preencha OPENROUTER_API_KEY e PII_HASH_SALT"
+echo "  6. (cd litellm_proxy && docker compose up -d)"
+echo "  7. uv run python -m app.main"
