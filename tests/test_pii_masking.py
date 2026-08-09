@@ -178,3 +178,22 @@ def test_missing_salt_raises_clear_error(monkeypatch):
 
     with pytest.raises(RuntimeError, match="PII_HASH_SALT"):
         mask_pii(ctx, request)
+
+
+def test_salt_not_required_when_no_cpf_or_cnpj_present(monkeypatch):
+    # Regressão: PII_HASH_SALT só é necessário pro tier de hash
+    # (CPF/CNPJ). Mascarar um texto que só tem PERSON/EMAIL/TELEFONE
+    # (tier de token, não de hash) nunca deveria exigir o salt -- um
+    # bug real fez exatamente isso (_build_operators construía o
+    # operador de hash incondicionalmente, mesmo sem CPF/CNPJ no
+    # texto), descoberto via test_golden_conversations.py: uma
+    # conversa de qualificação sem nenhum CPF envolvido falhava com
+    # "PII_HASH_SALT não configurado" só por mencionar um nome.
+    monkeypatch.delenv("PII_HASH_SALT", raising=False)
+    ctx = _fake_context()
+    request = _request_with_text("Oi, meu nome é Danilo Henrique")
+
+    result = mask_pii(ctx, request)  # não deveria levantar RuntimeError
+
+    assert result is None
+    assert "[PERSON_1]" in request.contents[0].parts[0].text

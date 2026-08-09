@@ -341,16 +341,30 @@ def _get_or_create_token(token_map: dict, prefix: str, original_value: str) -> s
     return new_token
 
 
-def _build_operators(token_map: dict) -> dict:
+def _build_operators(token_map: dict, entity_types_present: set[str]) -> dict:
+    """Constrói operadores SÓ para os tipos de entidade que apareceram de
+    verdade no texto -- não para todos os tipos conhecidos.
+
+    Isso importa porque o salt (PII_HASH_SALT) só é necessário pro tier
+    de hash (CPF/CNPJ). Construir o operador de hash incondicionalmente
+    pra todo texto (mesmo um que só tem um nome de pessoa, sem CPF nem
+    CNPJ) exigiria o salt pra mascarar QUALQUER PII, não só CPF/CNPJ --
+    era exatamente esse o bug: um texto com só um PERSON já disparava
+    "PII_HASH_SALT não configurado", mesmo sem nenhum CPF envolvido.
+    """
     operators = {}
 
     for entity_type, prefix in _TOKEN_TIER_PREFIXES.items():
+        if entity_type not in entity_types_present:
+            continue
         operators[entity_type] = OperatorConfig(
             "custom",
             {"lambda": lambda text, p=prefix: _get_or_create_token(token_map, p, text)},
         )
 
     for entity_type in _HASH_TIER_ENTITIES:
+        if entity_type not in entity_types_present:
+            continue
         operators[entity_type] = OperatorConfig(
             "hash",
             {"hash_type": "sha256", "salt": _get_pii_hash_salt()},
@@ -374,7 +388,8 @@ def _mask_text(text: str, token_map: dict) -> tuple[str, bool]:
         return text, False
 
     anonymizer = get_anonymizer_engine()
-    operators = _build_operators(token_map)
+    entity_types_present = {r.entity_type for r in relevant}
+    operators = _build_operators(token_map, entity_types_present)
     anonymized = anonymizer.anonymize(text=text, analyzer_results=relevant, operators=operators)
     return anonymized.text, False
 
@@ -1076,6 +1091,25 @@ def test_missing_salt_raises_clear_error(monkeypatch):
 
     with pytest.raises(RuntimeError, match="PII_HASH_SALT"):
         mask_pii(ctx, request)
+
+
+def test_salt_not_required_when_no_cpf_or_cnpj_present(monkeypatch):
+    # Regressão: PII_HASH_SALT só é necessário pro tier de hash
+    # (CPF/CNPJ). Mascarar um texto que só tem PERSON/EMAIL/TELEFONE
+    # (tier de token, não de hash) nunca deveria exigir o salt -- um
+    # bug real fez exatamente isso (_build_operators construía o
+    # operador de hash incondicionalmente, mesmo sem CPF/CNPJ no
+    # texto), descoberto via test_golden_conversations.py: uma
+    # conversa de qualificação sem nenhum CPF envolvido falhava com
+    # "PII_HASH_SALT não configurado" só por mencionar um nome.
+    monkeypatch.delenv("PII_HASH_SALT", raising=False)
+    ctx = _fake_context()
+    request = _request_with_text("Oi, meu nome é Danilo Henrique")
+
+    result = mask_pii(ctx, request)  # não deveria levantar RuntimeError
+
+    assert result is None
+    assert "[PERSON_1]" in request.contents[0].parts[0].text
 SDR_PART2_EOF
 
 echo "  - tests/test_smoke.py"
@@ -1311,6 +1345,7 @@ dev = [
 
 [tool.pytest.ini_options]
 pythonpath = ["."]
+asyncio_mode = "auto"
 
 [tool.ruff]
 line-length = 100
@@ -4342,10 +4377,13 @@ make proxy-status   # container está de pé?
 make proxy-logs     # acompanhar logs do proxy
 make proxy-restart  # derrubar e subir de novo (necessário após editar .env)
 
-make test       # suite completa
-make test-pii   # só os testes de PII (mais rápido pra iterar)
-make lint       # ruff
-make clean      # limpa __pycache__/.pytest_cache/.ruff_cache
+make test            # suite completa (camadas 1 e 2 -- grátis)
+make test-pii        # só os testes de PII
+make test-guardrails # só os testes de guardrails (Parte 3)
+make test-live       # conversas douradas contra o LLM real (custa API,
+                      # camada 3 -- ver "Estratégia de testes" abaixo)
+make lint             # ruff
+make clean            # limpa __pycache__/.pytest_cache/.ruff_cache
 ```
 
 Rode `make` (sem alvo) ou `make help` pra ver a lista completa.
@@ -4776,6 +4814,51 @@ app/agents/guardrails/
 uv run pytest tests/test_prompt_injection.py tests/test_output_policy.py \
   tests/test_action_allowlist.py tests/test_guardrails.py -v
 ```
+
+## Estratégia de testes
+
+Pergunta prática: "editei `qualification.py`, como sei que não quebrei
+nada?" A resposta muda dependendo de QUÃO CARO você aceita que a
+resposta seja — por isso os testes deste projeto ficam em 4 camadas,
+cada uma com um trade-off diferente de custo vs. o que ela pega:
+
+| Camada | Custo | Pega | Onde |
+|---|---|---|---|
+| 1. Estrutural | Grátis, instantâneo | Wiring quebrado, tool faltando, import errado | `test_smoke.py` |
+| 2. Lógica de tool (Python puro) | Grátis, instantâneo | A parte determinística de uma tool está errada | `test_tool_logic.py` |
+| 3. Conversa dourada | Barato, chamadas reais de LLM | Agente parou de chamar a tool certa, parou de completar o fluxo, guardrail disparou sem motivo | `test_golden_conversations.py` |
+| 4. Eval set com LLM-judge | Custo real, minutos | Qualidade da resposta regrediu, não só a estrutura | Parte 6 (planejado) |
+
+**Camadas 1 e 2 rodam em `make test`** (e no pipeline de CI, sempre) —
+não custam nada, então não tem motivo pra não rodar toda vez.
+
+**Camada 3 é deliberadamente separada** (`make test-live`), porque
+custa chamadas reais de API. Ela verifica ESTRUTURA (qual chave de
+`session.state` foi escrita, qual guardrail disparou), nunca texto
+exato — isso é o que permite ela sobreviver a ajustes de prompt sem
+precisar ser reescrita toda hora:
+
+```bash
+make test-live
+# ou, sem o Makefile:
+RUN_LIVE_TESTS=1 uv run pytest tests/test_golden_conversations.py -v
+```
+
+**Camada 4** (golden eval set + LLM-as-judge + regressão versionada)
+é escopo da Parte 6 — a camada 3 é deliberadamente mais simples que
+isso (sem modelo-juiz, sem rubrica de nota), pensada pra dar confiança
+no dia a dia de edição de agente, não pra ser o critério final de
+qualidade.
+
+### Workflow prático ao editar um agente
+
+1. `uv run pytest` (grátis) — confirma que nada estrutural quebrou
+2. Se mexeu na lógica de uma tool, rode/adicione o teste direto dela
+   (camada 2, grátis)
+3. `make test-live` — confirma que o fluxo ainda completa e chama as
+   tools certas (custa uma chamada real, mas é rápido)
+4. `make web` — checagem manual de tom/qualidade da conversa (ainda
+   importa, só não é mais a ÚNICA linha de defesa)
 
 ## Próxima parte
 
