@@ -21,7 +21,9 @@ from google.adk.sessions import InMemorySessionService
 from google.genai import types
 from pydantic import BaseModel
 
-from app.agents import root_agent  # importar isso já carrega o .env (ver app/config/__init__.py)
+from app.agents import (
+    root_agent,  # importar isso já carrega o .env (ver app/config/__init__.py)
+)
 
 APP_NAME = os.getenv("SDR_APP_NAME", "sdr-bot")
 
