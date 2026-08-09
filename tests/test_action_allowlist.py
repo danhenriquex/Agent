@@ -19,10 +19,7 @@ from google.adk.tools import FunctionTool
 
 from app.agents.guardrails.action_allowlist import enforce_action_allowlist
 from app.agents.scheduling import book_meeting, check_availability
-from app.agents.session.state_schema import (
-    STATE_GUARDRAIL_FLAGS,
-    STATE_QUALIFICATION_STATUS,
-)
+from app.agents.session.state_schema import STATE_GUARDRAIL_FLAGS, STATE_QUALIFICATION_STATUS
 
 _book_meeting_tool = FunctionTool(book_meeting)
 _check_availability_tool = FunctionTool(check_availability)

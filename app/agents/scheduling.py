@@ -24,6 +24,7 @@ from .guardrails.action_allowlist import enforce_action_allowlist
 from .guardrails.output_policy import validate_output_policy
 from .guardrails.prompt_injection import detect_prompt_injection
 from .guardrails.transfer import block_unauthorized_transfer
+from .persona import PERSONA_INTRO
 from .pii.masking import mask_pii
 from .session.state_schema import STATE_MEETING_SLOT
 
@@ -72,7 +73,8 @@ scheduling_agent = LlmAgent(
         "avançar para uma próxima etapa comercial."
     ),
     instruction=(
-        "Você ajuda o lead a marcar uma reunião. Primeiro chame "
+        PERSONA_INTRO
+        + "Você ajuda o lead a marcar uma reunião. Primeiro chame "
         "check_availability para ver os horários livres, apresente as "
         "opções de forma natural, e depois chame book_meeting com o "
         "horário escolhido. Seja objetivo — esse não é o momento de "

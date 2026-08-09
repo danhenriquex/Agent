@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# Gerado em: 2026-08-09T13:30:38Z -- se os outros scripts (part1/cicd/part2/part3) que você tem localmente têm datas MUITO diferentes desta, você está misturando versões antigas com novas. Baixe os 4 de novo, juntos, na mesma resposta/mensagem.
 #
 # part1_setup.sh — gera/atualiza os arquivos da Parte 1 do SDR Bot
 # (esqueleto multi-agente com ADK + LiteLLM Proxy + OpenRouter,
@@ -2472,6 +2473,7 @@ from .config.models import get_model_for_role
 from .guardrails.output_policy import validate_output_policy
 from .guardrails.prompt_injection import detect_prompt_injection
 from .guardrails.transfer import block_unauthorized_transfer
+from .persona import PERSONA_INTRO
 from .pii.masking import mask_pii
 from .session.state_schema import STATE_ESCALATED
 
@@ -2486,7 +2488,8 @@ escalate_agent = LlmAgent(
         "relacionado a vendas)."
     ),
     instruction=(
-        "Informe de forma clara e cordial que você vai conectar o lead "
+        PERSONA_INTRO
+        + "Informe de forma clara e cordial que você vai conectar o lead "
         "com um especialista humano, e que alguém do time vai continuar "
         "a conversa em breve. Não tente resolver o pedido original você "
         "mesmo."
@@ -2519,6 +2522,7 @@ from .config.models import get_model_for_role
 from .guardrails.output_policy import validate_output_policy
 from .guardrails.prompt_injection import detect_prompt_injection
 from .guardrails.transfer import block_unauthorized_transfer
+from .persona import PERSONA_INTRO
 from .pii.masking import mask_pii
 from .session.state_schema import STATE_LAST_RETRIEVED_CONTEXT
 
@@ -2531,7 +2535,8 @@ knowledge_agent = LlmAgent(
         "custa', 'vocês integram com X', etc."
     ),
     instruction=(
-        "Você responde perguntas sobre nosso produto SaaS de forma "
+        PERSONA_INTRO
+        + "Você responde perguntas sobre nosso produto SaaS de forma "
         "precisa e concisa. "
         "IMPORTANTE (temporário — Parte 1): você ainda não tem acesso à "
         "base de conhecimento real. Se não tiver certeza absoluta da "
@@ -2569,6 +2574,7 @@ from .config.models import get_model_for_role
 from .guardrails.output_policy import validate_output_policy
 from .guardrails.prompt_injection import detect_prompt_injection
 from .guardrails.transfer import block_unauthorized_transfer
+from .persona import PERSONA_INTRO
 from .pii.masking import mask_pii
 from .session.state_schema import STATE_OBJECTIONS_RAISED
 
@@ -2581,7 +2587,8 @@ objection_agent = LlmAgent(
         "agora). Use quando o lead expressar hesitação ou recusa."
     ),
     instruction=(
-        "Você lida com objeções de forma empática, sem ser insistente. "
+        PERSONA_INTRO
+        + "Você lida com objeções de forma empática, sem ser insistente. "
         "Reconheça a objeção antes de responder a ela. Nunca ofereça "
         "desconto, condição especial ou prazo que não foi explicitamente "
         "autorizado — se o lead pedir desconto, diga que pode conectar "
@@ -2660,6 +2667,7 @@ from .guardrails.output_policy import validate_output_policy
 from .guardrails.prompt_injection import detect_prompt_injection
 from .knowledge import knowledge_agent
 from .objection import objection_agent
+from .persona import COMPANY_NAME, PERSONA_INTRO
 from .pii.masking import mask_pii, unmask_pii
 from .qualification import qualification_agent
 from .scheduling import scheduling_agent
@@ -2672,26 +2680,39 @@ root_agent = LlmAgent(
         "decide qual especialista consultar antes de responder."
     ),
     instruction=(
-        "Você é o orquestrador de um time de vendas (SDR) automatizado. "
+        PERSONA_INTRO
+        + "Você é o orquestrador de um time de vendas (SDR) automatizado. "
         "Para a maioria das mensagens, você deve CONSULTAR o especialista "
         "certo (chamando-o como ferramenta) antes de responder — não "
         "responda de memória sobre produto, preço, objeções ou "
         "agendamento.\n\n"
-        "Regras de consulta:\n"
-        "1) Se é o início da conversa ou ainda não sabemos se o lead é "
-        "qualificado, consulte QualificationAgent.\n"
+        "Para uma saudação simples (ex: 'oi', 'olá', 'bom dia'), responda "
+        "você mesmo, sem consultar ninguém, seguindo este padrão -- "
+        "direto ao ponto, nunca um 'como posso ajudar?' genérico e vazio:\n"
+        f"1) Se apresente em uma frase: seu nome, {COMPANY_NAME}, e o que "
+        "a empresa faz.\n"
+        "2) Ofereça dois caminhos ao mesmo tempo, na mesma mensagem: uma "
+        "pergunta leve sobre o desafio do lead, OU a opção de já ver "
+        "horários pra uma conversa rápida com o time. Deixe explícito que "
+        "agendar é uma opção disponível desde já -- não algo que só "
+        "aparece depois de uma qualificação longa.\n\n"
+        "Regras de consulta pro resto da conversa:\n"
+        "1) Se ainda não sabemos se o lead é qualificado, consulte "
+        "QualificationAgent.\n"
         "2) Se o lead pergunta sobre produto, funcionalidade ou preço, "
         "consulte KnowledgeAgent.\n"
         "3) Se o lead expressa hesitação, recusa ou objeção, consulte "
         "ObjectionHandlingAgent.\n"
-        "4) Se o lead concorda em avançar / quer marcar uma conversa, "
-        "consulte SchedulingAgent.\n"
+        "4) Se o lead concorda em avançar / já quer marcar uma conversa, "
+        "consulte SchedulingAgent -- mesmo que a qualificação não esteja "
+        "completa. É papel do SchedulingAgent (e do guardrail de "
+        "allowlist) decidir se já pode confirmar ou se precisa voltar "
+        "pra qualificação primeiro; você não precisa bloquear isso aqui.\n"
         "5) Se o pedido está fora do escopo comercial, ou o lead pede "
         "explicitamente um humano, consulte EscalateToHumanAgent.\n\n"
         "Depois de consultar o especialista, entregue a resposta dele ao "
         "lead de forma natural (pode repassar quase literalmente — não "
-        "precisa reescrever tudo). Só responda diretamente, sem consultar "
-        "ninguém, para saudações simples."
+        "precisa reescrever tudo)."
     ),
     tools=[
         AgentTool(agent=qualification_agent),
@@ -2702,6 +2723,41 @@ root_agent = LlmAgent(
     ],
     before_model_callback=[mask_pii, detect_prompt_injection],
     after_model_callback=[validate_output_policy, unmask_pii],
+)
+SDR_PART1_EOF
+
+echo "  - app/agents/persona.py"
+cat > "$TARGET_DIR/app/agents/persona.py" <<'SDR_PART1_EOF'
+"""
+Persona compartilhada do bot -- nome, empresa, e o "elevator pitch" de
+uma frase, usado na saudação inicial e como contexto leve em todo
+agente. Centralizado aqui em vez de duplicado em cada instruction, pra
+ter um único lugar pra atualizar quando o produto/vertical mudar (ex:
+quando a Parte 4 trouxer conteúdo real da base de conhecimento).
+
+Empresa e nome são fictícios, pensados pro portfólio: "Helssing" como
+uma SaaS de RH e DP (Departamento Pessoal) -- um vertical B2B comum e
+bem reconhecível no mercado brasileiro.
+
+Decisão deliberada: o bot se identifica como assistente de IA, nunca
+finge ser humano. Isso não é só postura ética -- é o tipo de
+transparência que regulação (ex: EU AI Act, art. 50) já está exigindo
+de sistemas conversacionais automatizados, e vale citar isso como
+escolha consciente, não descuido.
+"""
+
+BOT_NAME = "Bia"
+COMPANY_NAME = "Helssing"
+COMPANY_PITCH = (
+    "plataforma de RH e DP que automatiza folha de pagamento, admissão "
+    "e ponto pra empresas que ainda dependem de planilha"
+)
+
+PERSONA_INTRO = (
+    f"Você é {BOT_NAME}, assistente de IA da {COMPANY_NAME} -- seja "
+    "transparente que é um assistente automatizado sempre que "
+    f"perguntado, nunca finja ser humano. A {COMPANY_NAME} é "
+    f"{COMPANY_PITCH}.\n\n"
 )
 SDR_PART1_EOF
 
@@ -2716,6 +2772,13 @@ estruturada e auditável de declarar "esse lead está qualificado" —
 antes disso, só existia texto livre em qualification_notes, o que não
 dava pra checagem confiável em outro lugar do sistema (ex: o
 before_tool_callback de scheduling.py que agora depende desse status).
+
+Padrão "booking-first" (o mesmo que Drift/Qualified/Chili Piper usam):
+o objetivo não é completar um checklist BANT inteiro antes de sugerir
+agendar -- é chegar a um convite pra marcar uma conversa o quanto antes,
+usando qualificação como um filtro leve, não uma barreira. "in_progress"
+é um status perfeitamente aceitável pra deixar pro SDR humano completar
+na call, em vez de segurar o lead numa qualificação longa via chat.
 """
 
 from google.adk.agents import LlmAgent
@@ -2725,6 +2788,7 @@ from .config.models import get_model_for_role
 from .guardrails.output_policy import validate_output_policy
 from .guardrails.prompt_injection import detect_prompt_injection
 from .guardrails.transfer import block_unauthorized_transfer
+from .persona import PERSONA_INTRO
 from .pii.masking import mask_pii
 from .session.state_schema import STATE_QUALIFICATION_NOTES, STATE_QUALIFICATION_STATUS
 
@@ -2765,13 +2829,21 @@ qualification_agent = LlmAgent(
         "ainda não sabemos se ele é um bom fit."
     ),
     instruction=(
-        "Você é um SDR conduzindo a qualificação inicial de um lead B2B. "
-        "Faça perguntas curtas e naturais, uma de cada vez, cobrindo ao "
-        "longo da conversa: qual problema o lead quer resolver, se ele "
-        "tem orçamento definido, se ele é o decisor ou influencia a "
-        "decisão, e em que prazo pretende resolver isso. "
-        "Não faça um interrogatório — intercale com contexto útil sobre "
-        "como ajudamos empresas parecidas. "
+        PERSONA_INTRO
+        + "Você conduz a qualificação inicial de um lead B2B, mas de "
+        "forma LEVE e RÁPIDA -- o objetivo é chegar a um convite pra "
+        "agendar uma conversa o quanto antes, não completar um checklist "
+        "inteiro antes de sugerir isso. Um SDR de verdade não interroga "
+        "por várias perguntas seguidas antes de oferecer uma reunião.\n\n"
+        "Faça no máximo 1-2 perguntas curtas e naturais sobre o desafio "
+        "do lead (o que ele quer resolver) e, se render, o tamanho da "
+        "empresa. Intercale com contexto útil sobre como ajudamos "
+        "empresas parecidas -- não faça um interrogatório.\n\n"
+        "Assim que tiver QUALQUER sinal razoável de fit -- não precisa "
+        "ser orçamento, autoridade e prazo completos -- convide pra "
+        "marcar uma conversa rápida com o time. 'in_progress' é um "
+        "status perfeitamente aceitável: é normal deixar o resto da "
+        "qualificação pra call em vez de segurar o lead no chat.\n\n"
         "Assim que tiver informação suficiente pra decidir, chame "
         "set_qualification_status com o status apropriado — isso é o "
         "que libera (ou não) o lead pra avançar pro agendamento. "
@@ -2818,6 +2890,7 @@ from .guardrails.action_allowlist import enforce_action_allowlist
 from .guardrails.output_policy import validate_output_policy
 from .guardrails.prompt_injection import detect_prompt_injection
 from .guardrails.transfer import block_unauthorized_transfer
+from .persona import PERSONA_INTRO
 from .pii.masking import mask_pii
 from .session.state_schema import STATE_MEETING_SLOT
 
@@ -2866,7 +2939,8 @@ scheduling_agent = LlmAgent(
         "avançar para uma próxima etapa comercial."
     ),
     instruction=(
-        "Você ajuda o lead a marcar uma reunião. Primeiro chame "
+        PERSONA_INTRO
+        + "Você ajuda o lead a marcar uma reunião. Primeiro chame "
         "check_availability para ver os horários livres, apresente as "
         "opções de forma natural, e depois chame book_meeting com o "
         "horário escolhido. Seja objetivo — esse não é o momento de "
@@ -3350,6 +3424,20 @@ def test_specialists_have_no_parent_agent():
         assert agent.parent_agent is None, (
             f"{agent.name} tem parent_agent definido — isso reintroduziria "
             "a ferramenta transfer_to_agent e os bugs associados a ela"
+        )
+
+
+def test_every_agent_instruction_includes_company_name():
+    # Barato e sem chamada de LLM -- pega o caso "criei um agente novo e
+    # esqueci de importar PERSONA_INTRO", antes de precisar de um teste
+    # ao vivo pra descobrir isso.
+    from app.agents.persona import COMPANY_NAME
+
+    all_agents = [root_agent, *_specialist_agents()]
+    for agent in all_agents:
+        assert COMPANY_NAME in agent.instruction, (
+            f"{agent.name} não tem {COMPANY_NAME} na instruction -- "
+            "provavelmente esqueceu de usar PERSONA_INTRO"
         )
 
 

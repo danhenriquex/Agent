@@ -18,6 +18,7 @@ from .config.models import get_model_for_role
 from .guardrails.output_policy import validate_output_policy
 from .guardrails.prompt_injection import detect_prompt_injection
 from .guardrails.transfer import block_unauthorized_transfer
+from .persona import PERSONA_INTRO
 from .pii.masking import mask_pii
 from .session.state_schema import STATE_ESCALATED
 
@@ -32,7 +33,8 @@ escalate_agent = LlmAgent(
         "relacionado a vendas)."
     ),
     instruction=(
-        "Informe de forma clara e cordial que você vai conectar o lead "
+        PERSONA_INTRO
+        + "Informe de forma clara e cordial que você vai conectar o lead "
         "com um especialista humano, e que alguém do time vai continuar "
         "a conversa em breve. Não tente resolver o pedido original você "
         "mesmo."

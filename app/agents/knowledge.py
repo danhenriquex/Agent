@@ -14,6 +14,7 @@ from .config.models import get_model_for_role
 from .guardrails.output_policy import validate_output_policy
 from .guardrails.prompt_injection import detect_prompt_injection
 from .guardrails.transfer import block_unauthorized_transfer
+from .persona import PERSONA_INTRO
 from .pii.masking import mask_pii
 from .session.state_schema import STATE_LAST_RETRIEVED_CONTEXT
 
@@ -26,7 +27,8 @@ knowledge_agent = LlmAgent(
         "custa', 'vocês integram com X', etc."
     ),
     instruction=(
-        "Você responde perguntas sobre nosso produto SaaS de forma "
+        PERSONA_INTRO
+        + "Você responde perguntas sobre nosso produto SaaS de forma "
         "precisa e concisa. "
         "IMPORTANTE (temporário — Parte 1): você ainda não tem acesso à "
         "base de conhecimento real. Se não tiver certeza absoluta da "
