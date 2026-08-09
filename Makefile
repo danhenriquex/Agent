@@ -26,6 +26,7 @@ help:
 	@echo ""
 	@echo "  make test          - roda a suite de testes completa"
 	@echo "  make test-pii      - roda só os testes de PII (mais rápido pra iterar)"
+	@echo "  make test-guardrails - roda só os testes de guardrails (Parte 3)"
 	@echo "  make lint          - roda o ruff"
 	@echo "  make clean         - remove __pycache__/.pytest_cache/.ruff_cache"
 
@@ -80,6 +81,10 @@ test:
 
 test-pii:
 	uv run pytest tests/test_pii_masking.py -v
+
+test-guardrails:
+	uv run pytest tests/test_prompt_injection.py tests/test_output_policy.py \
+		tests/test_action_allowlist.py tests/test_guardrails.py -v
 
 lint:
 	uv run ruff check app tests

@@ -14,8 +14,10 @@ fallback silencioso dentro de outro agente) para que:
 
 from google.adk.agents import LlmAgent
 
-from ._guardrails import block_unauthorized_transfer
 from .config.models import get_model_for_role
+from .guardrails.output_policy import validate_output_policy
+from .guardrails.prompt_injection import detect_prompt_injection
+from .guardrails.transfer import block_unauthorized_transfer
 from .pii.masking import mask_pii
 from .session.state_schema import STATE_ESCALATED
 
@@ -24,10 +26,10 @@ escalate_agent = LlmAgent(
     model=get_model_for_role("escalate"),
     description=(
         "Encerra o atendimento automatizado e transfere para um humano. "
-        "Use quando: o guardrail bloquear uma mensagem (Parte 3), o lead "
-        "pedir explicitamente para falar com uma pessoa, ou a conversa "
-        "sair do escopo comercial (suporte técnico, reclamação, assunto "
-        "não relacionado a vendas)."
+        "Use quando: o guardrail bloquear uma mensagem, o lead pedir "
+        "explicitamente para falar com uma pessoa, ou a conversa sair do "
+        "escopo comercial (suporte técnico, reclamação, assunto não "
+        "relacionado a vendas)."
     ),
     instruction=(
         "Informe de forma clara e cordial que você vai conectar o lead "
@@ -39,8 +41,7 @@ escalate_agent = LlmAgent(
     # Chamado via AgentTool a partir do Orchestrator (ver orchestrator.py),
     # não via sub_agents — então este agente nunca ganha a ferramenta
     # transfer_to_agent para começar; não há transferência a bloquear. O
-    # guardrail abaixo fica como defesa em profundidade, não a proteção
-    # primária (ver docstring de _guardrails.py para o histórico do bug).
-    before_model_callback=mask_pii,
-    after_model_callback=block_unauthorized_transfer,
+    # guardrail de transfer abaixo fica como defesa em profundidade.
+    before_model_callback=[mask_pii, detect_prompt_injection],
+    after_model_callback=[validate_output_policy, block_unauthorized_transfer],
 )

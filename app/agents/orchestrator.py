@@ -42,6 +42,12 @@ PII de volta pro contexto antes da resposta final estar pronta. Todos
 os agentes (incluindo este) registram mask_pii, para que nenhum deles
 jamais veja PII crua, mesmo que uma ferramenta futura (Parte 4+) traga
 dado bruto de algum lugar. Ver app/agents/pii/masking.py.
+
+Parte 3 — guardrails: mesmo padrão de defesa em profundidade.
+detect_prompt_injection e validate_output_policy rodam em TODO agente
+(incluindo este); enforce_action_allowlist (before_tool_callback) só
+existe em SchedulingAgent, porque é a única tool com uma ação que
+precisa de allowlist hoje. Ver app/agents/guardrails/.
 """
 
 from google.adk.agents import LlmAgent
@@ -49,6 +55,8 @@ from google.adk.tools.agent_tool import AgentTool
 
 from .config.models import get_model_for_role
 from .escalate import escalate_agent
+from .guardrails.output_policy import validate_output_policy
+from .guardrails.prompt_injection import detect_prompt_injection
 from .knowledge import knowledge_agent
 from .objection import objection_agent
 from .pii.masking import mask_pii, unmask_pii
@@ -91,6 +99,6 @@ root_agent = LlmAgent(
         AgentTool(agent=scheduling_agent),
         AgentTool(agent=escalate_agent),
     ],
-    before_model_callback=mask_pii,
-    after_model_callback=unmask_pii,
+    before_model_callback=[mask_pii, detect_prompt_injection],
+    after_model_callback=[validate_output_policy, unmask_pii],
 )

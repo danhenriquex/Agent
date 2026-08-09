@@ -1,4 +1,4 @@
-# SDR Bot — Sistema Multi-Agente (Partes 1 e 2: Esqueleto + PII)
+# SDR Bot — Sistema Multi-Agente (Partes 1, 2 e 3: Esqueleto + PII + Guardrails)
 
 Chatbot SDR (Sales Development Representative) construído com **Google ADK**,
 desenhado para demonstrar, na prática, os requisitos técnicos de vagas de
@@ -6,7 +6,7 @@ LLM/AI Engineer sênior focadas em produção: orquestração multi-agente,
 guardrails, mascaramento de PII, RAG avaliado e observabilidade.
 
 Este projeto é dividido em partes incrementais. Este README cobre as
-**Partes 1 e 2**.
+**Partes 1, 2 e 3**.
 
 ## O que existe nesta parte
 
@@ -34,15 +34,19 @@ Este projeto é dividido em partes incrementais. Este README cobre as
   para CPF/CNPJ (com validação real de dígito verificador) + telefone BR
   (via `phonenumbers`) + spaCy `pt_core_news_lg` para nomes — ver seção
   dedicada abaixo.
-- Smoke tests da topologia + testes de PII (`tests/`) que rodam sem
-  precisar de chave de API (a única exceção é o download do modelo spaCy
-  no `uv sync`, que acontece uma vez).
+- **Guardrails (Parte 3)**: detecção heurística de prompt injection,
+  allowlist de ação (`book_meeting` só executa se o lead estiver
+  qualificado) e validação de política de saída (nunca oferecer desconto
+  não autorizado) — em todo agente, mesmo padrão de defesa em
+  profundidade da Parte 2. Ver seção dedicada abaixo.
+- Smoke tests da topologia + testes de PII + testes de guardrails
+  (`tests/`) que rodam sem precisar de chave de API (a única exceção é o
+  download do modelo spaCy no `uv sync`, que acontece uma vez).
 
 ## O que **não** está aqui ainda (de propósito)
 
 | Falta | Onde entra |
 |---|---|
-| Guardrails completos / mitigação de prompt injection | Parte 3 |
 | RAG real + MCP Server para o KnowledgeAgent | Parte 4 |
 | LangFuse + Phoenix (observabilidade) | Parte 5 |
 | Golden eval set + LLM-as-judge + regressão | Parte 6 |
@@ -411,11 +415,103 @@ A primeira execução carrega o modelo spaCy (~15s); chamadas seguintes
 na mesma sessão de teste reusam o engine cacheado (singleton em
 `engine.py`).
 
+## Guardrails (Parte 3)
+
+Três pontos deixaram rastro explícito de TODO no código durante as
+Partes 1 e 2 — a Parte 3 é sobre fechar exatamente esses três.
+
+### 1. Detecção de prompt injection (`before_model_callback`)
+
+Escopo desta versão: **só heurística** (regex/keyword), sem camada de
+LLM-judge — decisão deliberada de custo/latência, não limitação técnica.
+Roda depois do `mask_pii` na mesma cadeia
+(`[mask_pii, detect_prompt_injection]`), em todo agente:
+
+```python
+before_model_callback=[mask_pii, detect_prompt_injection]
+```
+
+Só avalia o **último turno do usuário**, não o histórico inteiro a cada
+chamada — uma mensagem já filtrada não precisa ser reavaliada pra
+sempre. Ver `app/agents/guardrails/prompt_injection.py`.
+
+### 2. Allowlist de ação (`before_tool_callback`)
+
+Resolve o TODO de `scheduling.py`: `book_meeting` só executa de verdade
+se `session.state[STATE_QUALIFICATION_STATUS] == "qualified"`. Isso é
+diferente de um guardrail de conteúdo — é sobre o que o sistema tem
+permissão de **executar**, não sobre o que ele diz:
+
+```
+book_meeting(slot) chamado
+      │
+      ▼
+enforce_action_allowlist verifica qualification_status
+      │
+   ┌──┴──┐
+  sim    não
+   │      │
+   ▼      ▼
+executa   retorna {"status": "blocked", "error_message": "...link..."}
+```
+
+Quando bloqueado, a resposta simula um redirecionamento (link fake —
+não existe formulário de qualificação real neste projeto) em vez de só
+recusar. O contrato de retorno imita o padrão de erro que `book_meeting`
+já usava pra "horário indisponível", deixando o modelo do
+`SchedulingAgent` transformar isso em linguagem natural, em vez da
+guardrail hardcodar a frase exata.
+
+Isso também exigiu resolver um problema real: `STATE_QUALIFICATION_STATUS`
+existia como chave reservada desde a Parte 1, mas nada escrevia um valor
+estruturado nela. A `QualificationAgent` ganhou uma tool nova pra isso:
+
+```python
+set_qualification_status(status: "qualified"|"disqualified"|"in_progress", reasoning: str)
+```
+
+Mesmo padrão que `SchedulingAgent` já usava — mudança de estado
+estruturada e auditável via tool, não texto livre que outro lugar do
+sistema teria que tentar interpretar.
+
+### 3. Validação de política de saída (`after_model_callback`)
+
+Resolve o TODO de `objection.py`: "nunca ofereça desconto" era só uma
+instrução de prompt — contornável por prompt injection. Agora também é
+verificado na resposta de verdade:
+
+```python
+after_model_callback=[validate_output_policy, block_unauthorized_transfer]  # especialistas
+after_model_callback=[validate_output_policy, unmask_pii]                    # orchestrator
+```
+
+**Escopo**: todo agente (defesa em profundidade), não só
+`ObjectionHandlingAgent` — mesma postura da Parte 2. Hoje só o
+`ObjectionHandlingAgent` fala sobre desconto, mas `KnowledgeAgent` vai
+discutir preço de verdade a partir da Parte 4, e essa proteção já
+precisa estar no lugar antes disso, não adicionada depois.
+
+### Onde o código mora
+
+```
+app/agents/guardrails/
+├── transfer.py           # bloqueio de transfer_to_agent não autorizado
+│                           # (existia desde a Parte 1 como _guardrails.py,
+│                           # movido pra cá — não é mais um stopgap solto)
+├── prompt_injection.py   # detect_prompt_injection
+├── output_policy.py      # validate_output_policy
+└── action_allowlist.py   # enforce_action_allowlist
+```
+
+### Rodando os testes de guardrails isoladamente
+
+```bash
+uv run pytest tests/test_prompt_injection.py tests/test_output_policy.py \
+  tests/test_action_allowlist.py tests/test_guardrails.py -v
+```
+
 ## Próxima parte
 
-**Parte 3**: guardrails mais completos e mitigação de prompt injection —
-generaliza o padrão já usado em `_guardrails.py` (bloquear comportamento
-indesejado via callback) para cobrir tentativas de manipulação de
-prompt, allowlist de ações sensíveis (ex: `book_meeting` só deveria
-confirmar se o lead está qualificado), e validação de saída contra
-políticas de negócio (ex: nunca oferecer desconto não autorizado).
+**Parte 4**: RAG de verdade para o `KnowledgeAgent`, via um MCP Server
+dedicado sobre ChromaDB — o agente para de responder "vou confirmar com
+o time" e passa a recuperar contexto real da base de conhecimento.
