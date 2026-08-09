@@ -13,7 +13,10 @@ precisar ler os prompts inteiros de cada um.
 
 # Escrito pelo Qualification Agent
 STATE_QUALIFICATION_NOTES = "qualification_notes"      # texto livre nesta Parte 1
-# "in_progress" | "qualified" | "disqualified"
+# "in_progress" | "qualified" | "disqualified" — escrito pela tool
+# set_qualification_status (Parte 3). Consumido por
+# app/agents/guardrails/action_allowlist.py pra decidir se book_meeting
+# pode executar de verdade.
 STATE_QUALIFICATION_STATUS = "qualification_status"
 # TODO Parte 6: qualification_notes deveria virar um dict estruturado
 # (budget, authority, need, timeline) para o eval set conseguir medir
@@ -31,7 +34,9 @@ STATE_MEETING_SLOT = "meeting_slot"
 # Escrito pelo Escalate Agent
 STATE_ESCALATED = "escalated"
 
-# Escrito pela camada de guardrail/PII (Partes 2 e 3 — placeholder aqui
-# para já deixar o contrato visível desde a Parte 1)
+# Escrito pela camada de guardrails (Partes 2 e 3): PII (redação de
+# cartão), prompt injection, política de saída, allowlist de ação, e
+# tentativa de transfer_to_agent não autorizada. list[str], útil pra
+# debug e pra futuro dashboard de observabilidade (Parte 5).
 STATE_PII_TOKEN_MAP = "pii_token_map"        # token -> valor original; NUNCA vai ao LLM nem a logs
-STATE_GUARDRAIL_FLAGS = "guardrail_flags"    # list[str]: violações detectadas na sessão
+STATE_GUARDRAIL_FLAGS = "guardrail_flags"

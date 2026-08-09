@@ -460,6 +460,7 @@ help:
 	@echo ""
 	@echo "  make test          - roda a suite de testes completa"
 	@echo "  make test-pii      - roda só os testes de PII (mais rápido pra iterar)"
+	@echo "  make test-guardrails - roda só os testes de guardrails (Parte 3)"
 	@echo "  make lint          - roda o ruff"
 	@echo "  make clean         - remove __pycache__/.pytest_cache/.ruff_cache"
 
@@ -514,6 +515,10 @@ test:
 
 test-pii:
 	uv run pytest tests/test_pii_masking.py -v
+
+test-guardrails:
+	uv run pytest tests/test_prompt_injection.py tests/test_output_policy.py \
+		tests/test_action_allowlist.py tests/test_guardrails.py -v
 
 lint:
 	uv run ruff check app tests
@@ -3160,8 +3165,9 @@ echo "==> CI/CD gerado/atualizado com sucesso em $TARGET_DIR"
 echo ""
 echo "Próximos passos:"
 echo "  Nota: se os agentes vierem da Parte 2 em diante, rode também"
-echo "  part2_setup.sh antes de \"make test\"/\"make web\" -- os arquivos"
-echo "  de agente importam o módulo de PII independente desta camada."
+echo "  part2_setup.sh e part3_setup.sh antes de \"make test\"/\"make web\""
+echo "  -- os arquivos de agente importam PII e guardrails independente"
+echo "  desta camada."
 echo ""
 echo "  1. cd $TARGET_DIR && uv sync   # agora inclui fastapi/uvicorn/ruff/httpx"
 echo "  2. make test   # ou: uv run pytest -v"

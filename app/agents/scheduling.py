@@ -5,16 +5,25 @@ Scheduling Agent — tarefa estruturada: verifica disponibilidade e
 Modelo: barato/rápido (ver app/config/models.py) porque a tarefa é
 majoritariamente extração estruturada, não raciocínio aberto.
 
-Este é o único agente com tools nesta Parte 1 — propositalmente, para
-validar que tool-calling funciona ponta a ponta através do LiteLLM Proxy
-+ OpenRouter antes de adicionarmos tools mais sensíveis (RAG, MCP) nas
-próximas partes.
+Este foi o primeiro agente com tools reais no projeto — propositalmente,
+para validar que tool-calling funciona ponta a ponta através do LiteLLM
+Proxy + OpenRouter antes de adicionarmos tools mais sensíveis (RAG, MCP)
+nas próximas partes.
+
+Parte 3: book_meeting agora é protegido por enforce_action_allowlist
+(before_tool_callback) — só executa de verdade se
+session.state[STATE_QUALIFICATION_STATUS] == "qualified". Isso é
+allowlist de AÇÃO (o que o sistema pode EXECUTAR), diferente dos
+guardrails de conteúdo (o que o sistema pode DIZER).
 """
 
 from google.adk.agents import LlmAgent
 
-from ._guardrails import block_unauthorized_transfer
 from .config.models import get_model_for_role
+from .guardrails.action_allowlist import enforce_action_allowlist
+from .guardrails.output_policy import validate_output_policy
+from .guardrails.prompt_injection import detect_prompt_injection
+from .guardrails.transfer import block_unauthorized_transfer
 from .pii.masking import mask_pii
 from .session.state_schema import STATE_MEETING_SLOT
 
@@ -49,10 +58,8 @@ def book_meeting(slot: str) -> dict:
             ),
         }
 
-    # TODO Parte 3: antes de confirmar de verdade, isso deveria passar por
-    # um before_tool_callback validando que o lead está QUALIFICADO
-    # (session.state[STATE_QUALIFICATION_STATUS] == "qualified") —
-    # allowlist de AÇÃO, não só allowlist de tool disponível.
+    # A checagem de qualificação acontece ANTES desta função sequer
+    # rodar -- ver enforce_action_allowlist (before_tool_callback).
     return {"status": "success", "confirmed_slot": slot}
 
 
@@ -69,15 +76,18 @@ scheduling_agent = LlmAgent(
         "check_availability para ver os horários livres, apresente as "
         "opções de forma natural, e depois chame book_meeting com o "
         "horário escolhido. Seja objetivo — esse não é o momento de "
-        "reabrir a qualificação ou discutir preço."
+        "reabrir a qualificação ou discutir preço. Se book_meeting "
+        "retornar status 'blocked', explique ao lead de forma natural "
+        "que precisa completar o perfil antes, usando o link fornecido "
+        "no error_message."
     ),
     tools=[check_availability, book_meeting],
     output_key=STATE_MEETING_SLOT,
     # Chamado via AgentTool a partir do Orchestrator (ver orchestrator.py),
     # não via sub_agents — então este agente nunca ganha a ferramenta
     # transfer_to_agent para começar; não há transferência a bloquear. O
-    # guardrail abaixo fica como defesa em profundidade, não a proteção
-    # primária (ver docstring de _guardrails.py para o histórico do bug).
-    before_model_callback=mask_pii,
-    after_model_callback=block_unauthorized_transfer,
+    # guardrail de transfer abaixo fica como defesa em profundidade.
+    before_model_callback=[mask_pii, detect_prompt_injection],
+    after_model_callback=[validate_output_policy, block_unauthorized_transfer],
+    before_tool_callback=enforce_action_allowlist,
 )
