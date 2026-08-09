@@ -78,16 +78,30 @@ def _get_or_create_token(token_map: dict, prefix: str, original_value: str) -> s
     return new_token
 
 
-def _build_operators(token_map: dict) -> dict:
+def _build_operators(token_map: dict, entity_types_present: set[str]) -> dict:
+    """Constrói operadores SÓ para os tipos de entidade que apareceram de
+    verdade no texto -- não para todos os tipos conhecidos.
+
+    Isso importa porque o salt (PII_HASH_SALT) só é necessário pro tier
+    de hash (CPF/CNPJ). Construir o operador de hash incondicionalmente
+    pra todo texto (mesmo um que só tem um nome de pessoa, sem CPF nem
+    CNPJ) exigiria o salt pra mascarar QUALQUER PII, não só CPF/CNPJ --
+    era exatamente esse o bug: um texto com só um PERSON já disparava
+    "PII_HASH_SALT não configurado", mesmo sem nenhum CPF envolvido.
+    """
     operators = {}
 
     for entity_type, prefix in _TOKEN_TIER_PREFIXES.items():
+        if entity_type not in entity_types_present:
+            continue
         operators[entity_type] = OperatorConfig(
             "custom",
             {"lambda": lambda text, p=prefix: _get_or_create_token(token_map, p, text)},
         )
 
     for entity_type in _HASH_TIER_ENTITIES:
+        if entity_type not in entity_types_present:
+            continue
         operators[entity_type] = OperatorConfig(
             "hash",
             {"hash_type": "sha256", "salt": _get_pii_hash_salt()},
@@ -111,7 +125,8 @@ def _mask_text(text: str, token_map: dict) -> tuple[str, bool]:
         return text, False
 
     anonymizer = get_anonymizer_engine()
-    operators = _build_operators(token_map)
+    entity_types_present = {r.entity_type for r in relevant}
+    operators = _build_operators(token_map, entity_types_present)
     anonymized = anonymizer.anonymize(text=text, analyzer_results=relevant, operators=operators)
     return anonymized.text, False
 

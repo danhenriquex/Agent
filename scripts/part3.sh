@@ -299,8 +299,17 @@ _QUALIFICATION_LINK_BASE = "https://sdr-bot.exemplo.com/qualificar"
 def enforce_action_allowlist(tool, args: dict, tool_context: ToolContext) -> dict | None:
     """Retorna um dict (substituindo o resultado real da tool) se a ação
     for bloqueada; retorna None para deixar a tool executar normalmente.
+
+    `tool` aqui é o objeto `BaseTool`/`FunctionTool` que o ADK usa
+    internamente para invocar a função real -- tem um atributo `.name`
+    (extraído de `func.__name__` na hora de envolver a função), não
+    `__name__` diretamente. Usar `.__name__` passa despercebido em
+    testes unitários que chamam a função crua direto, mas quebra em
+    execução real (google.adk.workflow._errors.DynamicNodeFailError) —
+    foi exatamente assim que este bug foi encontrado, via
+    test_golden_conversations.py, não pelos testes unitários.
     """
-    if tool.__name__ not in _GATED_TOOLS:
+    if tool.name not in _GATED_TOOLS:
         return None
 
     status = tool_context.state.get(STATE_QUALIFICATION_STATUS)
@@ -309,7 +318,7 @@ def enforce_action_allowlist(tool, args: dict, tool_context: ToolContext) -> dic
 
     flags = tool_context.state.get(STATE_GUARDRAIL_FLAGS, [])
     flags.append(
-        f"{tool_context.agent_name}: {tool.__name__} bloqueado — lead "
+        f"{tool_context.agent_name}: {tool.name} bloqueado — lead "
         f"ainda não qualificado (status atual: {status!r})"
     )
     tool_context.state[STATE_GUARDRAIL_FLAGS] = flags
@@ -1220,17 +1229,30 @@ SDR_PART3_EOF
 echo "  - tests/test_action_allowlist.py"
 cat > "$TARGET_DIR/tests/test_action_allowlist.py" <<'SDR_PART3_EOF'
 """
-Unit tests for the action allowlist guardrail. No LLM calls -- uses the
-real check_availability/book_meeting functions as the `tool` argument
-(so tool.__name__ matches exactly what the real callback sees), with a
-mocked ToolContext for state.
+Unit tests for the action allowlist guardrail. No LLM calls -- but
+CRITICALLY, wraps check_availability/book_meeting in the real
+FunctionTool class (same as ADK does internally) instead of passing the
+raw functions directly.
+
+This distinction matters: an earlier version of this test passed the
+raw functions as `tool`, which have `__name__` -- masking a real bug
+where the guardrail checked `tool.__name__` instead of `tool.name`
+(the actual attribute FunctionTool exposes). That bug only surfaced in
+real execution (test_golden_conversations.py), not here, because the
+raw-function stand-in didn't match the real integration boundary's
+shape. Wrapping in FunctionTool here closes that gap.
 """
 
 from unittest.mock import MagicMock
 
+from google.adk.tools import FunctionTool
+
 from app.agents.guardrails.action_allowlist import enforce_action_allowlist
 from app.agents.scheduling import book_meeting, check_availability
 from app.agents.session.state_schema import STATE_GUARDRAIL_FLAGS, STATE_QUALIFICATION_STATUS
+
+_book_meeting_tool = FunctionTool(book_meeting)
+_check_availability_tool = FunctionTool(check_availability)
 
 
 def _fake_tool_context(qualification_status: str | None) -> MagicMock:
@@ -1247,7 +1269,9 @@ def _fake_tool_context(qualification_status: str | None) -> MagicMock:
 def test_blocks_book_meeting_when_not_qualified():
     ctx = _fake_tool_context(qualification_status="in_progress")
 
-    result = enforce_action_allowlist(book_meeting, {"slot": "terça-feira às 10h"}, ctx)
+    result = enforce_action_allowlist(
+        _book_meeting_tool, {"slot": "terça-feira às 10h"}, ctx
+    )
 
     assert result is not None
     assert result["status"] == "blocked"
@@ -1258,7 +1282,9 @@ def test_blocks_book_meeting_when_not_qualified():
 def test_blocks_book_meeting_when_status_never_set():
     ctx = _fake_tool_context(qualification_status=None)
 
-    result = enforce_action_allowlist(book_meeting, {"slot": "terça-feira às 10h"}, ctx)
+    result = enforce_action_allowlist(
+        _book_meeting_tool, {"slot": "terça-feira às 10h"}, ctx
+    )
 
     assert result is not None
     assert result["status"] == "blocked"
@@ -1267,7 +1293,9 @@ def test_blocks_book_meeting_when_status_never_set():
 def test_allows_book_meeting_when_qualified():
     ctx = _fake_tool_context(qualification_status="qualified")
 
-    result = enforce_action_allowlist(book_meeting, {"slot": "terça-feira às 10h"}, ctx)
+    result = enforce_action_allowlist(
+        _book_meeting_tool, {"slot": "terça-feira às 10h"}, ctx
+    )
 
     assert result is None  # None = deixa a tool real executar
 
@@ -1277,7 +1305,7 @@ def test_does_not_gate_check_availability():
     # não confirma nada) -- não deveria ser bloqueada mesmo sem qualificação.
     ctx = _fake_tool_context(qualification_status="in_progress")
 
-    result = enforce_action_allowlist(check_availability, {}, ctx)
+    result = enforce_action_allowlist(_check_availability_tool, {}, ctx)
 
     assert result is None
 
@@ -1285,9 +1313,20 @@ def test_does_not_gate_check_availability():
 def test_blocked_message_includes_a_link():
     ctx = _fake_tool_context(qualification_status="disqualified")
 
-    result = enforce_action_allowlist(book_meeting, {"slot": "terça-feira às 10h"}, ctx)
+    result = enforce_action_allowlist(
+        _book_meeting_tool, {"slot": "terça-feira às 10h"}, ctx
+    )
 
     assert "https://" in result["error_message"]
+
+
+def test_would_have_caught_the_dunder_name_bug():
+    # Regressão direta do bug real: tool.__name__ não existe em
+    # FunctionTool (só em funções cruas). Se alguém reintroduzir
+    # `tool.__name__` no guardrail, este teste falha com AttributeError
+    # antes de qualquer chamada real de LLM revelar o problema.
+    assert not hasattr(_book_meeting_tool, "__name__")
+    assert _book_meeting_tool.name == "book_meeting"
 SDR_PART3_EOF
 
 echo "  - Makefile"
@@ -1321,6 +1360,8 @@ help:
 	@echo "  make test          - roda a suite de testes completa"
 	@echo "  make test-pii      - roda só os testes de PII (mais rápido pra iterar)"
 	@echo "  make test-guardrails - roda só os testes de guardrails (Parte 3)"
+	@echo "  make test-live     - conversas douradas contra o LLM real (custa"
+	@echo "                       API, sobe o proxy sozinho) — NÃO entra em 'make test'"
 	@echo "  make lint          - roda o ruff"
 	@echo "  make clean         - remove __pycache__/.pytest_cache/.ruff_cache"
 
@@ -1379,6 +1420,11 @@ test-pii:
 test-guardrails:
 	uv run pytest tests/test_prompt_injection.py tests/test_output_policy.py \
 		tests/test_action_allowlist.py tests/test_guardrails.py -v
+
+# Testes ao vivo (Layer 3): custam chamadas reais de API, por isso não
+# entram em "make test". Sobe o proxy (se preciso) antes de rodar.
+test-live: proxy-up
+	RUN_LIVE_TESTS=1 uv run pytest tests/test_golden_conversations.py -v
 
 lint:
 	uv run ruff check app tests
@@ -1468,10 +1514,13 @@ make proxy-status   # container está de pé?
 make proxy-logs     # acompanhar logs do proxy
 make proxy-restart  # derrubar e subir de novo (necessário após editar .env)
 
-make test       # suite completa
-make test-pii   # só os testes de PII (mais rápido pra iterar)
-make lint       # ruff
-make clean      # limpa __pycache__/.pytest_cache/.ruff_cache
+make test            # suite completa (camadas 1 e 2 -- grátis)
+make test-pii        # só os testes de PII
+make test-guardrails # só os testes de guardrails (Parte 3)
+make test-live       # conversas douradas contra o LLM real (custa API,
+                      # camada 3 -- ver "Estratégia de testes" abaixo)
+make lint             # ruff
+make clean            # limpa __pycache__/.pytest_cache/.ruff_cache
 ```
 
 Rode `make` (sem alvo) ou `make help` pra ver a lista completa.
@@ -1902,6 +1951,51 @@ app/agents/guardrails/
 uv run pytest tests/test_prompt_injection.py tests/test_output_policy.py \
   tests/test_action_allowlist.py tests/test_guardrails.py -v
 ```
+
+## Estratégia de testes
+
+Pergunta prática: "editei `qualification.py`, como sei que não quebrei
+nada?" A resposta muda dependendo de QUÃO CARO você aceita que a
+resposta seja — por isso os testes deste projeto ficam em 4 camadas,
+cada uma com um trade-off diferente de custo vs. o que ela pega:
+
+| Camada | Custo | Pega | Onde |
+|---|---|---|---|
+| 1. Estrutural | Grátis, instantâneo | Wiring quebrado, tool faltando, import errado | `test_smoke.py` |
+| 2. Lógica de tool (Python puro) | Grátis, instantâneo | A parte determinística de uma tool está errada | `test_tool_logic.py` |
+| 3. Conversa dourada | Barato, chamadas reais de LLM | Agente parou de chamar a tool certa, parou de completar o fluxo, guardrail disparou sem motivo | `test_golden_conversations.py` |
+| 4. Eval set com LLM-judge | Custo real, minutos | Qualidade da resposta regrediu, não só a estrutura | Parte 6 (planejado) |
+
+**Camadas 1 e 2 rodam em `make test`** (e no pipeline de CI, sempre) —
+não custam nada, então não tem motivo pra não rodar toda vez.
+
+**Camada 3 é deliberadamente separada** (`make test-live`), porque
+custa chamadas reais de API. Ela verifica ESTRUTURA (qual chave de
+`session.state` foi escrita, qual guardrail disparou), nunca texto
+exato — isso é o que permite ela sobreviver a ajustes de prompt sem
+precisar ser reescrita toda hora:
+
+```bash
+make test-live
+# ou, sem o Makefile:
+RUN_LIVE_TESTS=1 uv run pytest tests/test_golden_conversations.py -v
+```
+
+**Camada 4** (golden eval set + LLM-as-judge + regressão versionada)
+é escopo da Parte 6 — a camada 3 é deliberadamente mais simples que
+isso (sem modelo-juiz, sem rubrica de nota), pensada pra dar confiança
+no dia a dia de edição de agente, não pra ser o critério final de
+qualidade.
+
+### Workflow prático ao editar um agente
+
+1. `uv run pytest` (grátis) — confirma que nada estrutural quebrou
+2. Se mexeu na lógica de uma tool, rode/adicione o teste direto dela
+   (camada 2, grátis)
+3. `make test-live` — confirma que o fluxo ainda completa e chama as
+   tools certas (custa uma chamada real, mas é rápido)
+4. `make web` — checagem manual de tom/qualidade da conversa (ainda
+   importa, só não é mais a ÚNICA linha de defesa)
 
 ## Próxima parte
 

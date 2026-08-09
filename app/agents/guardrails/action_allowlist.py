@@ -27,8 +27,17 @@ _QUALIFICATION_LINK_BASE = "https://sdr-bot.exemplo.com/qualificar"
 def enforce_action_allowlist(tool, args: dict, tool_context: ToolContext) -> dict | None:
     """Retorna um dict (substituindo o resultado real da tool) se a ação
     for bloqueada; retorna None para deixar a tool executar normalmente.
+
+    `tool` aqui é o objeto `BaseTool`/`FunctionTool` que o ADK usa
+    internamente para invocar a função real -- tem um atributo `.name`
+    (extraído de `func.__name__` na hora de envolver a função), não
+    `__name__` diretamente. Usar `.__name__` passa despercebido em
+    testes unitários que chamam a função crua direto, mas quebra em
+    execução real (google.adk.workflow._errors.DynamicNodeFailError) —
+    foi exatamente assim que este bug foi encontrado, via
+    test_golden_conversations.py, não pelos testes unitários.
     """
-    if tool.__name__ not in _GATED_TOOLS:
+    if tool.name not in _GATED_TOOLS:
         return None
 
     status = tool_context.state.get(STATE_QUALIFICATION_STATUS)
@@ -37,7 +46,7 @@ def enforce_action_allowlist(tool, args: dict, tool_context: ToolContext) -> dic
 
     flags = tool_context.state.get(STATE_GUARDRAIL_FLAGS, [])
     flags.append(
-        f"{tool_context.agent_name}: {tool.__name__} bloqueado — lead "
+        f"{tool_context.agent_name}: {tool.name} bloqueado — lead "
         f"ainda não qualificado (status atual: {status!r})"
     )
     tool_context.state[STATE_GUARDRAIL_FLAGS] = flags

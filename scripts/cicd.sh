@@ -143,6 +143,241 @@ def test_health_returns_ok():
     assert response.json() == {"status": "ok"}
 SDR_CICD_EOF
 
+echo "  - tests/test_tool_logic.py"
+cat > "$TARGET_DIR/tests/test_tool_logic.py" <<'SDR_CICD_EOF'
+"""
+Layer 2 de testes: as funções de tool que são Python puro (sem chamada
+de LLM) merecem teste direto, não só indireto via guardrail. Rápido,
+grátis, e pega regressão na lógica determinística antes de qualquer
+chamada de API real.
+
+Ver README > "Estratégia de testes" para onde isso se encaixa na
+pirâmide de 4 camadas (estrutural → lógica de tool → conversa dourada →
+eval set com LLM-judge).
+"""
+
+from unittest.mock import MagicMock
+
+from app.agents.qualification import set_qualification_status
+from app.agents.scheduling import book_meeting, check_availability
+from app.agents.session.state_schema import STATE_QUALIFICATION_STATUS
+
+
+def _fake_tool_context() -> MagicMock:
+    ctx = MagicMock()
+    ctx.state = {}
+    return ctx
+
+
+# --- check_availability ---
+
+
+def test_check_availability_returns_success_with_slots():
+    result = check_availability()
+
+    assert result["status"] == "success"
+    assert len(result["available_slots"]) == 3
+
+
+# --- book_meeting ---
+
+
+def test_book_meeting_confirms_valid_slot():
+    result = book_meeting("terça-feira às 10h")
+
+    assert result["status"] == "success"
+    assert result["confirmed_slot"] == "terça-feira às 10h"
+
+
+def test_book_meeting_rejects_invalid_slot():
+    result = book_meeting("sexta-feira às 20h")
+
+    assert result["status"] == "error"
+    assert "não está disponível" in result["error_message"]
+
+
+def test_book_meeting_slot_list_matches_check_availability():
+    # Trava a consistência entre as duas tools -- se alguém mudar
+    # _MOCK_SLOTS num lugar só, isso pega a divergência.
+    available = check_availability()["available_slots"]
+    for slot in available:
+        assert book_meeting(slot)["status"] == "success"
+
+
+# --- set_qualification_status ---
+
+
+def test_set_qualification_status_accepts_valid_status():
+    ctx = _fake_tool_context()
+
+    result = set_qualification_status("qualified", "orçamento e prazo confirmados", ctx)
+
+    assert result["status"] == "success"
+    assert result["recorded_status"] == "qualified"
+    assert ctx.state[STATE_QUALIFICATION_STATUS] == "qualified"
+
+
+def test_set_qualification_status_rejects_invalid_status():
+    ctx = _fake_tool_context()
+
+    result = set_qualification_status("super_qualified", "não é um status real", ctx)
+
+    assert result["status"] == "error"
+    assert STATE_QUALIFICATION_STATUS not in ctx.state
+
+
+def test_set_qualification_status_all_valid_values_accepted():
+    for status in ("qualified", "disqualified", "in_progress"):
+        ctx = _fake_tool_context()
+        result = set_qualification_status(status, "teste", ctx)
+        assert result["status"] == "success"
+        assert ctx.state[STATE_QUALIFICATION_STATUS] == status
+SDR_CICD_EOF
+
+echo "  - tests/test_golden_conversations.py"
+cat > "$TARGET_DIR/tests/test_golden_conversations.py" <<'SDR_CICD_EOF'
+"""
+Layer 3 de testes: "conversas douradas" -- rodam contra o LLM de
+verdade (via LiteLLM Proxy -> OpenRouter) e verificam ESTRUTURA (qual
+tool foi chamada, o que foi escrito em session.state), não texto exato.
+Isso é deliberadamente MAIS simples que o eval set da Parte 6 (sem
+modelo-juiz, sem rubrica de nota) -- o objetivo aqui é pegar "um ajuste
+de prompt fez o agente parar de chamar set_qualification_status", não
+avaliar qualidade de resposta.
+
+Custam chamadas reais de API e precisam do LiteLLM Proxy rodando --
+por isso ficam FORA do `pytest`/`make test` padrão, rodando só quando
+explicitamente pedido:
+
+    make test-live
+    # ou
+    RUN_LIVE_TESTS=1 uv run pytest tests/test_golden_conversations.py -v
+
+Pré-requisito: proxy de pé (`make proxy-up`) e .env configurado
+(OPENROUTER_API_KEY, PII_HASH_SALT).
+"""
+
+import os
+import uuid
+
+import pytest
+from google.adk.runners import Runner
+from google.adk.sessions import InMemorySessionService
+from google.genai import types
+
+pytestmark = pytest.mark.skipif(
+    os.environ.get("RUN_LIVE_TESTS") != "1",
+    reason=(
+        "Testes ao vivo -- custam chamadas reais de API e precisam do "
+        "LiteLLM Proxy rodando. Rode com RUN_LIVE_TESTS=1 (ou `make test-live`)."
+    ),
+)
+
+_APP_NAME = "sdr-bot-test"
+
+
+async def _run_conversation(agent, messages: list[str]) -> dict:
+    """Roda uma conversa multi-turno contra um agente real (specialist
+    OU root_agent) e retorna o session.state final.
+
+    Cada teste usa um session_id novo (uuid) -- sessões não devem
+    vazar estado entre testes.
+    """
+    session_service = InMemorySessionService()
+    user_id = "test-user"
+    session_id = f"golden-{uuid.uuid4().hex[:8]}"
+
+    await session_service.create_session(
+        app_name=_APP_NAME, user_id=user_id, session_id=session_id
+    )
+    runner = Runner(agent=agent, app_name=_APP_NAME, session_service=session_service)
+
+    for message in messages:
+        content = types.Content(role="user", parts=[types.Part(text=message)])
+        async for _event in runner.run_async(
+            user_id=user_id, session_id=session_id, new_message=content
+        ):
+            pass  # só precisamos do estado final, não do texto de cada evento
+
+    session = await session_service.get_session(
+        app_name=_APP_NAME, user_id=user_id, session_id=session_id
+    )
+    return session.state
+
+
+# --- QualificationAgent ---
+
+
+async def test_qualification_flow_sets_status():
+    from app.agents.qualification import qualification_agent
+    from app.agents.session.state_schema import STATE_QUALIFICATION_STATUS
+
+    state = await _run_conversation(
+        qualification_agent,
+        [
+            "Oi, vi vocês no LinkedIn",
+            "Temos uns 50 funcionários, orçamento de uns R$5k/mês",
+            "Sou eu quem decide isso",
+            "Precisamos resolver isso ainda esse trimestre",
+        ],
+    )
+
+    # Não afirmamos QUAL status -- isso depende de julgamento do modelo
+    # e mudaria a cada ajuste de prompt. Afirmamos que a tool foi
+    # chamada com ALGUM valor válido -- é isso que prova que o fluxo
+    # não quebrou.
+    assert state.get(STATE_QUALIFICATION_STATUS) in {
+        "qualified",
+        "in_progress",
+        "disqualified",
+    }
+
+
+# --- SchedulingAgent (allowlist deveria bloquear sem qualificação prévia) ---
+
+
+async def test_scheduling_blocks_booking_without_qualification():
+    from app.agents.scheduling import scheduling_agent
+    from app.agents.session.state_schema import STATE_GUARDRAIL_FLAGS
+
+    state = await _run_conversation(
+        scheduling_agent,
+        ["quero marcar uma reunião", "pode ser terça-feira às 10h"],
+    )
+
+    # Sessão nova = sem qualification_status setado = allowlist deveria
+    # ter bloqueado book_meeting. Verificamos pelo flag de guardrail,
+    # não pelo texto da resposta (que varia).
+    flags = state.get(STATE_GUARDRAIL_FLAGS, [])
+    assert any("book_meeting" in f and "bloqueado" in f for f in flags), (
+        f"Esperava um flag de bloqueio de book_meeting, achei: {flags}"
+    )
+
+
+# --- Orchestrator (roteamento ponta a ponta) ---
+
+
+async def test_orchestrator_routes_pricing_question_to_knowledge_agent():
+    from app.agents import root_agent
+    from app.agents.session.state_schema import STATE_LAST_RETRIEVED_CONTEXT
+
+    state = await _run_conversation(root_agent, ["quanto custa o plano de vocês?"])
+
+    # Confirma que o Orchestrator consultou o KnowledgeAgent -- pelo
+    # state que ele escreve, não pelo texto exato da resposta (isso
+    # continua válido depois que a Parte 4 trocar o stub por RAG real).
+    assert STATE_LAST_RETRIEVED_CONTEXT in state
+
+
+async def test_orchestrator_routes_objection_to_objection_agent():
+    from app.agents import root_agent
+    from app.agents.session.state_schema import STATE_OBJECTIONS_RAISED
+
+    state = await _run_conversation(root_agent, ["isso parece caro pra gente agora"])
+
+    assert STATE_OBJECTIONS_RAISED in state
+SDR_CICD_EOF
+
 echo "  - Dockerfile"
 cat > "$TARGET_DIR/Dockerfile" <<'SDR_CICD_EOF'
 # syntax=docker/dockerfile:1
@@ -461,6 +696,8 @@ help:
 	@echo "  make test          - roda a suite de testes completa"
 	@echo "  make test-pii      - roda só os testes de PII (mais rápido pra iterar)"
 	@echo "  make test-guardrails - roda só os testes de guardrails (Parte 3)"
+	@echo "  make test-live     - conversas douradas contra o LLM real (custa"
+	@echo "                       API, sobe o proxy sozinho) — NÃO entra em 'make test'"
 	@echo "  make lint          - roda o ruff"
 	@echo "  make clean         - remove __pycache__/.pytest_cache/.ruff_cache"
 
@@ -520,6 +757,11 @@ test-guardrails:
 	uv run pytest tests/test_prompt_injection.py tests/test_output_policy.py \
 		tests/test_action_allowlist.py tests/test_guardrails.py -v
 
+# Testes ao vivo (Layer 3): custam chamadas reais de API, por isso não
+# entram em "make test". Sobe o proxy (se preciso) antes de rodar.
+test-live: proxy-up
+	RUN_LIVE_TESTS=1 uv run pytest tests/test_golden_conversations.py -v
+
 lint:
 	uv run ruff check app tests
 
@@ -560,6 +802,7 @@ dev = [
 
 [tool.pytest.ini_options]
 pythonpath = ["."]
+asyncio_mode = "auto"
 
 [tool.ruff]
 line-length = 100
@@ -2906,7 +3149,10 @@ make proxy-status   # container está de pé?
 make proxy-logs     # acompanhar logs do proxy
 make proxy-restart  # derrubar e subir de novo (necessário após editar .env)
 
-make test    # suite completa
+make test    # suite completa (grátis -- camadas 1 e 2 de teste)
+make test-live  # conversas douradas contra o LLM real (custa API --
+                # disponível a partir da Parte 2/3, ver estratégia de
+                # testes na versão completa deste README)
 make lint    # ruff
 make clean   # limpa __pycache__/.pytest_cache/.ruff_cache
 ```

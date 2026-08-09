@@ -27,6 +27,8 @@ help:
 	@echo "  make test          - roda a suite de testes completa"
 	@echo "  make test-pii      - roda só os testes de PII (mais rápido pra iterar)"
 	@echo "  make test-guardrails - roda só os testes de guardrails (Parte 3)"
+	@echo "  make test-live     - conversas douradas contra o LLM real (custa"
+	@echo "                       API, sobe o proxy sozinho) — NÃO entra em 'make test'"
 	@echo "  make lint          - roda o ruff"
 	@echo "  make clean         - remove __pycache__/.pytest_cache/.ruff_cache"
 
@@ -85,6 +87,11 @@ test-pii:
 test-guardrails:
 	uv run pytest tests/test_prompt_injection.py tests/test_output_policy.py \
 		tests/test_action_allowlist.py tests/test_guardrails.py -v
+
+# Testes ao vivo (Layer 3): custam chamadas reais de API, por isso não
+# entram em "make test". Sobe o proxy (se preciso) antes de rodar.
+test-live: proxy-up
+	RUN_LIVE_TESTS=1 uv run pytest tests/test_golden_conversations.py -v
 
 lint:
 	uv run ruff check app tests

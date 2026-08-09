@@ -8,6 +8,16 @@
 # Racional de qual modelo vai em cada papel está documentado na arquitetura
 # (README.md) — resumo: tarefas de raciocínio/nuance usam modelo mais forte,
 # tarefas estruturadas/roteamento usam modelo mais barato e rápido.
+#
+# NOTA: qualification/knowledge/objection-model apontavam originalmente
+# pra anthropic/claude-3.5-sonnet — esse modelo foi oficialmente
+# aposentado pela Anthropic em 5 de janeiro de 2026 e a OpenRouter parou
+# de rotear pra ele ("No endpoints found"), o que quebrou os testes ao
+# vivo (test_golden_conversations.py). Migrado pra anthropic/claude-
+# sonnet-5 (sucessor direto na mesma faixa Sonnet, lançado 30/06/2026).
+# Isso é um lembrete de que aliases de modelo em provedores terceiros
+# precisam de manutenção periódica -- não é "configura uma vez e
+# esquece".
 
 model_list:
   # --- Orquestrador: roteamento de intenção, não precisa de raciocínio pesado ---
@@ -19,19 +29,19 @@ model_list:
   # --- Qualificação: precisa conduzir perguntas de discovery coerentes ---
   - model_name: qualification-model
     litellm_params:
-      model: openrouter/anthropic/claude-3.5-sonnet
+      model: openrouter/anthropic/claude-sonnet-5
       api_key: os.environ/OPENROUTER_API_KEY
 
   # --- Knowledge/RAG: faithfulness importa, não pode alucinar sobre produto ---
   - model_name: knowledge-model
     litellm_params:
-      model: openrouter/anthropic/claude-3.5-sonnet
+      model: openrouter/anthropic/claude-sonnet-5
       api_key: os.environ/OPENROUTER_API_KEY
 
   # --- Objeções: nuance e persuasão ---
   - model_name: objection-model
     litellm_params:
-      model: openrouter/anthropic/claude-3.5-sonnet
+      model: openrouter/anthropic/claude-sonnet-5
       api_key: os.environ/OPENROUTER_API_KEY
 
   # --- Agendamento: tarefa estruturada (extrair data/hora), modelo barato ---
