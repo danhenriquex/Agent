@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# Gerado em: 2026-08-09T13:30:38Z -- se os outros scripts (part1/cicd/part2/part3) que você tem localmente têm datas MUITO diferentes desta, você está misturando versões antigas com novas. Baixe os 4 de novo, juntos, na mesma resposta/mensagem.
 #
 # cicd_setup.sh — adiciona/atualiza a camada de CI/CD + deploy GCP:
 #   - app/api.py e tests/test_api.py (camada HTTP sobre os agentes)
@@ -276,9 +277,10 @@ pytestmark = pytest.mark.skipif(
 _APP_NAME = "sdr-bot-test"
 
 
-async def _run_conversation(agent, messages: list[str]) -> dict:
+async def _run_conversation(agent, messages: list[str]) -> tuple[dict, str]:
     """Roda uma conversa multi-turno contra um agente real (specialist
-    OU root_agent) e retorna o session.state final.
+    OU root_agent) e retorna (session.state final, texto da última
+    resposta).
 
     Cada teste usa um session_id novo (uuid) -- sessões não devem
     vazar estado entre testes.
@@ -292,17 +294,37 @@ async def _run_conversation(agent, messages: list[str]) -> dict:
     )
     runner = Runner(agent=agent, app_name=_APP_NAME, session_service=session_service)
 
+    last_response_text = ""
     for message in messages:
         content = types.Content(role="user", parts=[types.Part(text=message)])
-        async for _event in runner.run_async(
+        async for event in runner.run_async(
             user_id=user_id, session_id=session_id, new_message=content
         ):
-            pass  # só precisamos do estado final, não do texto de cada evento
+            if event.is_final_response() and event.content and event.content.parts:
+                last_response_text = event.content.parts[0].text or last_response_text
 
     session = await session_service.get_session(
         app_name=_APP_NAME, user_id=user_id, session_id=session_id
     )
-    return session.state
+    return session.state, last_response_text
+
+
+# --- Orchestrator: saudação (padrão booking-first) ---
+
+
+async def test_greeting_introduces_bot_and_company():
+    from app.agents import root_agent
+    from app.agents.persona import COMPANY_NAME
+
+    _state, response_text = await _run_conversation(root_agent, ["oi"])
+
+    # A queixa original era literal: "oi" respondia só "como posso
+    # ajudar", sem contexto nenhum. Isso verifica a correção de forma
+    # estrutural (nome da empresa presente), não texto exato -- resiste
+    # a ajustes futuros de tom/redação do prompt.
+    assert COMPANY_NAME.lower() in response_text.lower(), (
+        f"Resposta à saudação não menciona {COMPANY_NAME}: {response_text!r}"
+    )
 
 
 # --- QualificationAgent ---
@@ -312,7 +334,7 @@ async def test_qualification_flow_sets_status():
     from app.agents.qualification import qualification_agent
     from app.agents.session.state_schema import STATE_QUALIFICATION_STATUS
 
-    state = await _run_conversation(
+    state, _response_text = await _run_conversation(
         qualification_agent,
         [
             "Oi, vi vocês no LinkedIn",
@@ -340,7 +362,7 @@ async def test_scheduling_blocks_booking_without_qualification():
     from app.agents.scheduling import scheduling_agent
     from app.agents.session.state_schema import STATE_GUARDRAIL_FLAGS
 
-    state = await _run_conversation(
+    state, _response_text = await _run_conversation(
         scheduling_agent,
         ["quero marcar uma reunião", "pode ser terça-feira às 10h"],
     )
@@ -361,7 +383,9 @@ async def test_orchestrator_routes_pricing_question_to_knowledge_agent():
     from app.agents import root_agent
     from app.agents.session.state_schema import STATE_LAST_RETRIEVED_CONTEXT
 
-    state = await _run_conversation(root_agent, ["quanto custa o plano de vocês?"])
+    state, _response_text = await _run_conversation(
+        root_agent, ["quanto custa o plano de vocês?"]
+    )
 
     # Confirma que o Orchestrator consultou o KnowledgeAgent -- pelo
     # state que ele escreve, não pelo texto exato da resposta (isso
@@ -373,7 +397,9 @@ async def test_orchestrator_routes_objection_to_objection_agent():
     from app.agents import root_agent
     from app.agents.session.state_schema import STATE_OBJECTIONS_RAISED
 
-    state = await _run_conversation(root_agent, ["isso parece caro pra gente agora"])
+    state, _response_text = await _run_conversation(
+        root_agent, ["isso parece caro pra gente agora"]
+    )
 
     assert STATE_OBJECTIONS_RAISED in state
 SDR_CICD_EOF
@@ -489,6 +515,17 @@ cat > "$TARGET_DIR/.gitlab-ci.yml" <<'SDR_CICD_EOF'
 # main especificamente — até lá, o pipeline fica verde só com
 # lint+test+build_check.
 #
+# `uv sync --locked` (não --frozen): --frozen instala o que estiver no
+# uv.lock SEM checar se bate com pyproject.toml -- se o lock commitado
+# estiver desatualizado (ex: uma dependência de dev foi adicionada no
+# pyproject.toml mas o uv.lock não foi regenerado), --frozen instala
+# silenciosamente incompleto, sem erro nenhum. Foi exatamente assim que
+# um `ruff check` falhou em CI com "No such file or directory" — o lock
+# commitado não tinha o ruff, e --frozen nunca reclamou disso. --locked
+# falha alto e claro nesse cenário ("lockfile não está atualizado"), o
+# que é um erro muito mais fácil de diagnosticar que "comando não
+# encontrado" no meio de um job de lint.
+#
 # Variáveis de CI/CD esperadas (configurar quando for ativar o deploy):
 #   GCP_PROJECT_ID       - ID do projeto GCP de destino
 #   GCP_PROJECT_NUMBER   - número do projeto (necessário pro WIF)
@@ -540,7 +577,7 @@ lint:
   stage: lint
   image: ghcr.io/astral-sh/uv:python3.12-bookworm-slim
   script:
-    - uv sync --frozen
+    - uv sync --locked
     - uv run ruff check app tests
   rules:
     - if: $CI_PIPELINE_SOURCE == "merge_request_event"
@@ -551,7 +588,7 @@ test:
   stage: test
   image: ghcr.io/astral-sh/uv:python3.12-bookworm-slim
   script:
-    - uv sync --frozen
+    - uv sync --locked
     - uv run pytest tests/ -v
   rules:
     - if: $CI_PIPELINE_SOURCE == "merge_request_event"

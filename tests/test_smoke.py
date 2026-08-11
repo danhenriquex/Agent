@@ -67,6 +67,20 @@ def test_specialists_have_no_parent_agent():
         )
 
 
+def test_every_agent_instruction_includes_company_name():
+    # Barato e sem chamada de LLM -- pega o caso "criei um agente novo e
+    # esqueci de importar PERSONA_INTRO", antes de precisar de um teste
+    # ao vivo pra descobrir isso.
+    from app.agents.persona import COMPANY_NAME
+
+    all_agents = [root_agent, *_specialist_agents()]
+    for agent in all_agents:
+        assert COMPANY_NAME in agent.instruction, (
+            f"{agent.name} não tem {COMPANY_NAME} na instruction -- "
+            "provavelmente esqueceu de usar PERSONA_INTRO"
+        )
+
+
 def test_scheduling_agent_tools_are_registered():
     scheduling_agent = next(
         agent for agent in _specialist_agents() if agent.name == "SchedulingAgent"

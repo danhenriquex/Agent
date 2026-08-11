@@ -38,9 +38,10 @@ pytestmark = pytest.mark.skipif(
 _APP_NAME = "sdr-bot-test"
 
 
-async def _run_conversation(agent, messages: list[str]) -> dict:
+async def _run_conversation(agent, messages: list[str]) -> tuple[dict, str]:
     """Roda uma conversa multi-turno contra um agente real (specialist
-    OU root_agent) e retorna o session.state final.
+    OU root_agent) e retorna (session.state final, texto da última
+    resposta).
 
     Cada teste usa um session_id novo (uuid) -- sessões não devem
     vazar estado entre testes.
@@ -54,17 +55,37 @@ async def _run_conversation(agent, messages: list[str]) -> dict:
     )
     runner = Runner(agent=agent, app_name=_APP_NAME, session_service=session_service)
 
+    last_response_text = ""
     for message in messages:
         content = types.Content(role="user", parts=[types.Part(text=message)])
-        async for _event in runner.run_async(
+        async for event in runner.run_async(
             user_id=user_id, session_id=session_id, new_message=content
         ):
-            pass  # só precisamos do estado final, não do texto de cada evento
+            if event.is_final_response() and event.content and event.content.parts:
+                last_response_text = event.content.parts[0].text or last_response_text
 
     session = await session_service.get_session(
         app_name=_APP_NAME, user_id=user_id, session_id=session_id
     )
-    return session.state
+    return session.state, last_response_text
+
+
+# --- Orchestrator: saudação (padrão booking-first) ---
+
+
+async def test_greeting_introduces_bot_and_company():
+    from app.agents import root_agent
+    from app.agents.persona import COMPANY_NAME
+
+    _state, response_text = await _run_conversation(root_agent, ["oi"])
+
+    # A queixa original era literal: "oi" respondia só "como posso
+    # ajudar", sem contexto nenhum. Isso verifica a correção de forma
+    # estrutural (nome da empresa presente), não texto exato -- resiste
+    # a ajustes futuros de tom/redação do prompt.
+    assert COMPANY_NAME.lower() in response_text.lower(), (
+        f"Resposta à saudação não menciona {COMPANY_NAME}: {response_text!r}"
+    )
 
 
 # --- QualificationAgent ---
@@ -74,7 +95,7 @@ async def test_qualification_flow_sets_status():
     from app.agents.qualification import qualification_agent
     from app.agents.session.state_schema import STATE_QUALIFICATION_STATUS
 
-    state = await _run_conversation(
+    state, _response_text = await _run_conversation(
         qualification_agent,
         [
             "Oi, vi vocês no LinkedIn",
@@ -102,7 +123,7 @@ async def test_scheduling_blocks_booking_without_qualification():
     from app.agents.scheduling import scheduling_agent
     from app.agents.session.state_schema import STATE_GUARDRAIL_FLAGS
 
-    state = await _run_conversation(
+    state, _response_text = await _run_conversation(
         scheduling_agent,
         ["quero marcar uma reunião", "pode ser terça-feira às 10h"],
     )
@@ -123,7 +144,9 @@ async def test_orchestrator_routes_pricing_question_to_knowledge_agent():
     from app.agents import root_agent
     from app.agents.session.state_schema import STATE_LAST_RETRIEVED_CONTEXT
 
-    state = await _run_conversation(root_agent, ["quanto custa o plano de vocês?"])
+    state, _response_text = await _run_conversation(
+        root_agent, ["quanto custa o plano de vocês?"]
+    )
 
     # Confirma que o Orchestrator consultou o KnowledgeAgent -- pelo
     # state que ele escreve, não pelo texto exato da resposta (isso
@@ -135,6 +158,8 @@ async def test_orchestrator_routes_objection_to_objection_agent():
     from app.agents import root_agent
     from app.agents.session.state_schema import STATE_OBJECTIONS_RAISED
 
-    state = await _run_conversation(root_agent, ["isso parece caro pra gente agora"])
+    state, _response_text = await _run_conversation(
+        root_agent, ["isso parece caro pra gente agora"]
+    )
 
     assert STATE_OBJECTIONS_RAISED in state

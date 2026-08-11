@@ -1,11 +1,12 @@
-# SDR Bot — Sistema Multi-Agente (Parte 1: Esqueleto)
+# SDR Bot — Sistema Multi-Agente (Partes 1, 2 e 3: Esqueleto + PII + Guardrails)
 
 Chatbot SDR (Sales Development Representative) construído com **Google ADK**,
 desenhado para demonstrar, na prática, os requisitos técnicos de vagas de
 LLM/AI Engineer sênior focadas em produção: orquestração multi-agente,
 guardrails, mascaramento de PII, RAG avaliado e observabilidade.
 
-Este projeto é dividido em partes incrementais. Este README cobre a **Parte 1**.
+Este projeto é dividido em partes incrementais. Este README cobre as
+**Partes 1, 2 e 3**.
 
 ## O que existe nesta parte
 
@@ -29,15 +30,23 @@ Este projeto é dividido em partes incrementais. Este README cobre a **Parte 1**
   modelo-por-agente e a lógica de fallback.
 - Um agente com tools reais (`SchedulingAgent`), para validar tool-calling
   ponta a ponta através do proxy antes de mexer em tools mais sensíveis.
-- Smoke test da topologia (`tests/test_smoke.py`) que roda sem precisar de
-  chave de API.
+- **Mascaramento de PII (Parte 2)**: Presidio + recognizers customizados
+  para CPF/CNPJ (com validação real de dígito verificador) + telefone BR
+  (via `phonenumbers`) + spaCy `pt_core_news_lg` para nomes — ver seção
+  dedicada abaixo.
+- **Guardrails (Parte 3)**: detecção heurística de prompt injection,
+  allowlist de ação (`book_meeting` só executa se o lead estiver
+  qualificado) e validação de política de saída (nunca oferecer desconto
+  não autorizado) — em todo agente, mesmo padrão de defesa em
+  profundidade da Parte 2. Ver seção dedicada abaixo.
+- Smoke tests da topologia + testes de PII + testes de guardrails
+  (`tests/`) que rodam sem precisar de chave de API (a única exceção é o
+  download do modelo spaCy no `uv sync`, que acontece uma vez).
 
 ## O que **não** está aqui ainda (de propósito)
 
 | Falta | Onde entra |
 |---|---|
-| Mascaramento de PII (Presidio + recognizers BR) | Parte 2 |
-| Guardrails / mitigação de prompt injection | Parte 3 |
 | RAG real + MCP Server para o KnowledgeAgent | Parte 4 |
 | LangFuse + Phoenix (observabilidade) | Parte 5 |
 | Golden eval set + LLM-as-judge + regressão | Parte 6 |
@@ -45,6 +54,37 @@ Este projeto é dividido em partes incrementais. Este README cobre a **Parte 1**
 Cada agente tem comentários `TODO Parte N` no código exatamente nos pontos
 onde essas camadas vão se conectar — não são promessas soltas, são pontos
 de extensão já identificados na arquitetura.
+
+## Atalhos com Makefile
+
+Depois do primeiro setup manual acima, o dia a dia fica mais rápido via
+`make` — em especial `make web` resolve o problema de "quero testar na
+UI do adk toda hora": ele sobe o proxy (se ainda não estiver de pé),
+**espera de verdade ele responder** antes de prosseguir (isso existe
+porque `docker compose up -d` retorna assim que o container inicia, não
+quando o LiteLLM lá dentro termina de registrar os modelos — sem essa
+espera, é fácil bater num "empty reply from server" por pura corrida de
+horário), e só então abre a interface:
+
+```bash
+make web    # proxy + adk web, tudo em um comando
+make cli    # proxy + CLI (app/main.py)
+make api    # proxy + FastAPI com --reload
+
+make proxy-status   # container está de pé?
+make proxy-logs     # acompanhar logs do proxy
+make proxy-restart  # derrubar e subir de novo (necessário após editar .env)
+
+make test            # suite completa (camadas 1 e 2 -- grátis)
+make test-pii        # só os testes de PII
+make test-guardrails # só os testes de guardrails (Parte 3)
+make test-live       # conversas douradas contra o LLM real (custa API,
+                      # camada 3 -- ver "Estratégia de testes" abaixo)
+make lint             # ruff
+make clean            # limpa __pycache__/.pytest_cache/.ruff_cache
+```
+
+Rode `make` (sem alvo) ou `make help` pra ver a lista completa.
 
 ## Como rodar
 
@@ -69,6 +109,11 @@ ambiente certo.
 ```bash
 cp .env.example .env
 # edite .env e preencha OPENROUTER_API_KEY (https://openrouter.ai/keys)
+
+# gere e preencha também PII_HASH_SALT (obrigatório -- sem ele, o
+# mascaramento de CPF/CNPJ falha alto, de propósito, em vez de usar
+# um salt inseguro por padrão):
+python3 -c "import secrets; print(secrets.token_hex(32))"
 ```
 
 ### 3. Subir o LiteLLM Proxy
@@ -172,10 +217,349 @@ LiteLLM Proxy (Docker, litellm_proxy/config.yaml)
 OpenRouter ──► Claude 3.5 Sonnet / GPT-4o-mini / Llama 3.1 (fallback)
 ```
 
+## CI/CD (GitLab) e deploy na GCP
+
+### Modelo de branches
+
+```
+feature branches ──MR──► develop ──MR──► main
+   (trabalho acontece)   (integração,      (só deploy — nada mais)
+                          default branch
+                          do repositório)
+```
+
+- **`develop`** é a branch padrão do repositório (configurar em Settings
+  → Repository → Default branch). Toda feature branch abre MR contra
+  ela. `lint`/`test`/`docker_build_check` rodam em qualquer MR e em todo
+  push pra `develop` — feedback rápido, sem tocar em nada de GCP.
+- **`main`** só recebe merge vindo de `develop`, quando o conjunto de
+  mudanças está pronto pra ir pro ar. É a **única** branch que os jobs
+  `build_and_push`/`deploy_*` reconhecem — um push direto em `develop`
+  nunca aciona deploy, só em `main`.
+- Deliberadamente **não** é GitFlow completo (sem release/hotfix
+  branches) — pra um projeto deste porte, esse processo extra não paga
+  o custo de manutenção.
+- Recomendado: proteger `main` em Settings → Repository → Protected
+  branches (só merge via MR, sem push direto).
+
+Isso é o motivo de `.gitlab-ci.yml` usar nomes de branch explícitos
+(`"develop"`, `"main"`) nas regras, em vez de `$CI_DEFAULT_BRANCH` — uma
+vez que "branch padrão" e "branch que decide deploy" são conceitos
+diferentes aqui, uma variável só não cobre os dois.
+
+### Pipeline
+
+O pipeline (`.gitlab-ci.yml`) é evolutivo, em duas camadas:
+
+1. **Sempre roda, sem credencial nenhuma**: `lint`, `test` (smoke tests,
+   sem chamada real de LLM) e `docker_build_check` (valida que os
+   Dockerfiles buildam) — em qualquer MR e em push pra `develop` ou
+   `main`. Isso mantém o pipeline verde desde o primeiro commit, mesmo
+   antes de qualquer configuração de nuvem.
+2. **Só aparece quando a GCP estiver configurada E o commit for em
+   `main`**: `build_and_push` (Artifact Registry) e os dois `deploy_*`
+   (Cloud Run), condicionados à variável `$GCP_PROJECT_ID` existir no
+   projeto GitLab.
+
+Arquitetura de deploy: dois serviços Cloud Run — `litellm-proxy` (o
+gateway pra OpenRouter) e `sdr-bot-api` (a API FastAPI sobre o sistema de
+agentes), o segundo apontando pro primeiro via `LITELLM_PROXY_URL`.
+
+### Configurando deploy na GCP (rodar uma vez, fora do pipeline)
+
+```bash
+# 1. Habilitar APIs necessárias
+gcloud services enable run.googleapis.com artifactregistry.googleapis.com \
+    iamcredentials.googleapis.com secretmanager.googleapis.com
+
+# 2. Criar repositório no Artifact Registry
+gcloud artifacts repositories create sdr-bot-repo \
+    --repository-format=docker --location=us-central1
+
+# 3. Criar service account que o pipeline vai impersonar
+gcloud iam service-accounts create gitlab-ci-deployer \
+    --display-name="GitLab CI/CD deployer"
+
+# Dar as permissões mínimas necessárias (Artifact Registry + Cloud Run)
+gcloud projects add-iam-policy-binding "$GCP_PROJECT_ID" \
+    --member="serviceAccount:gitlab-ci-deployer@${GCP_PROJECT_ID}.iam.gserviceaccount.com" \
+    --role="roles/artifactregistry.writer"
+gcloud projects add-iam-policy-binding "$GCP_PROJECT_ID" \
+    --member="serviceAccount:gitlab-ci-deployer@${GCP_PROJECT_ID}.iam.gserviceaccount.com" \
+    --role="roles/run.admin"
+gcloud projects add-iam-policy-binding "$GCP_PROJECT_ID" \
+    --member="serviceAccount:gitlab-ci-deployer@${GCP_PROJECT_ID}.iam.gserviceaccount.com" \
+    --role="roles/iam.serviceAccountUser"
+
+# 4. Criar o Workload Identity Pool + Provider pro GitLab
+gcloud iam workload-identity-pools create gitlab-pool \
+    --location="global" --display-name="GitLab CI"
+
+gcloud iam workload-identity-pools providers create-oidc gitlab-provider \
+    --location="global" --workload-identity-pool="gitlab-pool" \
+    --issuer-uri="https://gitlab.com" \
+    --attribute-mapping="google.subject=assertion.sub,attribute.repository=assertion.project_path" \
+    --attribute-condition="assertion.project_path == '<seu-namespace>/<seu-repo>'"
+
+# 5. Permitir que a identidade federada do GitLab impersone a service account
+gcloud iam service-accounts add-iam-policy-binding \
+    "gitlab-ci-deployer@${GCP_PROJECT_ID}.iam.gserviceaccount.com" \
+    --role="roles/iam.workloadIdentityUser" \
+    --member="principalSet://iam.googleapis.com/projects/${GCP_PROJECT_NUMBER}/locations/global/workloadIdentityPools/gitlab-pool/attribute.repository/<seu-namespace>/<seu-repo>"
+
+# 6. Guardar os segredos de runtime no Secret Manager (não em CI/CD variables)
+echo -n "sua-chave-openrouter" | gcloud secrets create openrouter-api-key --data-file=-
+echo -n "sua-master-key-do-proxy" | gcloud secrets create litellm-proxy-key --data-file=-
+```
+
+### Variáveis a configurar no GitLab (Settings > CI/CD > Variables)
+
+| Variável | Valor |
+|---|---|
+| `GCP_PROJECT_ID` | ID do projeto GCP |
+| `GCP_PROJECT_NUMBER` | Número do projeto (`gcloud projects describe`) |
+| `GCP_REGION` / `AR_REGION` | ex: `us-central1` |
+| `AR_REPOSITORY` | `sdr-bot-repo` |
+| `WIF_POOL_ID` | `gitlab-pool` |
+| `WIF_PROVIDER_ID` | `gitlab-provider` |
+| `WIF_SERVICE_ACCOUNT` | `gitlab-ci-deployer@<project-id>.iam.gserviceaccount.com` |
+
+Nenhuma chave JSON de service account é armazenada em lugar nenhum — a
+autenticação usa o ID token OIDC que o próprio GitLab emite por job
+(`id_tokens` no `.gitlab-ci.yml`), trocado por uma credencial federada de
+curta duração via `gcloud iam workload-identity-pools create-cred-config`.
+
+## Mascaramento de PII (Parte 2)
+
+### Onde a máscara acontece — desenho de "perímetro"
+
+O Orchestrator é o único ponto de entrada (recebe texto cru do usuário)
+e o único ponto de saída (entrega a resposta final) de todo o sistema
+— consequência direta da migração pra `AgentTool` na Parte 1. Por isso:
+
+- **Todo agente** (Orchestrator + 5 especialistas) registra `mask_pii`
+  em `before_model_callback` — mascarar em texto já mascarado é
+  idempotente (não-operação), então isso é defesa em profundidade
+  barata, não redundância real hoje. Importa quando a Parte 4 der a
+  algum especialista uma tool que traga dado de fora (ex: CRM).
+- **Só o Orchestrator** registra `unmask_pii` em `after_model_callback`
+  — desmascarar em qualquer outro lugar arriscaria PII crua voltando
+  pro contexto do Orchestrator antes da resposta final estar pronta.
+
+```
+Usuário (texto cru, pode ter PII)
+      │
+      ▼
+OrchestratorAgent.before_model_callback  ← mask_pii (entrada)
+      │  (a partir daqui, nenhum LLM do sistema vê PII crua)
+      ▼
+Orchestrator decide consultar um especialista (AgentTool)
+      │
+      ▼
+Specialist.before_model_callback  ← mask_pii (defesa em profundidade,
+      │                               normalmente não-operação)
+      ▼
+Specialist responde (ainda mascarado)
+      │
+      ▼
+Resultado volta pro Orchestrator como retorno de tool (ainda mascarado)
+      │
+      ▼
+OrchestratorAgent.after_model_callback  ← unmask_pii (só aqui)
+      │
+      ▼
+Usuário recebe o nome real, nunca um token
+```
+
+### As três camadas
+
+| Camada | Entidades | Ação | Por quê |
+|---|---|---|---|
+| 1 — Token reversível | `PERSON`, `EMAIL_ADDRESS`, `TELEFONE_BR` | `[PERSON_1]`, `[EMAIL_1]`... — mapa em `session.state`, revertido só na saída | Útil pra conversa soar natural |
+| 2 — Hash com salt | `CPF_BR`, `CNPJ_BR` | SHA-256 + salt fixo secreto, nunca revertido | O bot nunca precisa "falar" um CPF de volta — só correlacionar |
+| 3 — Bloqueio total | `CREDIT_CARD` | Mensagem nunca chega ao LLM; resposta de recusa curto-circuitada | Não existe motivo legítimo pra dado de cartão numa conversa de SDR |
+
+**Detalhe de segurança que importa citar em entrevista**: hash de CPF
+sem salt secreto não protege quase nada — 11 dígitos é um espaço de
+busca pequeno o suficiente pra força bruta trivial. O salt em
+`PII_HASH_SALT` precisa ser fixo (pra permitir correlação entre
+sessões: "é o mesmo lead de antes?") **e** secreto (fora do código,
+via `.env` local / Secret Manager em produção) — um hash sem essas duas
+propriedades juntas não é proteção de verdade.
+
+### Recognizers customizados vs. built-in do Presidio
+
+- `CPF_BR`, `CNPJ_BR`: customizados (`app/agents/pii/recognizers.py`),
+  com validação real de dígito verificador — um número no formato de
+  CPF que falha o dígito verificador não é tratado como PII (evita
+  falso positivo em qualquer ID de 11 dígitos). Também rejeita
+  explicitamente sequências tipo `111.111.111-11`, que passam no
+  checksum matematicamente mas nunca são CPFs reais.
+- `TELEFONE_BR`: built-in do Presidio (`PhoneRecognizer`, usa
+  `python-phonenumbers`), só reconfigurado pra região `BR` — mais
+  robusto que regex escrita à mão.
+- `CREDIT_CARD`: built-in do Presidio, mas exige atenção — o
+  recognizer padrão tem `supported_language="en"` e é **silenciosamente
+  descartado** ao carregar recognizers pra português (só loga um
+  warning, não falha). Descoberto via teste automatizado, corrigido
+  registrando-o explicitamente com `supported_language="pt"` em
+  `engine.py`.
+- `PERSON`: built-in do Presidio, mas com o backend de NLP trocado pra
+  `pt_core_news_lg` (spaCy) — o padrão do Presidio é treinado em
+  inglês e não reconhece nomes em português de forma confiável.
+
+### Rodando os testes de PII isoladamente
+
+```bash
+uv run pytest tests/test_pii_masking.py -v
+```
+
+A primeira execução carrega o modelo spaCy (~15s); chamadas seguintes
+na mesma sessão de teste reusam o engine cacheado (singleton em
+`engine.py`).
+
+## Guardrails (Parte 3)
+
+Três pontos deixaram rastro explícito de TODO no código durante as
+Partes 1 e 2 — a Parte 3 é sobre fechar exatamente esses três.
+
+### 1. Detecção de prompt injection (`before_model_callback`)
+
+Escopo desta versão: **só heurística** (regex/keyword), sem camada de
+LLM-judge — decisão deliberada de custo/latência, não limitação técnica.
+Roda depois do `mask_pii` na mesma cadeia
+(`[mask_pii, detect_prompt_injection]`), em todo agente:
+
+```python
+before_model_callback=[mask_pii, detect_prompt_injection]
+```
+
+Só avalia o **último turno do usuário**, não o histórico inteiro a cada
+chamada — uma mensagem já filtrada não precisa ser reavaliada pra
+sempre. Ver `app/agents/guardrails/prompt_injection.py`.
+
+### 2. Allowlist de ação (`before_tool_callback`)
+
+Resolve o TODO de `scheduling.py`: `book_meeting` só executa de verdade
+se `session.state[STATE_QUALIFICATION_STATUS] == "qualified"`. Isso é
+diferente de um guardrail de conteúdo — é sobre o que o sistema tem
+permissão de **executar**, não sobre o que ele diz:
+
+```
+book_meeting(slot) chamado
+      │
+      ▼
+enforce_action_allowlist verifica qualification_status
+      │
+   ┌──┴──┐
+  sim    não
+   │      │
+   ▼      ▼
+executa   retorna {"status": "blocked", "error_message": "...link..."}
+```
+
+Quando bloqueado, a resposta simula um redirecionamento (link fake —
+não existe formulário de qualificação real neste projeto) em vez de só
+recusar. O contrato de retorno imita o padrão de erro que `book_meeting`
+já usava pra "horário indisponível", deixando o modelo do
+`SchedulingAgent` transformar isso em linguagem natural, em vez da
+guardrail hardcodar a frase exata.
+
+Isso também exigiu resolver um problema real: `STATE_QUALIFICATION_STATUS`
+existia como chave reservada desde a Parte 1, mas nada escrevia um valor
+estruturado nela. A `QualificationAgent` ganhou uma tool nova pra isso:
+
+```python
+set_qualification_status(status: "qualified"|"disqualified"|"in_progress", reasoning: str)
+```
+
+Mesmo padrão que `SchedulingAgent` já usava — mudança de estado
+estruturada e auditável via tool, não texto livre que outro lugar do
+sistema teria que tentar interpretar.
+
+### 3. Validação de política de saída (`after_model_callback`)
+
+Resolve o TODO de `objection.py`: "nunca ofereça desconto" era só uma
+instrução de prompt — contornável por prompt injection. Agora também é
+verificado na resposta de verdade:
+
+```python
+after_model_callback=[validate_output_policy, block_unauthorized_transfer]  # especialistas
+after_model_callback=[validate_output_policy, unmask_pii]                    # orchestrator
+```
+
+**Escopo**: todo agente (defesa em profundidade), não só
+`ObjectionHandlingAgent` — mesma postura da Parte 2. Hoje só o
+`ObjectionHandlingAgent` fala sobre desconto, mas `KnowledgeAgent` vai
+discutir preço de verdade a partir da Parte 4, e essa proteção já
+precisa estar no lugar antes disso, não adicionada depois.
+
+### Onde o código mora
+
+```
+app/agents/guardrails/
+├── transfer.py           # bloqueio de transfer_to_agent não autorizado
+│                           # (existia desde a Parte 1 como _guardrails.py,
+│                           # movido pra cá — não é mais um stopgap solto)
+├── prompt_injection.py   # detect_prompt_injection
+├── output_policy.py      # validate_output_policy
+└── action_allowlist.py   # enforce_action_allowlist
+```
+
+### Rodando os testes de guardrails isoladamente
+
+```bash
+uv run pytest tests/test_prompt_injection.py tests/test_output_policy.py \
+  tests/test_action_allowlist.py tests/test_guardrails.py -v
+```
+
+## Estratégia de testes
+
+Pergunta prática: "editei `qualification.py`, como sei que não quebrei
+nada?" A resposta muda dependendo de QUÃO CARO você aceita que a
+resposta seja — por isso os testes deste projeto ficam em 4 camadas,
+cada uma com um trade-off diferente de custo vs. o que ela pega:
+
+| Camada | Custo | Pega | Onde |
+|---|---|---|---|
+| 1. Estrutural | Grátis, instantâneo | Wiring quebrado, tool faltando, import errado | `test_smoke.py` |
+| 2. Lógica de tool (Python puro) | Grátis, instantâneo | A parte determinística de uma tool está errada | `test_tool_logic.py` |
+| 3. Conversa dourada | Barato, chamadas reais de LLM | Agente parou de chamar a tool certa, parou de completar o fluxo, guardrail disparou sem motivo | `test_golden_conversations.py` |
+| 4. Eval set com LLM-judge | Custo real, minutos | Qualidade da resposta regrediu, não só a estrutura | Parte 6 (planejado) |
+
+**Camadas 1 e 2 rodam em `make test`** (e no pipeline de CI, sempre) —
+não custam nada, então não tem motivo pra não rodar toda vez.
+
+**Camada 3 é deliberadamente separada** (`make test-live`), porque
+custa chamadas reais de API. Ela verifica ESTRUTURA (qual chave de
+`session.state` foi escrita, qual guardrail disparou), nunca texto
+exato — isso é o que permite ela sobreviver a ajustes de prompt sem
+precisar ser reescrita toda hora:
+
+```bash
+make test-live
+# ou, sem o Makefile:
+RUN_LIVE_TESTS=1 uv run pytest tests/test_golden_conversations.py -v
+```
+
+**Camada 4** (golden eval set + LLM-as-judge + regressão versionada)
+é escopo da Parte 6 — a camada 3 é deliberadamente mais simples que
+isso (sem modelo-juiz, sem rubrica de nota), pensada pra dar confiança
+no dia a dia de edição de agente, não pra ser o critério final de
+qualidade.
+
+### Workflow prático ao editar um agente
+
+1. `uv run pytest` (grátis) — confirma que nada estrutural quebrou
+2. Se mexeu na lógica de uma tool, rode/adicione o teste direto dela
+   (camada 2, grátis)
+3. `make test-live` — confirma que o fluxo ainda completa e chama as
+   tools certas (custa uma chamada real, mas é rápido)
+4. `make web` — checagem manual de tom/qualidade da conversa (ainda
+   importa, só não é mais a ÚNICA linha de defesa)
+
 ## Próxima parte
 
-**Parte 2**: camada de PII (Presidio + recognizers customizados para CPF,
-telefone e CNPJ brasileiros) integrada via `before_model_callback` /
-`after_model_callback` do ADK — mascaramento reversível para dados
-"úteis à conversa" (nome, empresa) e redação irreversível para dados que
-nunca deveriam estar ali (número de cartão completo).
+**Parte 4**: RAG de verdade para o `KnowledgeAgent`, via um MCP Server
+dedicado sobre ChromaDB — o agente para de responder "vou confirmar com
+o time" e passa a recuperar contexto real da base de conhecimento.

@@ -14,6 +14,7 @@ from .config.models import get_model_for_role
 from .guardrails.output_policy import validate_output_policy
 from .guardrails.prompt_injection import detect_prompt_injection
 from .guardrails.transfer import block_unauthorized_transfer
+from .persona import PERSONA_INTRO
 from .pii.masking import mask_pii
 from .session.state_schema import STATE_OBJECTIONS_RAISED
 
@@ -26,7 +27,8 @@ objection_agent = LlmAgent(
         "agora). Use quando o lead expressar hesitação ou recusa."
     ),
     instruction=(
-        "Você lida com objeções de forma empática, sem ser insistente. "
+        PERSONA_INTRO
+        + "Você lida com objeções de forma empática, sem ser insistente. "
         "Reconheça a objeção antes de responder a ela. Nunca ofereça "
         "desconto, condição especial ou prazo que não foi explicitamente "
         "autorizado — se o lead pedir desconto, diga que pode conectar "

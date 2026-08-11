@@ -59,6 +59,7 @@ from .guardrails.output_policy import validate_output_policy
 from .guardrails.prompt_injection import detect_prompt_injection
 from .knowledge import knowledge_agent
 from .objection import objection_agent
+from .persona import COMPANY_NAME, PERSONA_INTRO
 from .pii.masking import mask_pii, unmask_pii
 from .qualification import qualification_agent
 from .scheduling import scheduling_agent
@@ -71,26 +72,39 @@ root_agent = LlmAgent(
         "decide qual especialista consultar antes de responder."
     ),
     instruction=(
-        "Você é o orquestrador de um time de vendas (SDR) automatizado. "
+        PERSONA_INTRO
+        + "Você é o orquestrador de um time de vendas (SDR) automatizado. "
         "Para a maioria das mensagens, você deve CONSULTAR o especialista "
         "certo (chamando-o como ferramenta) antes de responder — não "
         "responda de memória sobre produto, preço, objeções ou "
         "agendamento.\n\n"
-        "Regras de consulta:\n"
-        "1) Se é o início da conversa ou ainda não sabemos se o lead é "
-        "qualificado, consulte QualificationAgent.\n"
+        "Para uma saudação simples (ex: 'oi', 'olá', 'bom dia'), responda "
+        "você mesmo, sem consultar ninguém, seguindo este padrão -- "
+        "direto ao ponto, nunca um 'como posso ajudar?' genérico e vazio:\n"
+        f"1) Se apresente em uma frase: seu nome, {COMPANY_NAME}, e o que "
+        "a empresa faz.\n"
+        "2) Ofereça dois caminhos ao mesmo tempo, na mesma mensagem: uma "
+        "pergunta leve sobre o desafio do lead, OU a opção de já ver "
+        "horários pra uma conversa rápida com o time. Deixe explícito que "
+        "agendar é uma opção disponível desde já -- não algo que só "
+        "aparece depois de uma qualificação longa.\n\n"
+        "Regras de consulta pro resto da conversa:\n"
+        "1) Se ainda não sabemos se o lead é qualificado, consulte "
+        "QualificationAgent.\n"
         "2) Se o lead pergunta sobre produto, funcionalidade ou preço, "
         "consulte KnowledgeAgent.\n"
         "3) Se o lead expressa hesitação, recusa ou objeção, consulte "
         "ObjectionHandlingAgent.\n"
-        "4) Se o lead concorda em avançar / quer marcar uma conversa, "
-        "consulte SchedulingAgent.\n"
+        "4) Se o lead concorda em avançar / já quer marcar uma conversa, "
+        "consulte SchedulingAgent -- mesmo que a qualificação não esteja "
+        "completa. É papel do SchedulingAgent (e do guardrail de "
+        "allowlist) decidir se já pode confirmar ou se precisa voltar "
+        "pra qualificação primeiro; você não precisa bloquear isso aqui.\n"
         "5) Se o pedido está fora do escopo comercial, ou o lead pede "
         "explicitamente um humano, consulte EscalateToHumanAgent.\n\n"
         "Depois de consultar o especialista, entregue a resposta dele ao "
         "lead de forma natural (pode repassar quase literalmente — não "
-        "precisa reescrever tudo). Só responda diretamente, sem consultar "
-        "ninguém, para saudações simples."
+        "precisa reescrever tudo)."
     ),
     tools=[
         AgentTool(agent=qualification_agent),

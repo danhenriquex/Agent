@@ -7,6 +7,13 @@ estruturada e auditável de declarar "esse lead está qualificado" —
 antes disso, só existia texto livre em qualification_notes, o que não
 dava pra checagem confiável em outro lugar do sistema (ex: o
 before_tool_callback de scheduling.py que agora depende desse status).
+
+Padrão "booking-first" (o mesmo que Drift/Qualified/Chili Piper usam):
+o objetivo não é completar um checklist BANT inteiro antes de sugerir
+agendar -- é chegar a um convite pra marcar uma conversa o quanto antes,
+usando qualificação como um filtro leve, não uma barreira. "in_progress"
+é um status perfeitamente aceitável pra deixar pro SDR humano completar
+na call, em vez de segurar o lead numa qualificação longa via chat.
 """
 
 from google.adk.agents import LlmAgent
@@ -16,6 +23,7 @@ from .config.models import get_model_for_role
 from .guardrails.output_policy import validate_output_policy
 from .guardrails.prompt_injection import detect_prompt_injection
 from .guardrails.transfer import block_unauthorized_transfer
+from .persona import PERSONA_INTRO
 from .pii.masking import mask_pii
 from .session.state_schema import STATE_QUALIFICATION_NOTES, STATE_QUALIFICATION_STATUS
 
@@ -56,13 +64,21 @@ qualification_agent = LlmAgent(
         "ainda não sabemos se ele é um bom fit."
     ),
     instruction=(
-        "Você é um SDR conduzindo a qualificação inicial de um lead B2B. "
-        "Faça perguntas curtas e naturais, uma de cada vez, cobrindo ao "
-        "longo da conversa: qual problema o lead quer resolver, se ele "
-        "tem orçamento definido, se ele é o decisor ou influencia a "
-        "decisão, e em que prazo pretende resolver isso. "
-        "Não faça um interrogatório — intercale com contexto útil sobre "
-        "como ajudamos empresas parecidas. "
+        PERSONA_INTRO
+        + "Você conduz a qualificação inicial de um lead B2B, mas de "
+        "forma LEVE e RÁPIDA -- o objetivo é chegar a um convite pra "
+        "agendar uma conversa o quanto antes, não completar um checklist "
+        "inteiro antes de sugerir isso. Um SDR de verdade não interroga "
+        "por várias perguntas seguidas antes de oferecer uma reunião.\n\n"
+        "Faça no máximo 1-2 perguntas curtas e naturais sobre o desafio "
+        "do lead (o que ele quer resolver) e, se render, o tamanho da "
+        "empresa. Intercale com contexto útil sobre como ajudamos "
+        "empresas parecidas -- não faça um interrogatório.\n\n"
+        "Assim que tiver QUALQUER sinal razoável de fit -- não precisa "
+        "ser orçamento, autoridade e prazo completos -- convide pra "
+        "marcar uma conversa rápida com o time. 'in_progress' é um "
+        "status perfeitamente aceitável: é normal deixar o resto da "
+        "qualificação pra call em vez de segurar o lead no chat.\n\n"
         "Assim que tiver informação suficiente pra decidir, chame "
         "set_qualification_status com o status apropriado — isso é o "
         "que libera (ou não) o lead pra avançar pro agendamento. "

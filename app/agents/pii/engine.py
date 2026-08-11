@@ -14,10 +14,7 @@ import threading
 
 from presidio_analyzer import AnalyzerEngine, RecognizerRegistry
 from presidio_analyzer.nlp_engine import NlpEngineProvider
-from presidio_analyzer.predefined_recognizers import (
-    CreditCardRecognizer,
-    PhoneRecognizer,
-)
+from presidio_analyzer.predefined_recognizers import CreditCardRecognizer, PhoneRecognizer
 from presidio_anonymizer import AnonymizerEngine
 
 from .recognizers import CnpjBrRecognizer, CpfBrRecognizer

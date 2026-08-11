@@ -35,7 +35,7 @@ help:
 sync:
 	uv sync
 
-# Sobe o proxy e espera de verdade ele responder antes de liberar o'
+# Sobe o proxy e espera de verdade ele responder antes de liberar o
 # próximo comando -- isso existe especificamente porque "docker compose
 # up -d" retorna assim que o CONTAINER inicia, não quando o processo
 # LiteLLM lá dentro termina de registrar os modelos e está pronto pra

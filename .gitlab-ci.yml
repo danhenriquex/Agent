@@ -22,6 +22,17 @@
 # main especificamente — até lá, o pipeline fica verde só com
 # lint+test+build_check.
 #
+# `uv sync --locked` (não --frozen): --frozen instala o que estiver no
+# uv.lock SEM checar se bate com pyproject.toml -- se o lock commitado
+# estiver desatualizado (ex: uma dependência de dev foi adicionada no
+# pyproject.toml mas o uv.lock não foi regenerado), --frozen instala
+# silenciosamente incompleto, sem erro nenhum. Foi exatamente assim que
+# um `ruff check` falhou em CI com "No such file or directory" — o lock
+# commitado não tinha o ruff, e --frozen nunca reclamou disso. --locked
+# falha alto e claro nesse cenário ("lockfile não está atualizado"), o
+# que é um erro muito mais fácil de diagnosticar que "comando não
+# encontrado" no meio de um job de lint.
+#
 # Variáveis de CI/CD esperadas (configurar quando for ativar o deploy):
 #   GCP_PROJECT_ID       - ID do projeto GCP de destino
 #   GCP_PROJECT_NUMBER   - número do projeto (necessário pro WIF)
@@ -73,7 +84,7 @@ lint:
   stage: lint
   image: ghcr.io/astral-sh/uv:python3.12-bookworm-slim
   script:
-    - uv sync --frozen
+    - uv sync --locked
     - uv run ruff check app tests
   rules:
     - if: $CI_PIPELINE_SOURCE == "merge_request_event"
@@ -84,7 +95,7 @@ test:
   stage: test
   image: ghcr.io/astral-sh/uv:python3.12-bookworm-slim
   script:
-    - uv sync --frozen
+    - uv sync --locked
     - uv run pytest tests/ -v
   rules:
     - if: $CI_PIPELINE_SOURCE == "merge_request_event"
