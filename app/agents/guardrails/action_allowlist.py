@@ -17,6 +17,7 @@ of us hardcoding the exact user-facing sentence here.
 
 from google.adk.tools import ToolContext
 
+from ..observability import annotate_current_span
 from ..session.state_schema import STATE_GUARDRAIL_FLAGS, STATE_QUALIFICATION_STATUS
 
 _GATED_TOOLS = {"book_meeting"}
@@ -50,6 +51,13 @@ def enforce_action_allowlist(tool, args: dict, tool_context: ToolContext) -> dic
         f"ainda não qualificado (status atual: {status!r})"
     )
     tool_context.state[STATE_GUARDRAIL_FLAGS] = flags
+
+    annotate_current_span(
+        "guardrail.action_allowlist.denied",
+        agent=tool_context.agent_name,
+        tool=tool.name,
+        qualification_status=str(status),
+    )
 
     lead_token = tool_context.session.id[:8] if tool_context.session else "lead"
 

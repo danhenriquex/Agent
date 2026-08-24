@@ -7,7 +7,8 @@ PROXY_READY_URL := http://localhost:4000/health/readiness
 PROXY_READY_TIMEOUT := 30
 
 .PHONY: help sync proxy-up proxy-down proxy-restart proxy-logs proxy-status \
-        web cli api test test-pii lint clean
+        web cli api test test-pii test-guardrails test-live lint clean \
+        ingest-dev langfuse-secrets langfuse-up langfuse-down phoenix-up
 
 help:
 	@echo "Comandos disponíveis:"
@@ -30,6 +31,11 @@ help:
 	@echo "  make test-live     - conversas douradas contra o LLM real (custa"
 	@echo "                       API, sobe o proxy sozinho) — NÃO entra em 'make test'"
 	@echo "  make ingest-dev    - abre a UI do Dagster pra rodar a ingestão do RAG"
+	@echo ""
+	@echo "  make phoenix-up      - sobe o Phoenix local (tracing de agentes/RAG)"
+	@echo "  make langfuse-up     - sobe o LangFuse self-hospedado (custo/tokens)"
+	@echo "  make langfuse-down   - derruba o LangFuse"
+	@echo "  make langfuse-secrets - gera os ~10 segredos do LangFuse (só imprime)"
 	@echo "  make lint          - roda o ruff"
 	@echo "  make clean         - remove __pycache__/.pytest_cache/.ruff_cache"
 
@@ -43,7 +49,32 @@ sync:
 # aceitar conexão. Sem esperar isso, curl/a aplicação podem chegar
 # primeiro e receber "empty reply from server" -- foi exatamente o que
 # aconteceu depurando isso manualmente antes deste Makefile existir.
+#
+# A checagem de LANGFUSE_OTEL_HOST/LANGFUSE_HOST abaixo existe porque o
+# callback langfuse_otel (litellm_proxy/config.yaml) sem NENHUM dos dois
+# setados não falha nem loga erro -- ele silenciosamente manda os spans
+# pro endpoint US do Langfuse CLOUD (fallback hardcoded no próprio
+# litellm). Ou seja: sem essa var, "funciona" sem erro nenhum, só que
+# os dados de custo/tokens vazam pra fora em vez de ir pro LangFuse
+# self-hospedado -- pior tipo de bug, silencioso. Descoberto lendo o
+# código-fonte do callback (litellm/integrations/langfuse/langfuse_otel.py),
+# não documentado no README da lib.
 proxy-up:
+	@python3 -c "\
+from pathlib import Path; \
+import re, sys; \
+env_path = Path('.env'); \
+env_text = env_path.read_text() if env_path.exists() else ''; \
+values = dict(re.findall(r'^([A-Z_]+)=(.*)\$$', env_text, re.MULTILINE)); \
+has_host = bool(values.get('LANGFUSE_OTEL_HOST', '').strip() or values.get('LANGFUSE_HOST', '').strip()); \
+has_keys = bool(values.get('LANGFUSE_PUBLIC_KEY', '').strip() and values.get('LANGFUSE_SECRET_KEY', '').strip()); \
+sys.exit(0) if (has_host and has_keys) or not (has_host or has_keys) else (\
+    print('ERRO: LANGFUSE_PUBLIC_KEY/LANGFUSE_SECRET_KEY estão setados mas'), \
+    print('LANGFUSE_OTEL_HOST (nem LANGFUSE_HOST) não está -- o callback'), \
+    print('langfuse_otel vai mandar os spans pro Langfuse CLOUD em vez do'), \
+    print('seu self-hosted, SEM erro nenhum. Adicione ao .env:'), \
+    print('  LANGFUSE_OTEL_HOST=http://host.docker.internal:3000'), \
+    sys.exit(1))"
 	@docker compose -f $(PROXY_COMPOSE) up -d
 	@echo -n "Esperando o proxy ficar pronto"
 	@for i in $$(seq 1 $(PROXY_READY_TIMEOUT)); do \
@@ -96,6 +127,61 @@ test-live: proxy-up
 
 ingest-dev:
 	uv run dagster dev -f ingestion/definitions.py
+
+# Parte 5: gera os ~10 segredos do LangFuse de uma vez -- só IMPRIME,
+# nunca escreve no .env sozinho (mesmo espírito de PII_HASH_SALT:
+# você gera, você cola). Rodar de novo gera valores NOVOS -- não é
+# idempotente de propósito, já que cada segredo devia ser único.
+langfuse-secrets:
+	@echo "Cole estas linhas no seu .env (substituindo os valores vazios):"
+	@echo ""
+	@python3 -c "\
+import secrets; \
+names = ['LANGFUSE_SALT', 'LANGFUSE_ENCRYPTION_KEY', 'LANGFUSE_NEXTAUTH_SECRET', \
+'LANGFUSE_POSTGRES_PASSWORD', 'LANGFUSE_CLICKHOUSE_PASSWORD', 'LANGFUSE_REDIS_AUTH', \
+'LANGFUSE_MINIO_ROOT_PASSWORD', 'LANGFUSE_PUBLIC_KEY', 'LANGFUSE_SECRET_KEY', \
+'LANGFUSE_INIT_USER_PASSWORD']; \
+[print(f'{name}={secrets.token_hex(32)}') for name in names]"
+
+# --env-file .env é OBRIGATÓRIO aqui, não redundante com o env_file: ../.env
+# de dentro do compose -- descoberto rodando de verdade: o Docker Compose
+# resolve interpolação de ${VAR} no PRÓPRIO YAML (os "environment:"/"command:"
+# usados por postgres/redis/minio) usando um .env procurado no diretório do
+# arquivo compose (langfuse/.env, que não existe), não no diretório onde o
+# comando é executado. O `env_file: ../.env` funciona (injeta variáveis DENTRO
+# do container em runtime), mas isso é uma etapa totalmente separada da
+# interpolação -- sem --env-file .env, toda ${LANGFUSE_*} vira string vazia
+# na hora de montar o compose, e foi exatamente isso que causava o Redis
+# crashar com "wrong number of arguments" (bug do requirepass) e o Postgres
+# recusar subir por "superuser password is not specified", mesmo com os
+# segredos certos já colados no .env.
+langfuse-up:
+	@echo "Verificando segredos do LangFuse no .env..."
+	@python3 -c "\
+from pathlib import Path; \
+import re, sys; \
+env_path = Path('.env'); \
+env_text = env_path.read_text() if env_path.exists() else ''; \
+values = dict(re.findall(r'^([A-Z_]+)=(.*)\$$', env_text, re.MULTILINE)); \
+required = ['LANGFUSE_SALT', 'LANGFUSE_ENCRYPTION_KEY', 'LANGFUSE_NEXTAUTH_SECRET', \
+    'LANGFUSE_POSTGRES_PASSWORD', 'LANGFUSE_CLICKHOUSE_PASSWORD', 'LANGFUSE_REDIS_AUTH', \
+    'LANGFUSE_MINIO_ROOT_PASSWORD', 'LANGFUSE_PUBLIC_KEY', 'LANGFUSE_SECRET_KEY', \
+    'LANGFUSE_INIT_USER_PASSWORD']; \
+missing = [k for k in required if not values.get(k, '').strip()]; \
+sys.exit(0) if not missing else (\
+    print('ERRO: os seguintes segredos estão vazios/ausentes no .env:'), \
+    [print(f'  - {m}') for m in missing], \
+    print(), \
+    print('Rode: make langfuse-secrets'), \
+    print('E cole TODOS os valores gerados no seu .env antes de tentar de novo.'), \
+    sys.exit(1))"
+	docker compose -f langfuse/docker-compose.yml --env-file .env up -d
+
+langfuse-down:
+	docker compose -f langfuse/docker-compose.yml --env-file .env down
+
+phoenix-up:
+	uv run python -m phoenix.server.main serve
 
 lint:
 	uv run ruff check app tests

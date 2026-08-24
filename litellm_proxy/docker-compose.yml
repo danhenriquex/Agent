@@ -8,3 +8,12 @@ services:
     command: ["--config", "/app/config.yaml", "--port", "4000"]
     env_file:
       - ../.env
+    # litellm_proxy e langfuse/ são docker-compose PROJETOS separados
+    # (redes Docker diferentes por padrão) -- isso faz host.docker.internal
+    # resolver de verdade mesmo no Linux (no Mac/Windows já funciona
+    # nativamente), pra litellm-proxy alcançar o langfuse-web exposto
+    # na porta 3000 do host (Parte 5). Sem isso, LANGFUSE_OTEL_HOST
+    # apontando pra host.docker.internal falharia silenciosamente só
+    # no Linux.
+    extra_hosts:
+      - "host.docker.internal:host-gateway"

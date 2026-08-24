@@ -19,6 +19,10 @@ dependencies = [
     "dagster>=1.13.19",
     "fastmcp>=3.4.7",
     "dagster-webserver>=1.13.19",
+    "openinference-instrumentation-google-adk>=0.1.20",
+    "arize-phoenix>=20.3.0",
+    "opentelemetry-sdk>=1.42.1",
+    "opentelemetry-exporter-otlp>=1.42.1",
 ]
 
 # pt_core_news_lg não está no PyPI (modelos do spaCy são distribuídos como

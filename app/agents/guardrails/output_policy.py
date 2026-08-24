@@ -21,6 +21,7 @@ from google.adk.agents.callback_context import CallbackContext
 from google.adk.models import LlmResponse
 from google.genai import types
 
+from ..observability import annotate_current_span
 from ..session.state_schema import STATE_GUARDRAIL_FLAGS
 
 _FORBIDDEN_PATTERNS = [
@@ -56,6 +57,12 @@ def validate_output_policy(
                     f"política de saída (padrão: {pattern.pattern[:40]})"
                 )
                 callback_context.state[STATE_GUARDRAIL_FLAGS] = flags
+
+                annotate_current_span(
+                    "guardrail.output_policy.blocked",
+                    agent=callback_context.agent_name,
+                    pattern=pattern.pattern[:40],
+                )
 
                 return LlmResponse(
                     content=types.Content(

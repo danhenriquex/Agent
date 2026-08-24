@@ -34,6 +34,7 @@ from google.adk.agents.callback_context import CallbackContext
 from google.adk.models import LlmRequest, LlmResponse
 from google.genai import types
 
+from ..observability import annotate_current_span
 from ..session.state_schema import STATE_GUARDRAIL_FLAGS
 
 _FALLBACK_TEXT = (
@@ -65,6 +66,12 @@ def recover_from_duplicated_tool_call_json(
         "github.com/BerriAI/litellm/issues/20543)"
     )
     callback_context.state[STATE_GUARDRAIL_FLAGS] = flags
+
+    annotate_current_span(
+        "guardrail.model_error.recovered",
+        agent=callback_context.agent_name,
+        error_type="duplicated_tool_call_json",
+    )
 
     return LlmResponse(
         content=types.Content(role="model", parts=[types.Part(text=_FALLBACK_TEXT)])

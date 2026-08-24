@@ -22,6 +22,7 @@ from google.adk.models import LlmRequest, LlmResponse
 from google.genai import types
 from presidio_anonymizer.entities import OperatorConfig
 
+from ..observability import annotate_current_span
 from ..session.state_schema import STATE_GUARDRAIL_FLAGS, STATE_PII_TOKEN_MAP
 from .engine import SUPPORTED_ENTITIES, get_analyzer_engine, get_anonymizer_engine
 
@@ -110,25 +111,31 @@ def _build_operators(token_map: dict, entity_types_present: set[str]) -> dict:
     return operators
 
 
-def _mask_text(text: str, token_map: dict) -> tuple[str, bool]:
-    """Retorna (texto_processado, foi_bloqueado). Se foi_bloqueado for
-    True, texto_processado é irrelevante -- a mensagem inteira deve ser
-    substituída pela resposta de bloqueio."""
+def _mask_text(text: str, token_map: dict) -> tuple[str, bool, set[str]]:
+    """Retorna (texto_processado, foi_bloqueado, tipos_de_entidade_encontrados).
+    Se foi_bloqueado for True, texto_processado é irrelevante -- a
+    mensagem inteira deve ser substituída pela resposta de bloqueio.
+
+    tipos_de_entidade_encontrados é só pra anotar o span do Phoenix
+    (ex: {"PERSON", "EMAIL_ADDRESS"}) -- nunca os VALORES mascarados,
+    só os TIPOS. Vazar o próprio dado mascarado pro trace anularia o
+    propósito inteiro de mascarar.
+    """
     analyzer = get_analyzer_engine()
     results = analyzer.analyze(text=text, language="pt", entities=SUPPORTED_ENTITIES)
 
     if any(r.entity_type in _BLOCK_TIER_ENTITIES for r in results):
-        return "", True
+        return "", True, _BLOCK_TIER_ENTITIES & {r.entity_type for r in results}
 
     relevant = [r for r in results if r.entity_type not in _BLOCK_TIER_ENTITIES]
     if not relevant:
-        return text, False
+        return text, False, set()
 
     anonymizer = get_anonymizer_engine()
     entity_types_present = {r.entity_type for r in relevant}
     operators = _build_operators(token_map, entity_types_present)
     anonymized = anonymizer.anonymize(text=text, analyzer_results=relevant, operators=operators)
-    return anonymized.text, False
+    return anonymized.text, False, entity_types_present
 
 
 def mask_pii(callback_context: CallbackContext, llm_request: LlmRequest) -> LlmResponse | None:
@@ -151,7 +158,7 @@ def mask_pii(callback_context: CallbackContext, llm_request: LlmRequest) -> LlmR
                 new_parts.append(part)
                 continue
 
-            masked_text, blocked = _mask_text(part.text, token_map)
+            masked_text, blocked, entity_types = _mask_text(part.text, token_map)
 
             if blocked:
                 flags = callback_context.state.get(STATE_GUARDRAIL_FLAGS, [])
@@ -162,11 +169,24 @@ def mask_pii(callback_context: CallbackContext, llm_request: LlmRequest) -> LlmR
                 callback_context.state[STATE_GUARDRAIL_FLAGS] = flags
                 callback_context.state[STATE_PII_TOKEN_MAP] = token_map
 
+                annotate_current_span(
+                    "guardrail.pii.blocked",
+                    agent=callback_context.agent_name,
+                    entity_types=",".join(sorted(entity_types)),
+                )
+
                 return LlmResponse(
                     content=types.Content(
                         role="model",
                         parts=[types.Part(text=_BLOCKED_MESSAGE_TEXT)],
                     )
+                )
+
+            if entity_types:
+                annotate_current_span(
+                    "guardrail.pii.masked",
+                    agent=callback_context.agent_name,
+                    entity_types=",".join(sorted(entity_types)),
                 )
 
             new_parts.append(types.Part(text=masked_text))

@@ -13,3 +13,5 @@ mcp_server/chroma_data/
 # Dagster cria isso automaticamente quando DAGSTER_HOME não está
 # setado (nosso caso, dev local) -- efêmero por natureza.
 .tmp_dagster_home*/
+
+scripts/*
