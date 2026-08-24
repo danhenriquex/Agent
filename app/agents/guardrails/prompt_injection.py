@@ -22,6 +22,7 @@ from google.adk.agents.callback_context import CallbackContext
 from google.adk.models import LlmRequest, LlmResponse
 from google.genai import types
 
+from ..observability import annotate_current_span
 from ..session.state_schema import STATE_GUARDRAIL_FLAGS
 
 _INJECTION_PATTERNS = [
@@ -74,6 +75,12 @@ def detect_prompt_injection(
                 f"detectado (padrão: {pattern.pattern[:40]})"
             )
             callback_context.state[STATE_GUARDRAIL_FLAGS] = flags
+
+            annotate_current_span(
+                "guardrail.prompt_injection.blocked",
+                agent=callback_context.agent_name,
+                pattern=pattern.pattern[:40],
+            )
 
             return LlmResponse(
                 content=types.Content(role="model", parts=[types.Part(text=_REFUSAL_TEXT)])

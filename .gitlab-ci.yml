@@ -115,6 +115,13 @@ docker_build_check:
   services:
     - docker:27-dind
   script:
+    # Limpa qualquer imagem/camada residual de jobs anteriores no MESMO
+    # runner antes de buildar -- não resolve a causa raiz de imagem
+    # pesada (isso é o fix em pyproject.toml: torch CPU-only em vez do
+    # build com CUDA), mas é uma rede de segurança independente,
+    # incondicional, útil mesmo que outra dependência volte a inchar a
+    # imagem no futuro.
+    - docker system prune -af || true
     - docker build -t sdr-bot-api:ci-check .
     - docker build -t litellm-proxy:ci-check ./litellm_proxy
   rules:

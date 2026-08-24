@@ -27,6 +27,8 @@ from google.adk.runners import Runner
 from google.adk.sessions import InMemorySessionService
 from google.genai import types
 
+from app.agents.session.state_schema import STATE_GUARDRAIL_FLAGS
+
 pytestmark = pytest.mark.skipif(
     os.environ.get("RUN_LIVE_TESTS") != "1",
     reason=(
@@ -83,9 +85,9 @@ async def test_greeting_introduces_bot_and_company():
     # ajudar", sem contexto nenhum. Isso verifica a correção de forma
     # estrutural (nome da empresa presente), não texto exato -- resiste
     # a ajustes futuros de tom/redação do prompt.
-    assert COMPANY_NAME.lower() in response_text.lower(), (
-        f"Resposta à saudação não menciona {COMPANY_NAME}: {response_text!r}"
-    )
+    assert (
+        COMPANY_NAME.lower() in response_text.lower()
+    ), f"Resposta à saudação não menciona {COMPANY_NAME}: {response_text!r}"
 
 
 # --- QualificationAgent ---
@@ -95,25 +97,40 @@ async def test_qualification_flow_sets_status():
     from app.agents.qualification import qualification_agent
     from app.agents.session.state_schema import STATE_QUALIFICATION_STATUS
 
-    state, _response_text = await _run_conversation(
-        qualification_agent,
-        [
-            "Oi, vi vocês no LinkedIn",
-            "Temos uns 50 funcionários, orçamento de uns R$5k/mês",
-            "Sou eu quem decide isso",
-            "Precisamos resolver isso ainda esse trimestre",
-        ],
-    )
+    conversation = [
+        "Oi, vi vocês no LinkedIn",
+        "Temos uns 50 funcionários, orçamento de uns R$5k/mês",
+        "Sou eu quem decide isso",
+        "Precisamos resolver isso ainda esse trimestre",
+    ]
 
-    # Não afirmamos QUAL status -- isso depende de julgamento do modelo
-    # e mudaria a cada ajuste de prompt. Afirmamos que a tool foi
-    # chamada com ALGUM valor válido -- é isso que prova que o fluxo
-    # não quebrou.
-    assert state.get(STATE_QUALIFICATION_STATUS) in {
-        "qualified",
-        "in_progress",
-        "disqualified",
-    }
+    # Retry limitado -- BerriAI/litellm tem um bug documentado e ainda
+    # não confirmado como corrigido pro nosso caminho de código
+    # (OpenRouter, não Bedrock -- a correção rastreada é específica de
+    # Bedrock) que ocasionalmente duplica o JSON dos argumentos de uma
+    # tool call. Nosso guardrail (on_model_error_callback) já recupera
+    # disso graciosamente -- mas numa sessão de má sorte, TODOS os 4
+    # turnos podem ser afetados, e nenhuma tool call bem-sucedida
+    # acontece. Isso não é sobre nosso código estar quebrado; é sobre
+    # dar à conversa mais de uma chance de rodar sem essa instabilidade
+    # específica, documentada e externa.
+    last_state = None
+    for attempt in range(3):
+        state, _response_text = await _run_conversation(
+            qualification_agent, conversation
+        )
+        if state.get(STATE_QUALIFICATION_STATUS) in {
+            "qualified",
+            "in_progress",
+            "disqualified",
+        }:
+            return
+        last_state = state
+
+    flags = last_state.get(STATE_GUARDRAIL_FLAGS, [])
+    pytest.fail(
+        f"Falhou 3 vezes seguidas -- guardrail_flags do último attempt: {flags}"
+    )
 
 
 # --- SchedulingAgent (allowlist deveria bloquear sem qualificação prévia) ---
@@ -132,9 +149,9 @@ async def test_scheduling_blocks_booking_without_qualification():
     # ter bloqueado book_meeting. Verificamos pelo flag de guardrail,
     # não pelo texto da resposta (que varia).
     flags = state.get(STATE_GUARDRAIL_FLAGS, [])
-    assert any("book_meeting" in f and "bloqueado" in f for f in flags), (
-        f"Esperava um flag de bloqueio de book_meeting, achei: {flags}"
-    )
+    assert any(
+        "book_meeting" in f and "bloqueado" in f for f in flags
+    ), f"Esperava um flag de bloqueio de book_meeting, achei: {flags}"
 
 
 # --- Orchestrator (roteamento ponta a ponta) ---

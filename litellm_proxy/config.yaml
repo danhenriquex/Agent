@@ -73,10 +73,15 @@ litellm_settings:
     - scheduling-model: ["fallback-model"]
     - escalate-model: ["fallback-model"]
 
-  # TODO Parte 5: adicionar "langfuse" aqui para logging de custo/latência
-  # nativo do proxy, complementando o tracing feito no lado do ADK.
-  success_callback: []
-  failure_callback: []
+  # Parte 5: langfuse_otel é o callback de PRIMEIRA CLASSE atual pra
+  # LangFuse via LiteLLM Proxy -- a alternativa mais simples
+  # (success_callback: ["langfuse"]) é a integração "legacy v2 SDK",
+  # explicitamente não recomendada pelo próprio LiteLLM pra LangFuse
+  # v3+ (o que rodamos, self-hospedado, ver langfuse/docker-compose.yml).
+  # langfuse_otel constrói o endpoint OTLP e a autenticação (Basic
+  # Auth com as chaves abaixo) automaticamente -- não precisa configurar
+  # OTEL_EXPORTER_OTLP_* manualmente.
+  callbacks: ["langfuse_otel"]
 
 general_settings:
   master_key: os.environ/LITELLM_PROXY_KEY

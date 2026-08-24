@@ -1,4 +1,4 @@
-# SDR Bot — Sistema Multi-Agente (Partes 1–4: Esqueleto + PII + Guardrails + RAG)
+# SDR Bot — Sistema Multi-Agente (Partes 1–5: Esqueleto + PII + Guardrails + RAG + Observabilidade)
 
 Chatbot SDR (Sales Development Representative) construído com **Google ADK**,
 desenhado para demonstrar, na prática, os requisitos técnicos de vagas de
@@ -6,7 +6,7 @@ LLM/AI Engineer sênior focadas em produção: orquestração multi-agente,
 guardrails, mascaramento de PII, RAG avaliado e observabilidade.
 
 Este projeto é dividido em partes incrementais. Este README cobre as
-**Partes 1 a 4**.
+**Partes 1 a 5**.
 
 ## O que existe nesta parte
 
@@ -43,16 +43,20 @@ Este projeto é dividido em partes incrementais. Este README cobre as
   ChromaDB populado por um pipeline de ingestão Dagster, com
   `asset_check` de recall@3 e de vazamento de PII. Ver seção dedicada
   abaixo.
+- **Observabilidade (Parte 5)**: Phoenix (tracing automático de
+  agentes/tools/RAG via OpenInference) + LangFuse self-hospedado
+  (custo/tokens via `langfuse_otel` no LiteLLM Proxy), com os 6
+  guardrails anotando eventos direto nos spans. Ver seção dedicada
+  abaixo.
 - Smoke tests da topologia + testes de PII + testes de guardrails +
-  testes de RAG (`tests/`) que rodam sem precisar de chave de API (as
-  únicas exceções são o download do modelo spaCy e do modelo de
-  embedding, cada um uma vez).
+  testes de RAG + testes de observabilidade (`tests/`) que rodam sem
+  precisar de chave de API (as únicas exceções são o download do
+  modelo spaCy e do modelo de embedding, cada um uma vez).
 
 ## O que **não** está aqui ainda (de propósito)
 
 | Falta | Onde entra |
 |---|---|
-| LangFuse + Phoenix (observabilidade) | Parte 5 |
 | Golden eval set + LLM-as-judge + regressão | Parte 6 |
 
 Cada agente tem comentários `TODO Parte N` no código exatamente nos pontos
@@ -87,6 +91,11 @@ make test-live       # conversas douradas contra o LLM real (custa API,
 make ingest-dev       # UI do Dagster -- materializar o índice do RAG (Parte 4)
 make lint             # ruff
 make clean            # limpa __pycache__/.pytest_cache/.ruff_cache
+
+make phoenix-up        # Phoenix local (tracing de agentes/tools/RAG, Parte 5)
+make langfuse-secrets  # gera os ~10 segredos do LangFuse (só imprime)
+make langfuse-up       # LangFuse self-hospedado (custo/tokens, Parte 5)
+make langfuse-down     # derruba o LangFuse
 ```
 
 Rode `make` (sem alvo) ou `make help` pra ver a lista completa.
@@ -669,9 +678,140 @@ Nenhum desses precisa do modelo de embedding real nem de rede —
 de metadado, não busca semântica; relevância semântica de verdade já
 foi validada rodando o pipeline real).
 
+## Observabilidade (Parte 5)
+
+### Divisão de responsabilidade — por que dois sistemas, não um
+
+Phoenix e LangFuse enxergam **camadas diferentes** do sistema, o que
+evita que um duplique o outro:
+
+```
+Lead message
+      │
+      ▼
+OrchestratorAgent → especialistas → MCP/RAG ──┐
+      │                                        │  openinference-instrumentation-google-adk
+      ▼                                        │  (automático: árvore de agentes, tool
+LiteLLM Proxy ──────────────────────────────────┤  calls, retrieval do RAG)
+      │                                        ▼
+      ▼                                    Phoenix (self-hospedado, processo
+OpenRouter → Anthropic/OpenAI                único, sem conta, serviço irmão)
+      │
+      ▼ (callback langfuse_otel, não o "legacy" success_callback)
+LangFuse (self-hospedado: postgres + clickhouse +
+          redis + minio + langfuse-web + langfuse-worker)
+```
+
+- **Phoenix** enxerga *o que o sistema está fazendo* — qual agente
+  rodou, qual tool disparou, o que foi recuperado do ChromaDB pra uma
+  pergunta específica (estende diretamente o trabalho de RAG da Parte
+  4 — dá pra *ver* uma recuperação acontecendo numa conversa real, não
+  só no `asset_check` do Dagster).
+- **LangFuse** enxerga *quanto custou* — toda chamada de modelo que
+  passa pelo proxy, num lugar só, independente de qual dos 6 agentes
+  disparou.
+
+### Phoenix — instrumentação automática
+
+Um `phoenix.otel.register(auto_instrument=True)` instrumenta
+automaticamente a árvore de agentes inteira via
+`openinference-instrumentation-google-adk` — sem precisar anotar cada
+agente manualmente. Vive em `app/agents/observability.py`, seguindo o
+mesmo padrão de "efeito colateral de import" de `pii/` (Parte 2) e
+`guardrails/` (Parte 3): fica dentro de `app/agents/` porque o
+`adk web` isola esse diretório como raiz de import, sem visibilidade
+de módulos irmãos fora dele — a mesma restrição que já nos mordeu duas
+vezes antes.
+
+**Bug real encontrado testando isso de verdade**: o valor óbvio pro
+endpoint (`http://localhost:6006`, a raiz da UI) falha com `405 Method
+Not Allowed` — o endpoint de ingestão OTLP de verdade é
+`http://localhost:6006/v1/traces`. Só descobri isso rodando um Phoenix
+real neste ambiente, enviando um span de teste, vendo falhar, e
+confirmando a correção consultando a própria API do Phoenix depois.
+
+```bash
+make phoenix-up   # sobe em http://localhost:6006, sem conta necessária
+```
+
+### LangFuse — self-hospedado, `langfuse_otel`
+
+Self-hospedar LangFuse é, disparado, a stack mais pesada deste projeto
+— 6 containers (postgres, clickhouse, redis, minio, langfuse-web,
+langfuse-worker) contra 1 do `litellm_proxy`. Decisão deliberada de
+manter consistência com o resto do projeto (tudo self-hospedado) em
+vez de usar o free tier do LangFuse Cloud, que seria bem mais simples.
+
+O callback usado é `langfuse_otel` (`litellm_proxy/config.yaml`), não
+o mais óbvio `success_callback: ["langfuse"]` — o próprio LiteLLM
+documenta esse último como a integração "legacy v2 SDK", não
+recomendada pro LangFuse v3+ (que é o que rodamos). `langfuse_otel`
+constrói o endpoint OTLP e a autenticação (Basic Auth) automaticamente
+a partir de `LANGFUSE_PUBLIC_KEY`/`LANGFUSE_SECRET_KEY`/`LANGFUSE_OTEL_HOST`.
+
+**Duas descobertas reais rodando isso:**
+
+1. `litellm_proxy/` e `langfuse/` são dois PROJETOS docker-compose
+   separados (redes Docker diferentes por padrão) — `litellm-proxy`
+   não alcança `langfuse-web` por nome de serviço sem ajuda.
+   `extra_hosts: host.docker.internal:host-gateway` em
+   `litellm_proxy/docker-compose.yml` resolve isso — inclusive no
+   Linux, onde `host.docker.internal` não existe nativamente (diferente
+   de Mac/Windows).
+2. O `DATABASE_URL` que o LangFuse usa pra conectar no Postgres tinha,
+   na minha primeira versão, um valor padrão (`postgres:postgres`)
+   diferente da senha real configurada no container do Postgres
+   (`LANGFUSE_POSTGRES_PASSWORD`) — um bug silencioso que só apareceria
+   como falha de conexão. Corrigido derivando `DATABASE_URL` direto do
+   mesmo segredo, eliminando a duplicação.
+
+```bash
+make langfuse-secrets   # gera os ~10 segredos necessários, só imprime
+# cole no .env, depois:
+make langfuse-up        # sobe em http://localhost:3000
+```
+
+### Anotações de guardrail nos traces
+
+Além da instrumentação automática, os 6 guardrails (Partes 2 e 3)
+anotam o span ATIVO do OpenTelemetry quando disparam —
+`app/agents/observability.py::annotate_current_span()` usa
+`add_event()` (não `set_attribute()`) de propósito: um disparo de
+guardrail é uma ocorrência pontual dentro do span, não uma propriedade
+persistente dele, e eventos aparecem na timeline do trace no Phoenix.
+
+Eventos anotados: `guardrail.pii.masked` / `guardrail.pii.blocked`,
+`guardrail.prompt_injection.blocked`, `guardrail.output_policy.blocked`,
+`guardrail.action_allowlist.denied`, `guardrail.model_error.recovered`,
+`guardrail.transfer.blocked`.
+
+**Cuidado deliberado**: o evento de PII anota os TIPOS de entidade
+detectados (`entity_types=PERSON,EMAIL_ADDRESS`), nunca os valores
+mascarados — vazar o próprio dado mascarado pro trace anularia o
+propósito inteiro de mascarar. Testado explicitamente
+(`test_pii_masking_annotates_span_with_entity_types_not_values`).
+
+Verificado que a propagação de contexto funciona de verdade — não só
+assumido: `get_current_span()` chamado de dentro de uma função comum
+aninhada (exatamente a forma como nossos callbacks de guardrail
+executam) retorna o span ATIVO de verdade, não um span NoOp,
+confirmado com um `TracerProvider` real e `InMemorySpanExporter` nos
+testes.
+
+### Rodando os testes da Parte 5 isoladamente
+
+```bash
+uv run pytest tests/test_observability_spans.py -v
+```
+
+Não precisa de Phoenix nem LangFuse rodando -- usa um `TracerProvider`
+local isolado por teste, não o global registrado por
+`app/agents/observability.py`.
+
 ## Próxima parte
 
-**Parte 5**: observabilidade — LangFuse + Arize Phoenix, tracing de
-ponta a ponta através de todo o roteamento multi-agente, custo por
-conversa, e a primeira camada real de "consigo ver o que aconteceu"
-além dos flags manuais em `session.state`.
+**Parte 6**: golden eval set + LLM-as-judge + regressão versionada —
+fecha o requisito "processo de avaliação sistemático, prova que uma
+mudança melhorou, não acha". A camada 3 de testes (`test-live`) já
+verifica estrutura; a Parte 6 mede qualidade de verdade, com um
+critério explícito e rastreável ao longo do tempo.

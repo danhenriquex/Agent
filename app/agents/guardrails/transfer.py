@@ -22,6 +22,7 @@ from google.adk.agents.callback_context import CallbackContext
 from google.adk.models import LlmResponse
 from google.genai import types
 
+from ..observability import annotate_current_span
 from ..session.state_schema import STATE_GUARDRAIL_FLAGS
 
 _LEAKED_TRANSFER_PATTERN = re.compile(r"transfer_to_agent\s*\{")
@@ -55,6 +56,12 @@ def block_unauthorized_transfer(
                 "transfer_to_agent (blocked by guardrail)"
             )
             callback_context.state[STATE_GUARDRAIL_FLAGS] = flags
+
+            annotate_current_span(
+                "guardrail.transfer.blocked",
+                agent=callback_context.agent_name,
+                leaked_text="true" if is_leaked_transfer_text else "false",
+            )
 
             return LlmResponse(
                 content=types.Content(
