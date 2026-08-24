@@ -48,6 +48,34 @@ detect_prompt_injection e validate_output_policy rodam em TODO agente
 (incluindo este); enforce_action_allowlist (before_tool_callback) só
 existe em SchedulingAgent, porque é a única tool com uma ação que
 precisa de allowlist hoje. Ver app/agents/guardrails/.
+
+Bug real observado em teste manual (session.db): QualificationAgent
+pergunta o prazo e deixa qualification_status como "in_progress",
+dizendo (na própria resposta) que vai chamar set_qualification_status
+de novo assim que tiver a resposta. O lead responde à pergunta -- mas a
+regra 4 (abaixo) mandava rotear direto pra SchedulingAgent nesse ponto,
+sem nunca voltar pro QualificationAgent pra fechar a decisão. Resultado:
+qualification_status ficava travado em "in_progress" pra sempre, e se o
+lead escolhesse um horário, enforce_action_allowlist bloquearia
+book_meeting com o link de "complete seu perfil" -- mesmo o lead tendo
+acabado de responder exatamente o que foi perguntado. A regra 1 agora
+cobre esse caso explicitamente: resposta a uma pergunta de qualificação
+em aberto volta pro QualificationAgent antes de ir pro Scheduling.
+
+Segundo bug real observado (mesma fonte, teste manual): a regra antiga
+"lead concorda em avançar -> consulte SchedulingAgent, mesmo sem
+qualificação completa" era liberal demais na prática -- o modelo
+interpretava uma simples descrição de dor ("tenho dificuldade em
+gerenciar o ponto com planilhas") como sinal suficiente pra já buscar
+horários, tudo numa única resposta, sem nunca explicar qual produto
+resolve aquela dor nem aprofundar o contexto. O lead recebia uma oferta
+de reunião antes de qualquer conversa de vendas de verdade acontecer.
+As regras abaixo agora inserem uma etapa de "explicar o produto que
+resolve a dor" (via KnowledgeAgent, com um pedido direcionado à dor
+relatada -- não uma lista genérica de planos) antes de considerar
+agendamento, e restringem SchedulingAgent a dois casos: pedido
+explícito do lead, ou a conversa parar de avançar depois que a dor e o
+produto já foram discutidos.
 """
 
 from google.adk.agents import LlmAgent
@@ -90,18 +118,40 @@ root_agent = LlmAgent(
         "agendar é uma opção disponível desde já -- não algo que só "
         "aparece depois de uma qualificação longa.\n\n"
         "Regras de consulta pro resto da conversa:\n"
-        "1) Se ainda não sabemos se o lead é qualificado, consulte "
-        "QualificationAgent.\n"
-        "2) Se o lead pergunta sobre produto, funcionalidade ou preço, "
-        "consulte KnowledgeAgent.\n"
-        "3) Se o lead expressa hesitação, recusa ou objeção, consulte "
+        "1) Se ainda não sabemos a dor do lead, consulte "
+        "QualificationAgent. Isso inclui o caso em que a última consulta "
+        "deixou qualification_status como 'in_progress' e a mensagem "
+        "atual do lead responde à pergunta que ficou em aberto -- volte "
+        "pro QualificationAgent com essa resposta ANTES de considerar "
+        "qualquer outra regra, mesmo que a resposta também pareça "
+        "sinalizar interesse em agendar. Só assim a qualificação é "
+        "fechada (qualified/disqualified) em vez de ficar presa em "
+        "'in_progress' pra sempre.\n"
+        "2) Assim que a dor do lead estiver clara (mesmo que "
+        "qualification_status ainda seja 'in_progress') e você ainda não "
+        "tiver explicado qual produto/plano da Helssing resolve ESSA dor "
+        "específica nesta conversa, consulte KnowledgeAgent pedindo uma "
+        "recomendação direcionada à dor relatada -- não uma lista "
+        "genérica de todos os planos. Isso vem ANTES de considerar a "
+        "regra 5: o objetivo é desenvolver a conversa e mostrar fit de "
+        "produto, não coletar o mínimo pra já empurrar uma reunião.\n"
+        "3) Se o lead pergunta algo específico sobre produto, "
+        "funcionalidade ou preço (mesmo depois da regra 2 já ter "
+        "rodado), consulte KnowledgeAgent de novo.\n"
+        "4) Se o lead expressa hesitação, recusa ou objeção, consulte "
         "ObjectionHandlingAgent.\n"
-        "4) Se o lead concorda em avançar / já quer marcar uma conversa, "
-        "consulte SchedulingAgent -- mesmo que a qualificação não esteja "
-        "completa. É papel do SchedulingAgent (e do guardrail de "
-        "allowlist) decidir se já pode confirmar ou se precisa voltar "
-        "pra qualificação primeiro; você não precisa bloquear isso aqui.\n"
-        "5) Se o pedido está fora do escopo comercial, ou o lead pede "
+        "5) Só consulte SchedulingAgent quando (a) o lead pede "
+        "explicitamente pra marcar/agendar, OU (b) a dor e o produto que "
+        "resolve ela já foram explicados nesta conversa (regra 2) e a "
+        "conversa parou de avançar -- o lead só confirmou/concordou sem "
+        "trazer pergunta ou informação nova. Fora desses dois casos, não "
+        "busque horários nem termine a resposta oferecendo uma reunião "
+        "por padrão -- continue aprofundando a conversa (regras 1-4) "
+        "antes disso. Quando a regra 5 valer, é papel do SchedulingAgent "
+        "(e do guardrail de allowlist) decidir se já pode confirmar ou "
+        "se precisa voltar pra qualificação primeiro; você não precisa "
+        "bloquear isso aqui.\n"
+        "6) Se o pedido está fora do escopo comercial, ou o lead pede "
         "explicitamente um humano, consulte EscalateToHumanAgent.\n\n"
         "Depois de consultar o especialista, entregue a resposta dele ao "
         "lead de forma natural (pode repassar quase literalmente — não "

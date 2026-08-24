@@ -11,16 +11,22 @@ este arquivo entende o que cada agente espera receber e o que produz, sem
 precisar ler os prompts inteiros de cada um.
 """
 
-# Escrito pelo Qualification Agent
-STATE_QUALIFICATION_NOTES = "qualification_notes"      # texto livre nesta Parte 1
+# Escrito pelo Qualification Agent, via set_qualification_status.
+# dict (QualificationDetails.model_dump(), ver app/agents/qualification.py):
+# {status, pain, product_of_interest, reasoning, company_size,
+# additional_notes} — o "opportunity brief" da oportunidade. Deixou de
+# ser texto livre pra que o eval set (Parte 6) e quem assumir a
+# conversa depois (SchedulingAgent hoje, via book_meeting; um
+# Closer/CRM real amanhã) consigam ler pain/product_of_interest de
+# forma confiável em vez de reinterpretar prosa.
+STATE_QUALIFICATION_NOTES = "qualification_notes"
 # "in_progress" | "qualified" | "disqualified" — escrito pela tool
 # set_qualification_status (Parte 3). Consumido por
 # app/agents/guardrails/action_allowlist.py pra decidir se book_meeting
-# pode executar de verdade.
+# pode executar de verdade. Mantido como string plana (em vez de dentro
+# do dict acima) de propósito: é o contrato de igualdade que a
+# allowlist já depende de checar.
 STATE_QUALIFICATION_STATUS = "qualification_status"
-# TODO Parte 6: qualification_notes deveria virar um dict estruturado
-# (budget, authority, need, timeline) para o eval set conseguir medir
-# "qualificação correta" de forma objetiva, não só ler texto livre.
 
 # Escrito pelo Knowledge Agent (Parte 4 vai popular de fato via RAG/MCP)
 STATE_LAST_RETRIEVED_CONTEXT = "last_retrieved_context"

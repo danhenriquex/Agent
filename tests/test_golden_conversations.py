@@ -98,7 +98,14 @@ async def test_qualification_flow_sets_status():
     from app.agents.session.state_schema import STATE_QUALIFICATION_STATUS
 
     conversation = [
-        "Oi, vi vocês no LinkedIn",
+        # Precisa incluir a dor explicitamente -- desde que
+        # QualificationAgent parou de aceitar "qualquer sinal de fit"
+        # (budget/autoridade/prazo sozinhos) como suficiente pra decidir,
+        # ele exige entender o problema antes de chamar
+        # set_qualification_status. Ver orchestrator.py e qualification.py
+        # pro histórico dessa mudança.
+        "Oi, vi vocês no LinkedIn. Estamos com dificuldade pra controlar "
+        "o ponto do time só com planilha.",
         "Temos uns 50 funcionários, orçamento de uns R$5k/mês",
         "Sou eu quem decide isso",
         "Precisamos resolver isso ainda esse trimestre",
@@ -180,3 +187,66 @@ async def test_orchestrator_routes_objection_to_objection_agent():
     )
 
     assert STATE_OBJECTIONS_RAISED in state
+
+
+async def test_orchestrator_closes_pending_qualification_before_scheduling():
+    # Regressão de um bug real visto em teste manual (session.db):
+    # QualificationAgent pergunta o prazo e deixa qualification_status
+    # como "in_progress". O lead responde à pergunta -- mas o
+    # Orchestrator pulava direto pra SchedulingAgent (regra antiga "lead
+    # concorda em avançar, consulte Scheduling mesmo sem qualificação
+    # completa") sem nunca voltar pro QualificationAgent pra fechar a
+    # decisão. Resultado: qualification_status ficava travado em
+    # "in_progress" pra sempre, e um book_meeting subsequente seria
+    # bloqueado mesmo o lead tendo acabado de responder tudo que foi
+    # pedido. Isso verifica que a resposta à pergunta em aberto fecha a
+    # qualificação (sai de "in_progress"), não que vira "qualified"
+    # especificamente -- "disqualified" também seria uma decisão válida.
+    from app.agents import root_agent
+    from app.agents.session.state_schema import STATE_QUALIFICATION_STATUS
+
+    conversation = [
+        "Atualmente utilizamos muita planilha e fica difícil gerenciar o ponto do pessoal",
+        "entre duas semanas seria interessante",
+    ]
+
+    last_state = None
+    for attempt in range(3):
+        state, _response_text = await _run_conversation(root_agent, conversation)
+        if state.get(STATE_QUALIFICATION_STATUS) != "in_progress":
+            return
+        last_state = state
+
+    flags = last_state.get(STATE_GUARDRAIL_FLAGS, [])
+    pytest.fail(
+        "qualification_status ficou 'in_progress' após 3 tentativas -- "
+        "Orchestrator pode não estar voltando pro QualificationAgent pra "
+        f"fechar a qualificação. guardrail_flags do último attempt: {flags}"
+    )
+
+
+async def test_orchestrator_does_not_jump_to_scheduling_on_first_pain_message():
+    # Regressão de um bug real visto em teste manual (session.db): uma
+    # única mensagem descrevendo a dor ("dificuldade em gerenciar o
+    # ponto com planilhas") já bastava pra regra antiga de scheduling
+    # ("lead concorda em avançar -> consulte SchedulingAgent, mesmo sem
+    # qualificação completa") disparar -- o lead recebia horários de
+    # reunião oferecidos antes de qualquer explicação de qual produto
+    # resolve o problema dele. A regra 5 agora exige pedido explícito de
+    # agendamento OU a conversa ter parado de avançar depois do fit de
+    # produto já ter sido explicado -- nenhum dos dois vale numa única
+    # mensagem de dor sem pedido de reunião.
+    from app.agents import root_agent
+    from app.agents.session.state_schema import STATE_MEETING_SLOT
+
+    conversation = [
+        "atualmente tenho dificuldades em gerenciar o ponto utilizando planilhas"
+    ]
+
+    state, _response_text = await _run_conversation(root_agent, conversation)
+
+    assert STATE_MEETING_SLOT not in state, (
+        "Orchestrator chamou SchedulingAgent numa única mensagem de dor, "
+        "sem pedido explícito de agendamento -- deveria ter explicado o "
+        "produto que resolve a dor (ou seguido aprofundando) primeiro."
+    )

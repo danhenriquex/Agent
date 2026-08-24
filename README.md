@@ -484,12 +484,24 @@ existia como chave reservada desde a Parte 1, mas nada escrevia um valor
 estruturado nela. A `QualificationAgent` ganhou uma tool nova pra isso:
 
 ```python
-set_qualification_status(status: "qualified"|"disqualified"|"in_progress", reasoning: str)
+set_qualification_status(
+    status: "qualified"|"disqualified"|"in_progress",
+    pain: str,
+    product_of_interest: str,
+    reasoning: str,
+    company_size: str | None = None,
+    additional_notes: str | None = None,
+)
 ```
 
 Mesmo padrão que `SchedulingAgent` já usava — mudança de estado
 estruturada e auditável via tool, não texto livre que outro lugar do
-sistema teria que tentar interpretar.
+sistema teria que tentar interpretar. Além de `status`, a tool grava um
+"opportunity brief" completo em `qualification_notes` (`pain`,
+`product_of_interest`, `company_size`, `reasoning`, `additional_notes`)
+— é isso que dá a quem assume a conversa depois (hoje, `book_meeting`
+via `SchedulingAgent`; um Closer/CRM real amanhã) contexto sobre a
+oportunidade sem precisar reler o chat inteiro.
 
 ### 3. Validação de política de saída (`after_model_callback`)
 
