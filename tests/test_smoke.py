@@ -81,6 +81,22 @@ def test_every_agent_instruction_includes_company_name():
         )
 
 
+def test_every_agent_recovers_from_duplicated_tool_call_json():
+    # BerriAI/litellm#20543: modelos Claude ocasionalmente emitem
+    # argumentos de tool call como JSON duplicado. Defesa em
+    # profundidade -- qualquer agente com tools pode ser afetado, não
+    # só onde foi observado a primeira vez (QualificationAgent).
+    from app.agents.guardrails.model_error_recovery import (
+        recover_from_duplicated_tool_call_json,
+    )
+
+    all_agents = [root_agent, *_specialist_agents()]
+    for agent in all_agents:
+        assert agent.on_model_error_callback is recover_from_duplicated_tool_call_json, (
+            f"{agent.name} não tem recover_from_duplicated_tool_call_json registrado"
+        )
+
+
 def test_scheduling_agent_tools_are_registered():
     scheduling_agent = next(
         agent for agent in _specialist_agents() if agent.name == "SchedulingAgent"

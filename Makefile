@@ -29,6 +29,7 @@ help:
 	@echo "  make test-guardrails - roda só os testes de guardrails (Parte 3)"
 	@echo "  make test-live     - conversas douradas contra o LLM real (custa"
 	@echo "                       API, sobe o proxy sozinho) — NÃO entra em 'make test'"
+	@echo "  make ingest-dev    - abre a UI do Dagster pra rodar a ingestão do RAG"
 	@echo "  make lint          - roda o ruff"
 	@echo "  make clean         - remove __pycache__/.pytest_cache/.ruff_cache"
 
@@ -92,6 +93,9 @@ test-guardrails:
 # entram em "make test". Sobe o proxy (se preciso) antes de rodar.
 test-live: proxy-up
 	RUN_LIVE_TESTS=1 uv run pytest tests/test_golden_conversations.py -v
+
+ingest-dev:
+	uv run dagster dev -f ingestion/definitions.py
 
 lint:
 	uv run ruff check app tests

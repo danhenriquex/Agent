@@ -1,4 +1,4 @@
-# SDR Bot — Sistema Multi-Agente (Partes 1, 2 e 3: Esqueleto + PII + Guardrails)
+# SDR Bot — Sistema Multi-Agente (Partes 1–4: Esqueleto + PII + Guardrails + RAG)
 
 Chatbot SDR (Sales Development Representative) construído com **Google ADK**,
 desenhado para demonstrar, na prática, os requisitos técnicos de vagas de
@@ -6,7 +6,7 @@ LLM/AI Engineer sênior focadas em produção: orquestração multi-agente,
 guardrails, mascaramento de PII, RAG avaliado e observabilidade.
 
 Este projeto é dividido em partes incrementais. Este README cobre as
-**Partes 1, 2 e 3**.
+**Partes 1 a 4**.
 
 ## O que existe nesta parte
 
@@ -39,15 +39,19 @@ Este projeto é dividido em partes incrementais. Este README cobre as
   qualificado) e validação de política de saída (nunca oferecer desconto
   não autorizado) — em todo agente, mesmo padrão de defesa em
   profundidade da Parte 2. Ver seção dedicada abaixo.
-- Smoke tests da topologia + testes de PII + testes de guardrails
-  (`tests/`) que rodam sem precisar de chave de API (a única exceção é o
-  download do modelo spaCy no `uv sync`, que acontece uma vez).
+- **RAG real (Parte 4)**: `KnowledgeAgent` conectado via MCP a um
+  ChromaDB populado por um pipeline de ingestão Dagster, com
+  `asset_check` de recall@3 e de vazamento de PII. Ver seção dedicada
+  abaixo.
+- Smoke tests da topologia + testes de PII + testes de guardrails +
+  testes de RAG (`tests/`) que rodam sem precisar de chave de API (as
+  únicas exceções são o download do modelo spaCy e do modelo de
+  embedding, cada um uma vez).
 
 ## O que **não** está aqui ainda (de propósito)
 
 | Falta | Onde entra |
 |---|---|
-| RAG real + MCP Server para o KnowledgeAgent | Parte 4 |
 | LangFuse + Phoenix (observabilidade) | Parte 5 |
 | Golden eval set + LLM-as-judge + regressão | Parte 6 |
 
@@ -80,6 +84,7 @@ make test-pii        # só os testes de PII
 make test-guardrails # só os testes de guardrails (Parte 3)
 make test-live       # conversas douradas contra o LLM real (custa API,
                       # camada 3 -- ver "Estratégia de testes" abaixo)
+make ingest-dev       # UI do Dagster -- materializar o índice do RAG (Parte 4)
 make lint             # ruff
 make clean            # limpa __pycache__/.pytest_cache/.ruff_cache
 ```
@@ -558,8 +563,115 @@ qualidade.
 4. `make web` — checagem manual de tom/qualidade da conversa (ainda
    importa, só não é mais a ÚNICA linha de defesa)
 
+## RAG real (Parte 4)
+
+### Arquitetura: por que MCP Server como processo separado
+
+O agente ADK nunca importa `mcp_server/` ou `ingestion/` como módulo
+Python — conecta no servidor MCP via subprocess/stdio
+(`McpToolset(connection_params=StdioConnectionParams(...))`), do mesmo
+jeito que o LiteLLM Proxy já é um processo separado desde a Parte 1.
+Essa decisão não foi só estética: significa que `mcp_server/` e
+`ingestion/` nunca entram na árvore de import de `app/agents/`, então
+nunca podem reintroduzir a restrição de import-root isolado do
+`adk web` que já nos mordeu duas vezes (Partes 1 e 2).
+
+```
+KnowledgeAgent (app/agents/knowledge.py)
+      │  McpToolset via subprocess/stdio
+      ▼
+mcp_server/server.py  (fastmcp, processo separado)
+      │  lê
+      ▼
+mcp_server/chroma_data/  (ChromaDB, PersistentClient)
+      ▲  escreve
+      │
+ingestion/assets.py  (Dagster: raw_docs → chunks → chroma_index)
+      ▲  lê
+      │
+ingestion/knowledge_base/*.md  (8 documentos sobre a Helssing)
+```
+
+### Pipeline de ingestão (Dagster)
+
+`raw_docs → chunks → chroma_index`, cada estágio um asset com linhagem
+rastreada — Dagster foi escolhido sobre Prefect especificamente porque
+o modelo de software-defined assets responde bem à pergunta "o índice
+está desatualizado em relação aos documentos-fonte?" via linhagem, sem
+código extra nosso.
+
+**Chunking**: por seção de nível 2 (`##`), não por tamanho fixo — os
+documentos já são estruturados em seções semanticamente coerentes (ver
+`ingestion/knowledge_base/*.md`), então isso preserva significado
+melhor que corte por N caracteres. Cada chunk carrega o título do
+documento como prefixo, pra não perder contexto quando recuperado
+isoladamente.
+
+**Dois `asset_check`** em `chroma_index`, resposta real pro requisito
+"RAG avaliado com dados":
+- `retrieval_recall_at_k`: recall@3 contra um golden query set de 4
+  perguntas — cada uma diz "essa pergunta deveria recuperar um chunk
+  vindo deste documento". Validado rodando de verdade: recall@3 = 1.0.
+- `no_pii_leaked_into_index`: reusa o Presidio já validado na Parte 2
+  pra confirmar que a base de conhecimento (conteúdo de produto) nunca
+  tem PII de verdade nela.
+
+```bash
+make ingest-dev   # abre a UI do Dagster -- materialize os 3 assets
+```
+
+A primeira materialização baixa o modelo de embedding multilingue
+(`paraphrase-multilingual-MiniLM-L12-v2`, ~470MB) do HuggingFace Hub —
+precisa de internet normal, sem restrição de rede. **O índice persiste
+em disco** (`mcp_server/chroma_data/`, gitignored) — não precisa
+rematerializar toda vez que o app roda, só quando o conteúdo dos `.md`
+ou a lógica de chunking mudar.
+
+### Escolha de modelo de embedding
+
+`paraphrase-multilingual-MiniLM-L12-v2` (leve, ~470MB, multilingue,
+bem estabelecido) em vez de encoders específicos de português como os
+"Serafim" da PORTULAN (melhor qualidade, mas outro download pesado em
+cima do modelo do spaCy que já carregamos na Parte 2) — trade-off
+deliberado de simplicidade sobre qualidade máxima, mesmo espírito das
+outras escolhas de modelo neste projeto.
+
+### Bug real encontrado rodando isso: `on_model_error_callback`
+
+Modelos Claude, através do LiteLLM, ocasionalmente emitem argumentos
+de tool call como JSON duplicado e concatenado sem separador (ex:
+`{"status": "x"}{"status": "x"}`) — bug real e ainda aberto a
+montante ([BerriAI/litellm#20543](https://github.com/BerriAI/litellm/issues/20543)).
+Descoberto porque `test_qualification_flow_sets_status` falhou duas
+vezes seguidas com a mesma assinatura de erro — não foi um acaso raro.
+ADK já tenta reparar formatos malformados antes de desistir
+(`ast.literal_eval`, chaves sem aspas), mas nenhuma estratégia cobre
+"JSON válido duplicado", então o erro original sobe e derruba o agente
+inteiro.
+
+`app/agents/guardrails/model_error_recovery.py` intercepta via
+`on_model_error_callback` (wireado em todo agente, defesa em
+profundidade) e degrada graciosamente — pede pro lead repetir a
+mensagem, em vez de travar a conversa inteira por um bug de terceiros
+que nem o LiteLLM conseguiu corrigir de forma definitiva ainda (a
+tentativa de correção deles, #18667, foi revertida em #19243).
+
+### Rodando os testes da Parte 4 isoladamente
+
+```bash
+uv run pytest tests/test_ingestion_chunking.py tests/test_mcp_server_tools.py \
+  tests/test_model_error_recovery.py -v
+```
+
+Nenhum desses precisa do modelo de embedding real nem de rede —
+`test_mcp_server_tools.py` usa um embedder falso e determinístico
+(válido pra testar estrutura e pra `get_pricing_info`, que usa filtro
+de metadado, não busca semântica; relevância semântica de verdade já
+foi validada rodando o pipeline real).
+
 ## Próxima parte
 
-**Parte 4**: RAG de verdade para o `KnowledgeAgent`, via um MCP Server
-dedicado sobre ChromaDB — o agente para de responder "vou confirmar com
-o time" e passa a recuperar contexto real da base de conhecimento.
+**Parte 5**: observabilidade — LangFuse + Arize Phoenix, tracing de
+ponta a ponta através de todo o roteamento multi-agente, custo por
+conversa, e a primeira camada real de "consigo ver o que aconteceu"
+além dos flags manuais em `session.state`.
