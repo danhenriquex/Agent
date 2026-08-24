@@ -5,3 +5,11 @@ __pycache__/
 .ruff_cache/
 .venv/
 venv/
+
+# Parte 4: dados gerados pelo pipeline de ingestão -- regenerável via
+# `make ingest-dev`, não deveria ir pro git (binário, muda a cada
+# reindexação, e o modelo de embedding baixado junto seria enorme).
+mcp_server/chroma_data/
+# Dagster cria isso automaticamente quando DAGSTER_HOME não está
+# setado (nosso caso, dev local) -- efêmero por natureza.
+.tmp_dagster_home*/

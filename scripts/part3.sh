@@ -1,26 +1,21 @@
 #!/usr/bin/env bash
-# Gerado em: 2026-08-09T13:30:38Z -- se os outros scripts (part1/cicd/part2/part3) que você tem localmente têm datas MUITO diferentes desta, você está misturando versões antigas com novas. Baixe os 4 de novo, juntos, na mesma resposta/mensagem.
+# Gerado em: 2026-08-24T02:40:12Z -- se os outros scripts (part1/cicd/part2/part4) que você tem localmente têm datas MUITO diferentes desta, você está misturando versões antigas com novas. Baixe os que precisar de novo, juntos, na mesma resposta/mensagem.
 #
-# part3_setup.sh — guardrails (Parte 3):
-#   - app/agents/guardrails/ (novo pacote): prompt_injection,
-#     output_policy, action_allowlist, transfer (movido de
-#     _guardrails.py -- não é mais um stopgap solto)
-#   - set_qualification_status: nova tool em QualificationAgent
-#   - Todo agente ganha detect_prompt_injection +
-#     validate_output_policy (defesa em profundidade, mesmo
-#     padrão da Parte 2); SchedulingAgent ganha
-#     enforce_action_allowlist (before_tool_callback)
+# part3_setup.sh — guardrails (Parte 3), agora incluindo:
+#   - recover_from_duplicated_tool_call_json: recuperação de um bug
+#     real e conhecido a montante (BerriAI/litellm#20543) -- modelos
+#     Claude ocasionalmente emitem argumentos de tool call como JSON
+#     duplicado/concatenado, quebrando o parsing e derrubando o
+#     agente inteiro. Wireado em todo agente (defesa em profundidade)
+#     via on_model_error_callback.
 #
-# Pré-requisito: rode isso DEPOIS de part1_setup.sh e
-# part2_setup.sh -- os agentes aqui dependem do módulo de PII
-# da Parte 2. cicd_setup.sh é independente, pode vir antes ou
-# depois.
+# Pré-requisito: rode isso DEPOIS de part1/cicd/part2_setup.sh --
+# os agentes aqui dependem do módulo de PII da Parte 2.
 #
 # Uso:
 #   bash part3_setup.sh [diretorio-do-projeto]
 #
-# É seguro rodar de novo: sobrescreve só os arquivos listados
-# acima com o conteúdo atual desta trilha.
+# É seguro rodar de novo: sobrescreve só os arquivos listados acima.
 
 set -euo pipefail
 
@@ -336,6 +331,81 @@ def enforce_action_allowlist(tool, args: dict, tool_context: ToolContext) -> dic
     }
 SDR_PART3_EOF
 
+echo "  - app/agents/guardrails/model_error_recovery.py"
+cat > "$TARGET_DIR/app/agents/guardrails/model_error_recovery.py" <<'SDR_PART3_EOF'
+"""
+Recuperação de um bug real, conhecido e ainda aberto a montante:
+BerriAI/litellm#20543 -- modelos Claude ocasionalmente emitem os
+argumentos de uma tool call como JSON duplicado e concatenado sem
+separador (ex: '{"status": "x"}{"status": "x"}'), o que quebra o
+parsing estrito de JSON.
+
+ADK já tenta reparar formatos malformados em
+lite_llm.py::_parse_tool_call_arguments (ast.literal_eval, chaves sem
+aspas) antes de desistir -- mas nenhuma dessas estratégias cobre
+"objeto JSON válido duplicado", então o erro original
+(json.JSONDecodeError, msg="Extra data") sobe até quebrar a invocação
+inteira do agente (DynamicNodeFailError).
+
+Descoberto rodando test_golden_conversations.py::
+test_qualification_flow_sets_status -- falhou duas vezes seguidas com
+a MESMA assinatura de erro, o que indica que não é um acaso raro pra
+esse par tool/conversa específico, e sim algo que vale ter uma
+recuperação de verdade, não só documentação.
+
+Este guardrail NÃO tenta reconstruir a tool call original (o nome da
+função não está disponível de forma confiável no contexto de
+on_model_error_callback, só os argumentos crus que falharam ao
+parsear) -- em vez disso, faz uma degradação graciosa: evita o crash
+duro e deixa a conversa continuar, em vez de travar a interação
+inteira por causa de um bug de terceiros que nem o LiteLLM conseguiu
+corrigir de forma definitiva ainda (a tentativa de correção deles,
+#18667, foi revertida em #19243).
+"""
+
+import json
+
+from google.adk.agents.callback_context import CallbackContext
+from google.adk.models import LlmRequest, LlmResponse
+from google.genai import types
+
+from ..session.state_schema import STATE_GUARDRAIL_FLAGS
+
+_FALLBACK_TEXT = (
+    "Desculpa, tive uma falha técnica processando isso agora. Pode "
+    "repetir sua última mensagem?"
+)
+
+
+def recover_from_duplicated_tool_call_json(
+    callback_context: CallbackContext, llm_request: LlmRequest, error: Exception
+) -> LlmResponse | None:
+    """Detecta especificamente o padrão de erro do BerriAI/litellm#20543
+    e degrada graciosamente em vez de deixar o agente inteiro travar.
+
+    Retorna None (deixa o erro original propagar) pra qualquer outro
+    tipo de erro -- este guardrail existe pra UM bug específico e
+    conhecido, não é um catch-all genérico que esconderia problemas
+    reais de verdade.
+    """
+    if not isinstance(error, json.JSONDecodeError):
+        return None
+    if "Extra data" not in str(error):
+        return None
+
+    flags = callback_context.state.get(STATE_GUARDRAIL_FLAGS, [])
+    flags.append(
+        f"{callback_context.agent_name}: recuperado de JSON duplicado em "
+        "argumentos de tool call (bug a montante, ver "
+        "github.com/BerriAI/litellm/issues/20543)"
+    )
+    callback_context.state[STATE_GUARDRAIL_FLAGS] = flags
+
+    return LlmResponse(
+        content=types.Content(role="model", parts=[types.Part(text=_FALLBACK_TEXT)])
+    )
+SDR_PART3_EOF
+
 echo "  - app/agents/orchestrator.py"
 cat > "$TARGET_DIR/app/agents/orchestrator.py" <<'SDR_PART3_EOF'
 """
@@ -395,6 +465,7 @@ from google.adk.tools.agent_tool import AgentTool
 
 from .config.models import get_model_for_role
 from .escalate import escalate_agent
+from .guardrails.model_error_recovery import recover_from_duplicated_tool_call_json
 from .guardrails.output_policy import validate_output_policy
 from .guardrails.prompt_injection import detect_prompt_injection
 from .knowledge import knowledge_agent
@@ -455,6 +526,7 @@ root_agent = LlmAgent(
     ],
     before_model_callback=[mask_pii, detect_prompt_injection],
     after_model_callback=[validate_output_policy, unmask_pii],
+    on_model_error_callback=recover_from_duplicated_tool_call_json,
 )
 SDR_PART3_EOF
 
@@ -482,6 +554,7 @@ from google.adk.agents import LlmAgent
 from google.adk.tools import ToolContext
 
 from .config.models import get_model_for_role
+from .guardrails.model_error_recovery import recover_from_duplicated_tool_call_json
 from .guardrails.output_policy import validate_output_policy
 from .guardrails.prompt_injection import detect_prompt_injection
 from .guardrails.transfer import block_unauthorized_transfer
@@ -556,6 +629,7 @@ qualification_agent = LlmAgent(
     # guardrail de transfer abaixo fica como defesa em profundidade.
     before_model_callback=[mask_pii, detect_prompt_injection],
     after_model_callback=[validate_output_policy, block_unauthorized_transfer],
+    on_model_error_callback=recover_from_duplicated_tool_call_json,
 )
 SDR_PART3_EOF
 
@@ -564,22 +638,49 @@ cat > "$TARGET_DIR/app/agents/knowledge.py" <<'SDR_PART3_EOF'
 """
 Knowledge Agent — responde dúvidas sobre produto, preço e cases.
 
-Nesta Parte 1 ele ainda NÃO tem RAG de verdade (isso é a Parte 4, via um
-MCP server dedicado rodando sobre ChromaDB). Por enquanto ele responde só
-com o que está na instruction, deixando claro ao lead quando não tem
-certeza — importante para não estabelecer hábito de alucinar antes de
-termos avaliação de faithfulness (Parte 6).
+Parte 4: ganhou RAG de verdade via McpToolset, conectado a um servidor
+MCP dedicado (mcp_server/server.py) que roda sobre ChromaDB. O servidor
+é um PROCESSO SEPARADO (igual o LiteLLM Proxy) -- o ADK conecta nele via
+subprocess/stdio, não como import Python. É por isso que mcp_server/ e
+ingestion/ podem ficar fora de app/agents/ sem esbarrar na restrição de
+import-root isolado do `adk web` (Partes 1 e 2).
+
+Pré-requisito pra isso funcionar: a base de conhecimento precisa ter
+sido indexada pelo menos uma vez (`make ingest-dev`), senão o servidor
+MCP não encontra a coleção no ChromaDB.
 """
 
+from pathlib import Path
+
 from google.adk.agents import LlmAgent
+from google.adk.tools.mcp_tool.mcp_session_manager import StdioConnectionParams
+from google.adk.tools.mcp_tool.mcp_toolset import McpToolset
+from mcp import StdioServerParameters
 
 from .config.models import get_model_for_role
+from .guardrails.model_error_recovery import recover_from_duplicated_tool_call_json
 from .guardrails.output_policy import validate_output_policy
 from .guardrails.prompt_injection import detect_prompt_injection
 from .guardrails.transfer import block_unauthorized_transfer
 from .persona import PERSONA_INTRO
 from .pii.masking import mask_pii
 from .session.state_schema import STATE_LAST_RETRIEVED_CONTEXT
+
+# app/agents/knowledge.py -> app/agents -> app -> raiz do projeto.
+# Calculado em runtime (não hardcoded) pra funcionar independente de
+# onde o projeto foi clonado.
+_PROJECT_ROOT = Path(__file__).parent.parent.parent
+
+_knowledge_base_mcp = McpToolset(
+    connection_params=StdioConnectionParams(
+        server_params=StdioServerParameters(
+            command="uv",
+            args=["run", "python", "mcp_server/server.py"],
+            cwd=str(_PROJECT_ROOT),
+        ),
+        timeout=15.0,
+    ),
+)
 
 knowledge_agent = LlmAgent(
     name="KnowledgeAgent",
@@ -592,15 +693,20 @@ knowledge_agent = LlmAgent(
     instruction=(
         PERSONA_INTRO
         + "Você responde perguntas sobre nosso produto SaaS de forma "
-        "precisa e concisa. "
-        "IMPORTANTE (temporário — Parte 1): você ainda não tem acesso à "
-        "base de conhecimento real. Se não tiver certeza absoluta da "
-        "resposta, diga explicitamente que vai confirmar com o time e "
-        "NÃO invente números de preço ou funcionalidades. "
-        "TODO Parte 4: este agente vai receber um MCPToolset apontando "
-        "para um servidor MCP de retrieval (ChromaDB) — ver arquitetura "
-        "no README."
+        "precisa e concisa, usando as ferramentas de busca disponíveis "
+        "-- NUNCA responda sobre preço, funcionalidade ou integração "
+        "de memória sem antes consultar retrieve_product_docs ou "
+        "get_pricing_info.\n\n"
+        "Para perguntas de preço/planos, use get_pricing_info (retorna "
+        "o documento completo, mais confiável que busca semântica pra "
+        "esse tipo de pergunta). Para tudo mais sobre produto, "
+        "funcionalidades, objeções ou integrações, use "
+        "retrieve_product_docs com a pergunta do lead.\n\n"
+        "Se o resultado da busca não cobrir o que foi perguntado, diga "
+        "explicitamente que vai confirmar com o time -- NÃO invente "
+        "números de preço ou funcionalidades que não vieram da busca."
     ),
+    tools=[_knowledge_base_mcp],
     output_key=STATE_LAST_RETRIEVED_CONTEXT,
     # Chamado via AgentTool a partir do Orchestrator (ver orchestrator.py),
     # não via sub_agents — então este agente nunca ganha a ferramenta
@@ -608,6 +714,7 @@ knowledge_agent = LlmAgent(
     # guardrail de transfer abaixo fica como defesa em profundidade.
     before_model_callback=[mask_pii, detect_prompt_injection],
     after_model_callback=[validate_output_policy, block_unauthorized_transfer],
+    on_model_error_callback=recover_from_duplicated_tool_call_json,
 )
 SDR_PART3_EOF
 
@@ -626,6 +733,7 @@ DE VERDADE, não só confia que ele vai seguir a instrução.
 from google.adk.agents import LlmAgent
 
 from .config.models import get_model_for_role
+from .guardrails.model_error_recovery import recover_from_duplicated_tool_call_json
 from .guardrails.output_policy import validate_output_policy
 from .guardrails.prompt_injection import detect_prompt_injection
 from .guardrails.transfer import block_unauthorized_transfer
@@ -656,6 +764,7 @@ objection_agent = LlmAgent(
     # guardrail de transfer abaixo fica como defesa em profundidade.
     before_model_callback=[mask_pii, detect_prompt_injection],
     after_model_callback=[validate_output_policy, block_unauthorized_transfer],
+    on_model_error_callback=recover_from_duplicated_tool_call_json,
 )
 SDR_PART3_EOF
 
@@ -678,6 +787,7 @@ fallback silencioso dentro de outro agente) para que:
 from google.adk.agents import LlmAgent
 
 from .config.models import get_model_for_role
+from .guardrails.model_error_recovery import recover_from_duplicated_tool_call_json
 from .guardrails.output_policy import validate_output_policy
 from .guardrails.prompt_injection import detect_prompt_injection
 from .guardrails.transfer import block_unauthorized_transfer
@@ -709,6 +819,7 @@ escalate_agent = LlmAgent(
     # guardrail de transfer abaixo fica como defesa em profundidade.
     before_model_callback=[mask_pii, detect_prompt_injection],
     after_model_callback=[validate_output_policy, block_unauthorized_transfer],
+    on_model_error_callback=recover_from_duplicated_tool_call_json,
 )
 SDR_PART3_EOF
 
@@ -737,6 +848,7 @@ from google.adk.agents import LlmAgent
 
 from .config.models import get_model_for_role
 from .guardrails.action_allowlist import enforce_action_allowlist
+from .guardrails.model_error_recovery import recover_from_duplicated_tool_call_json
 from .guardrails.output_policy import validate_output_policy
 from .guardrails.prompt_injection import detect_prompt_injection
 from .guardrails.transfer import block_unauthorized_transfer
@@ -807,6 +919,7 @@ scheduling_agent = LlmAgent(
     # guardrail de transfer abaixo fica como defesa em profundidade.
     before_model_callback=[mask_pii, detect_prompt_injection],
     after_model_callback=[validate_output_policy, block_unauthorized_transfer],
+    on_model_error_callback=recover_from_duplicated_tool_call_json,
     before_tool_callback=enforce_action_allowlist,
 )
 SDR_PART3_EOF
@@ -939,6 +1052,22 @@ def test_every_agent_instruction_includes_company_name():
         assert COMPANY_NAME in agent.instruction, (
             f"{agent.name} não tem {COMPANY_NAME} na instruction -- "
             "provavelmente esqueceu de usar PERSONA_INTRO"
+        )
+
+
+def test_every_agent_recovers_from_duplicated_tool_call_json():
+    # BerriAI/litellm#20543: modelos Claude ocasionalmente emitem
+    # argumentos de tool call como JSON duplicado. Defesa em
+    # profundidade -- qualquer agente com tools pode ser afetado, não
+    # só onde foi observado a primeira vez (QualificationAgent).
+    from app.agents.guardrails.model_error_recovery import (
+        recover_from_duplicated_tool_call_json,
+    )
+
+    all_agents = [root_agent, *_specialist_agents()]
+    for agent in all_agents:
+        assert agent.on_model_error_callback is recover_from_duplicated_tool_call_json, (
+            f"{agent.name} não tem recover_from_duplicated_tool_call_json registrado"
         )
 
 
@@ -1382,6 +1511,80 @@ def test_would_have_caught_the_dunder_name_bug():
     assert _book_meeting_tool.name == "book_meeting"
 SDR_PART3_EOF
 
+echo "  - tests/test_model_error_recovery.py"
+cat > "$TARGET_DIR/tests/test_model_error_recovery.py" <<'SDR_PART3_EOF'
+"""
+Unit tests for the recovery guardrail that handles the known upstream
+bug in BerriAI/litellm#20543 (duplicated JSON in tool call arguments).
+No LLM calls -- constructs the exact real-world JSONDecodeError
+signature directly.
+"""
+
+import json
+from unittest.mock import MagicMock
+
+from app.agents.guardrails.model_error_recovery import recover_from_duplicated_tool_call_json
+from app.agents.session.state_schema import STATE_GUARDRAIL_FLAGS
+
+
+def _fake_context() -> MagicMock:
+    ctx = MagicMock()
+    ctx.agent_name = "QualificationAgent"
+    ctx.state = {}
+    return ctx
+
+
+def _real_duplicated_json_error() -> json.JSONDecodeError:
+    """Reproduz a assinatura EXATA do erro real observado rodando
+    test_golden_conversations.py -- os mesmos argumentos duplicados e
+    concatenados sem separador."""
+    malformed = (
+        '{"status": "in_progress", "reasoning": "texto"}'
+        '{"status": "in_progress", "reasoning": "texto"}'
+    )
+    try:
+        json.loads(malformed)
+    except json.JSONDecodeError as e:
+        return e
+    raise AssertionError("deveria ter levantado JSONDecodeError")
+
+
+def test_recovers_from_real_duplicated_json_signature():
+    ctx = _fake_context()
+    error = _real_duplicated_json_error()
+
+    result = recover_from_duplicated_tool_call_json(ctx, MagicMock(), error)
+
+    assert result is not None
+    assert result.content.parts[0].text
+    assert len(ctx.state[STATE_GUARDRAIL_FLAGS]) == 1
+    assert "litellm/issues/20543" in ctx.state[STATE_GUARDRAIL_FLAGS][0]
+
+
+def test_does_not_swallow_unrelated_exceptions():
+    ctx = _fake_context()
+
+    result = recover_from_duplicated_tool_call_json(
+        ctx, MagicMock(), ValueError("algo completamente diferente")
+    )
+
+    assert result is None
+    assert STATE_GUARDRAIL_FLAGS not in ctx.state
+
+
+def test_does_not_swallow_other_json_decode_errors():
+    # Um JSONDecodeError de tipo diferente (ex: JSON genuinamente
+    # malformado, não duplicado) não deveria ser mascarado -- esse
+    # guardrail existe pra UM bug específico, não é um catch-all.
+    ctx = _fake_context()
+    other_error = json.JSONDecodeError("Expecting value", "", 0)
+
+    result = recover_from_duplicated_tool_call_json(ctx, MagicMock(), other_error)
+
+    assert result is None
+    assert STATE_GUARDRAIL_FLAGS not in ctx.state
+SDR_PART3_EOF
+
 echo "  - Makefile"
 cat > "$TARGET_DIR/Makefile" <<'SDR_PART3_EOF'
 SHELL := /bin/bash
@@ -1415,6 +1618,7 @@ help:
 	@echo "  make test-guardrails - roda só os testes de guardrails (Parte 3)"
 	@echo "  make test-live     - conversas douradas contra o LLM real (custa"
 	@echo "                       API, sobe o proxy sozinho) — NÃO entra em 'make test'"
+	@echo "  make ingest-dev    - abre a UI do Dagster pra rodar a ingestão do RAG"
 	@echo "  make lint          - roda o ruff"
 	@echo "  make clean         - remove __pycache__/.pytest_cache/.ruff_cache"
 
@@ -1478,6 +1682,9 @@ test-guardrails:
 # entram em "make test". Sobe o proxy (se preciso) antes de rodar.
 test-live: proxy-up
 	RUN_LIVE_TESTS=1 uv run pytest tests/test_golden_conversations.py -v
+
+ingest-dev:
+	uv run dagster dev -f ingestion/definitions.py
 
 lint:
 	uv run ruff check app tests
@@ -2068,8 +2275,6 @@ echo ""
 echo "==> Parte 3 gerada/atualizada com sucesso em $TARGET_DIR"
 echo ""
 echo "Próximos passos:"
-echo "  1. cd $TARGET_DIR && uv sync"
-echo "  2. make test    # ou: uv run pytest -v  (40 testes esperados)"
-echo "  3. make test-guardrails   # só os testes novos desta parte"
-echo "  4. make lint"
-echo "  5. make web     # teste manual dos guardrails na UI do adk"
+echo "  1. cd $TARGET_DIR && uv sync --locked"
+echo "  2. make test    # ou: uv run pytest -v"
+echo "  3. bash part4_setup.sh \$TARGET_DIR   # se você já tinha a Parte 4"

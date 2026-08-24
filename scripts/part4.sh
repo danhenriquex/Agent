@@ -1,3 +1,1087 @@
+#!/usr/bin/env bash
+# Gerado em: 2026-08-24T02:52:38Z -- se os outros scripts (part1/cicd/part2/part3) que você tem localmente têm datas MUITO diferentes desta, você está misturando versões antigas com novas. Baixe os que precisar de novo, juntos, na mesma resposta/mensagem.
+#
+# part4_setup.sh — RAG real (Parte 4):
+#   - ingestion/: pipeline Dagster (raw_docs -> chunks -> chroma_index)
+#     com 2 asset_check (recall@3, PII leak)
+#   - ingestion/knowledge_base/: 8 documentos sobre a Helssing
+#   - mcp_server/server.py: servidor MCP (fastmcp) que serve a busca,
+#     roda como PROCESSO SEPARADO (igual litellm_proxy)
+#   - app/agents/knowledge.py: McpToolset de verdade + recuperação
+#     do bug BerriAI/litellm#20543 (mesma correção da Parte 3,
+#     reaplicada aqui pq este script possui a versão mais recente
+#     deste arquivo especificamente)
+#   - pyproject.toml/uv.lock: +chromadb, sentence-transformers,
+#     dagster, dagster-webserver, fastmcp
+#
+# IMPORTANTE: depois de rodar isso, você AINDA precisa popular o
+# índice antes do KnowledgeAgent funcionar:
+#   uv sync --locked
+#   make ingest-dev   # abre a UI do Dagster, materialize os assets
+#
+# Pré-requisito: rode isso DEPOIS de part1/cicd/part2/part3_setup.sh
+#
+# Uso:
+#   bash part4_setup.sh [diretorio-do-projeto]
+#
+# É seguro rodar de novo: sobrescreve só os arquivos listados acima.
+
+set -euo pipefail
+
+TARGET_DIR="${1:-sdr-agent}"
+
+if [ ! -d "$TARGET_DIR" ]; then
+  echo "ERRO: \"$TARGET_DIR\" não existe. Rode part1_setup.sh primeiro."
+  exit 1
+fi
+
+echo "==> Adicionando RAG real (Parte 4) em: $TARGET_DIR"
+
+mkdir -p "$TARGET_DIR/ingestion"
+mkdir -p "$TARGET_DIR/ingestion/knowledge_base"
+mkdir -p "$TARGET_DIR/mcp_server"
+mkdir -p "$TARGET_DIR/app/agents"
+mkdir -p "$TARGET_DIR/tests"
+
+echo "  - ingestion/__init__.py"
+cat > "$TARGET_DIR/ingestion/__init__.py" <<'SDR_PART4_EOF'
+SDR_PART4_EOF
+
+echo "  - ingestion/assets.py"
+cat > "$TARGET_DIR/ingestion/assets.py" <<'SDR_PART4_EOF'
+"""
+Pipeline de ingestão do RAG: raw_docs -> chunks -> embeddings -> chroma_index
+
+Cada estágio é um Dagster asset com linhagem rastreada -- não "um
+script que roda", mas "um dado que existe e pode ficar desatualizado
+em relação à fonte". Isso é o motivo de termos escolhido Dagster em
+vez de Prefect pra essa parte especificamente: o modelo de
+software-defined assets encaixa bem melhor num pipeline de RAG, onde
+"o índice de vetores está desatualizado em relação aos documentos-
+fonte?" é uma pergunta que a própria ferramenta consegue responder via
+linhagem, sem código extra nosso.
+
+Os dois asset_check em chroma_index tornam a Parte 4 uma resposta real
+pro requisito "RAG avaliado com dados" -- toda vez que o índice é
+reconstruído, a qualidade de retrieval é reavaliada automaticamente,
+não é um notebook manual rodado de vez em quando.
+"""
+
+import re
+from pathlib import Path
+
+import chromadb
+import dagster as dg
+
+KNOWLEDGE_BASE_DIR = Path(__file__).parent / "knowledge_base"
+CHROMA_DATA_DIR = Path(__file__).parent.parent / "mcp_server" / "chroma_data"
+COLLECTION_NAME = "helssing_knowledge_base"
+EMBEDDING_MODEL_NAME = "paraphrase-multilingual-MiniLM-L12-v2"
+
+# Query dourada usada pelo asset_check de qualidade de retrieval --
+# cada entrada diz "essa pergunta deveria recuperar um chunk vindo
+# deste documento-fonte, entre os top-k resultados". Pequeno de
+# propósito (golden set completo com LLM-as-judge é escopo da Parte 6),
+# mas real o suficiente pra pegar regressão óbvia de chunking/embedding.
+_GOLDEN_QUERIES = [
+    ("quanto custa o plano de vocês?", "02_planos_precos"),
+    ("como funciona o cálculo de horas extras?", "03_folha_pagamento"),
+    ("já uso outro sistema, por que devo trocar?", "06_objecao_concorrente"),
+    ("vocês integram com o eSocial?", "08_integracoes"),
+]
+
+
+def _default_embedding_function():
+    """Função de embedding real, usada em produção -- baixa o modelo
+    multilingue do HuggingFace Hub na primeira chamada (~470MB)."""
+    from chromadb.utils.embedding_functions import SentenceTransformerEmbeddingFunction
+
+    return SentenceTransformerEmbeddingFunction(model_name=EMBEDDING_MODEL_NAME)
+
+
+@dg.asset(description="Lê todos os documentos .md da base de conhecimento")
+def raw_docs() -> list[dict]:
+    docs = []
+    for path in sorted(KNOWLEDGE_BASE_DIR.glob("*.md")):
+        docs.append({"source": path.stem, "text": path.read_text(encoding="utf-8")})
+    return docs
+
+
+@dg.asset(description="Divide cada documento em chunks por seção (headers ##)")
+def chunks(raw_docs: list[dict]) -> list[dict]:
+    """Divide por seção de nível 2 (##), não por tamanho fixo -- nossos
+    documentos já são estruturados em seções semanticamente coerentes
+    (ver ingestion/knowledge_base/*.md), então isso preserva o
+    significado de cada chunk melhor que corte por N caracteres.
+
+    Cada chunk carrega o título do documento (H1) como prefixo, pra não
+    perder o contexto de qual produto/assunto ele é quando recuperado
+    isoladamente.
+    """
+    result = []
+    for doc in raw_docs:
+        text = doc["text"]
+        title_match = re.match(r"^#\s+(.+)$", text, re.MULTILINE)
+        title = title_match.group(1) if title_match else doc["source"]
+
+        sections = re.split(r"^##\s+(.+)$", text, flags=re.MULTILINE)
+        # re.split com grupo de captura intercala: [preâmbulo, header1,
+        # corpo1, header2, corpo2, ...]
+        preamble = sections[0]
+        section_pairs = list(zip(sections[1::2], sections[2::2]))
+
+        if not section_pairs:
+            # Documento sem nenhum "##" -- trata o texto inteiro como um chunk só.
+            result.append(
+                {
+                    "id": f"{doc['source']}__full",
+                    "source": doc["source"],
+                    "text": text.strip(),
+                }
+            )
+            continue
+
+        for i, (header, body) in enumerate(section_pairs):
+            chunk_text = f"{title} — {header}\n\n{body.strip()}"
+            if i == 0 and preamble.strip():
+                # A primeira seção carrega também o preâmbulo (texto
+                # antes do primeiro "##"), que costuma ter o resumo
+                # de uma linha do documento.
+                chunk_text = f"{title}\n\n{preamble.strip()}\n\n## {header}\n\n{body.strip()}"
+            result.append(
+                {
+                    "id": f"{doc['source']}__{i}",
+                    "source": doc["source"],
+                    "text": chunk_text,
+                }
+            )
+    return result
+
+
+@dg.asset(description="Escreve os chunks no ChromaDB (recria a coleção do zero)")
+def chroma_index(
+    context: dg.AssetExecutionContext, chunks: list[dict]
+) -> dg.MaterializeResult:
+    CHROMA_DATA_DIR.mkdir(parents=True, exist_ok=True)
+    client = chromadb.PersistentClient(path=str(CHROMA_DATA_DIR))
+
+    # Recria do zero a cada materialização -- simples e correto pra
+    # esse volume (8 documentos); reindexação incremental ficaria como
+    # melhoria de "se isso fosse produção" com uma base maior.
+    try:
+        client.delete_collection(COLLECTION_NAME)
+    except Exception:
+        pass
+
+    collection = client.create_collection(
+        name=COLLECTION_NAME, embedding_function=_default_embedding_function()
+    )
+    collection.add(
+        documents=[c["text"] for c in chunks],
+        ids=[c["id"] for c in chunks],
+        metadatas=[{"source": c["source"]} for c in chunks],
+    )
+
+    context.log.info(f"Indexados {len(chunks)} chunks em '{COLLECTION_NAME}'")
+    return dg.MaterializeResult(
+        metadata={"chunk_count": len(chunks), "collection": COLLECTION_NAME}
+    )
+
+
+@dg.asset_check(asset=chroma_index, description="Recall@3 contra o golden query set")
+def retrieval_recall_at_k() -> dg.AssetCheckResult:
+    client = chromadb.PersistentClient(path=str(CHROMA_DATA_DIR))
+    collection = client.get_collection(
+        COLLECTION_NAME, embedding_function=_default_embedding_function()
+    )
+
+    hits = 0
+    misses = []
+    for query, expected_source in _GOLDEN_QUERIES:
+        results = collection.query(query_texts=[query], n_results=3)
+        retrieved_sources = [m["source"] for m in results["metadatas"][0]]
+        if expected_source in retrieved_sources:
+            hits += 1
+        else:
+            misses.append({"query": query, "expected": expected_source, "got": retrieved_sources})
+
+    recall = hits / len(_GOLDEN_QUERIES)
+    return dg.AssetCheckResult(
+        passed=recall >= 0.75,
+        metadata={
+            "recall_at_3": recall,
+            "hits": hits,
+            "total": len(_GOLDEN_QUERIES),
+            "misses": misses,
+        },
+    )
+
+
+@dg.asset_check(asset=chroma_index, description="Nenhum chunk indexado deveria conter PII")
+def no_pii_leaked_into_index() -> dg.AssetCheckResult:
+    """Defesa em profundidade -- a base de conhecimento é conteúdo de
+    produto, nunca deveria ter PII de verdade nela. Reusa o mesmo
+    Presidio já validado na Parte 2, em vez de duplicar lógica de
+    detecção.
+
+    Nota real descoberta rodando isso: os chunks carregam o título/
+    header da seção como prefixo (ex: "Helssing — Diferencial"), e
+    palavras isoladas e capitalizadas sem estrutura de frase ao redor
+    confundem o NER do spaCy (ex: "Preços", "Gestor", "CPF" foram
+    identificados como PERSON). Um nome de verdade é quase sempre
+    multi-token em texto natural ("Danilo Henrique") -- filtrar
+    matches de um token só remove esse falso positivo estrutural sem
+    enfraquecer a proteção real (esse filtro vale só para este check,
+    não para o mask_pii da Parte 2, que roda sobre mensagens de
+    conversa de verdade, não títulos de seção).
+    """
+    from app.agents.pii.engine import SUPPORTED_ENTITIES, get_analyzer_engine
+
+    client = chromadb.PersistentClient(path=str(CHROMA_DATA_DIR))
+    collection = client.get_collection(
+        COLLECTION_NAME, embedding_function=_default_embedding_function()
+    )
+    all_chunks = collection.get()
+
+    analyzer = get_analyzer_engine()
+    flagged = []
+    for chunk_id, text in zip(all_chunks["ids"], all_chunks["documents"]):
+        results = analyzer.analyze(text=text, language="pt", entities=SUPPORTED_ENTITIES)
+        real_hits = [
+            r
+            for r in results
+            if not (r.entity_type == "PERSON" and " " not in text[r.start : r.end].strip())
+        ]
+        if real_hits:
+            flagged.append({"chunk_id": chunk_id, "entities": [r.entity_type for r in real_hits]})
+
+    return dg.AssetCheckResult(
+        passed=len(flagged) == 0,
+        metadata={"flagged_chunks": flagged, "total_chunks": len(all_chunks["ids"])},
+    )
+SDR_PART4_EOF
+
+echo "  - ingestion/definitions.py"
+cat > "$TARGET_DIR/ingestion/definitions.py" <<'SDR_PART4_EOF'
+"""
+Ponto de entrada do Dagster pra este projeto -- `dagster dev -f
+ingestion/definitions.py` (ou via Makefile: `make ingest-dev`) abre a
+UI local mostrando o grafo de assets, histórico de materialização, e
+resultado dos asset_checks ao longo do tempo.
+
+Rodar a ingestão sem UI (ex: num pipeline de CI/CD futuro):
+    uv run dagster asset materialize -f ingestion/definitions.py --select '*'
+"""
+
+import dagster as dg
+
+from ingestion.assets import (
+    chroma_index,
+    chunks,
+    no_pii_leaked_into_index,
+    raw_docs,
+    retrieval_recall_at_k,
+)
+
+defs = dg.Definitions(
+    assets=[raw_docs, chunks, chroma_index],
+    asset_checks=[retrieval_recall_at_k, no_pii_leaked_into_index],
+)
+SDR_PART4_EOF
+
+echo "  - ingestion/knowledge_base/01_visao_geral.md"
+cat > "$TARGET_DIR/ingestion/knowledge_base/01_visao_geral.md" <<'SDR_PART4_EOF'
+# Visão Geral — Helssing
+
+A Helssing é uma plataforma de RH e DP (Departamento Pessoal) que
+automatiza folha de pagamento, admissão digital, gestão de ponto e
+benefícios para empresas que ainda dependem de planilha, papel ou
+sistemas fragmentados.
+
+## Pra quem é
+
+Empresas de 20 a 500 funcionários no Brasil, principalmente times de RH
+e DP que hoje gastam a maior parte do tempo em tarefas manuais e
+repetitivas (conferência de ponto, cálculo de folha, organização de
+documentos de admissão) em vez de cuidar de gente.
+
+## O problema que resolve
+
+Times de RH/DP pequenos costumam usar uma mistura de planilhas, e-mail,
+WhatsApp e no máximo um sistema de ponto isolado — sem integração entre
+essas ferramentas. Isso gera retrabalho, erros de cálculo na folha,
+atraso em admissões e risco de multa trabalhista por documentação
+incompleta ou fora do prazo.
+
+## Como a Helssing resolve
+
+Centraliza os quatro processos centrais de DP em um único sistema:
+
+- **Folha de pagamento**: cálculo automático (INSS, IRRF, FGTS, horas
+  extras, faltas), holerite digital, integração direta com o banco pra
+  pagamento.
+- **Admissão digital**: coleta de documentos, assinatura eletrônica de
+  contrato, geração automática de ficha de registro — elimina a etapa
+  de papel.
+- **Gestão de ponto**: batida por app com geolocalização, cálculo
+  automático de banco de horas, alertas de inconsistência antes do
+  fechamento da folha.
+- **Benefícios**: gestão de vale-transporte, vale-refeição, plano de
+  saúde e outros benefícios num único painel.
+
+## Diferencial
+
+Diferente de sistemas de ponto ou folha isolados, a Helssing conecta os
+quatro processos — uma correção de ponto já reflete automaticamente no
+cálculo da folha do mês, sem exportar planilha entre sistemas.
+SDR_PART4_EOF
+
+echo "  - ingestion/knowledge_base/02_planos_precos.md"
+cat > "$TARGET_DIR/ingestion/knowledge_base/02_planos_precos.md" <<'SDR_PART4_EOF'
+# Planos e Preços — Helssing
+
+Preços em reais, cobrança mensal, por funcionário ativo na folha
+(demitidos não contam no mês seguinte). Sem fidelidade — cancelamento a
+qualquer momento com aviso de 30 dias.
+
+## Starter — R$ 12 por funcionário/mês
+
+Pra empresas de até 30 funcionários que estão saindo de planilha pela
+primeira vez.
+
+- Folha de pagamento completa
+- Gestão de ponto (app + geolocalização)
+- Holerite digital
+- Suporte por chat em horário comercial
+
+## Growth — R$ 19 por funcionário/mês
+
+O plano mais escolhido — pra empresas de 30 a 150 funcionários que já
+têm RH estruturado.
+
+- Tudo do Starter
+- Admissão digital com assinatura eletrônica
+- Gestão de benefícios (vale-transporte, vale-refeição, plano de saúde)
+- Banco de horas automático
+- Suporte por chat e telefone, com SLA de resposta em até 4h úteis
+
+## Enterprise — sob consulta
+
+Pra empresas acima de 150 funcionários ou com necessidades específicas
+(múltiplas filiais, integração com ERP próprio, centro de custo
+detalhado).
+
+- Tudo do Growth
+- Múltiplas filiais e centros de custo
+- Integração via API com sistemas contábeis e ERPs
+- Gerente de conta dedicado
+- SLA de resposta em até 1h útil
+
+## Implementação
+
+Toda migração inclui suporte de implementação sem custo adicional —
+inclui importação de dados históricos de folha e ponto do sistema
+anterior. Tempo médio de implementação: 2 a 3 semanas, dependendo do
+volume de dados a migrar.
+
+## Teste
+
+Todos os planos têm 14 dias de teste gratuito, sem necessidade de
+cartão de crédito.
+SDR_PART4_EOF
+
+echo "  - ingestion/knowledge_base/03_folha_pagamento.md"
+cat > "$TARGET_DIR/ingestion/knowledge_base/03_folha_pagamento.md" <<'SDR_PART4_EOF'
+# Funcionalidade: Folha de Pagamento
+
+## O que faz
+
+Calcula a folha de pagamento mensal automaticamente, incluindo:
+
+- Salário base, horas extras e faltas
+- Descontos obrigatórios: INSS, IRRF, FGTS
+- Adicionais: noturno, insalubridade, periculosidade
+- 13º salário e férias (cálculo proporcional automático)
+- Rescisão (cálculo de verbas rescisórias completo)
+
+## Como funciona
+
+O cálculo puxa automaticamente as horas trabalhadas do módulo de ponto
+(sem precisar exportar/importar planilha entre sistemas) e aplica as
+regras da CLT e da convenção coletiva cadastrada pra cada
+funcionário. O RH revisa um resumo antes de fechar a folha, com
+qualquer inconsistência (falta não justificada, horas extras acima do
+limite legal) sinalizada antes do fechamento, não depois.
+
+## Holerite digital
+
+Cada funcionário recebe o holerite direto no app, com histórico de
+todos os meses anteriores disponível. Reduz drasticamente perguntas de
+RH sobre "cadê meu holerite".
+
+## Pagamento
+
+Integração direta com os principais bancos pra geração do arquivo de
+pagamento (CNAB) ou pagamento via PIX em lote, direto da plataforma —
+sem precisar exportar planilha pro internet banking.
+
+## Limitação atual
+
+A Helssing calcula a folha com base nas regras da CLT padrão e
+convenções coletivas cadastradas manualmente pelo cliente — não
+monitora automaticamente mudanças de convenção coletiva em tempo real
+(o RH precisa atualizar quando a convenção da categoria mudar).
+SDR_PART4_EOF
+
+echo "  - ingestion/knowledge_base/04_admissao_digital.md"
+cat > "$TARGET_DIR/ingestion/knowledge_base/04_admissao_digital.md" <<'SDR_PART4_EOF'
+# Funcionalidade: Admissão Digital
+
+## O que faz
+
+Elimina o processo de admissão em papel. O candidato aprovado recebe um
+link, preenche seus próprios dados e envia os documentos necessários
+(RG, CPF, comprovante de residência, etc.) direto pelo celular.
+
+## Fluxo
+
+1. RH cria a vaga/admissão no sistema com os dados do cargo, salário e
+   data de início.
+2. Candidato recebe o link, preenche dados pessoais e faz upload dos
+   documentos (foto direto da câmera do celular, sem precisar
+   escanear).
+3. Sistema gera automaticamente o contrato de trabalho e a ficha de
+   registro com base nos dados preenchidos.
+4. Assinatura eletrônica do contrato, com validade jurídica (conforme
+   MP 2.200-2/2001).
+5. Dados vão automaticamente pro módulo de folha e ponto — o novo
+   funcionário já está pronto pro primeiro fechamento de folha sem
+   nenhuma digitação manual do RH.
+
+## Tempo médio
+
+Reduz o tempo de admissão de aproximadamente 3-5 dias úteis (processo
+manual típico) para menos de 24 horas em média, incluindo o tempo de
+resposta do candidato.
+
+## Documentos suportados
+
+RG, CPF, comprovante de residência, carteira de trabalho digital,
+título de eleitor, certificado de reservista (quando aplicável),
+comprovante de escolaridade, exame admissional.
+
+## Integração com o restante da plataforma
+
+Diferente de ferramentas de assinatura eletrônica genéricas, os dados
+da admissão alimentam diretamente o cadastro de funcionário usado pela
+folha e pelo ponto — não é preciso recadastrar a pessoa em outro
+sistema depois.
+SDR_PART4_EOF
+
+echo "  - ingestion/knowledge_base/05_gestao_ponto.md"
+cat > "$TARGET_DIR/ingestion/knowledge_base/05_gestao_ponto.md" <<'SDR_PART4_EOF'
+# Funcionalidade: Gestão de Ponto
+
+## O que faz
+
+Substitui o ponto em papel, planilha ou relógio de ponto físico por um
+app de celular com registro de geolocalização, atendendo às exigências
+da Portaria 671/2021 do Ministério do Trabalho (ponto por dispositivo
+móvel).
+
+## Como funciona
+
+- Funcionário bate o ponto pelo app, que registra horário e
+  localização.
+- Sistema calcula automaticamente horas trabalhadas, horas extras,
+  banco de horas e faltas.
+- Inconsistências (esquecimento de bater ponto, jornada fora do
+  padrão) geram alerta pro gestor antes do fechamento da folha, não
+  depois.
+- Gestor aprova ou ajusta batidas direto pelo painel, com histórico de
+  alterações registrado (auditoria).
+
+## Banco de horas
+
+Cálculo automático de banco de horas conforme acordo individual ou
+convenção coletiva cadastrada, com alerta quando o saldo se aproxima do
+limite legal de compensação.
+
+## Geolocalização
+
+O registro de localização serve como comprovação em caso de
+fiscalização, mas não bloqueia o funcionário de bater ponto fora do
+raio esperado — apenas sinaliza a divergência pro gestor revisar.
+
+## Integração
+
+O módulo de ponto alimenta diretamente o cálculo da folha — não existe
+etapa de exportar/importar planilha entre os dois módulos, ao contrário
+de configurações comuns onde ponto e folha são sistemas separados.
+SDR_PART4_EOF
+
+echo "  - ingestion/knowledge_base/06_objecao_concorrente.md"
+cat > "$TARGET_DIR/ingestion/knowledge_base/06_objecao_concorrente.md" <<'SDR_PART4_EOF'
+# Objeção: "Já uso um concorrente"
+
+## Contexto
+
+É comum um lead já usar algum sistema de ponto ou folha isolado
+(inclusive soluções bem estabelecidas no mercado). A objeção mais
+comum não é "não gosto do que uso", é "trocar de sistema dá trabalho".
+
+## Diferencial real da Helssing
+
+A maioria dos concorrentes no mercado brasileiro resolve BEM um
+processo (só ponto, ou só folha) mas exige integração manual ou
+exportação de planilha pra conectar com os outros sistemas de RH. A
+Helssing centraliza folha, ponto, admissão e benefícios num único
+sistema, sem etapa de exportar/importar entre módulos.
+
+## Sobre trocar de sistema
+
+A migração é feita pelo time de implementação da Helssing sem custo
+adicional, incluindo importação de histórico de folha e ponto do
+sistema anterior — o cliente não precisa digitar os dados de novo. Tempo
+médio de implementação: 2-3 semanas.
+
+## O que NÃO afirmar
+
+- Não afirmar que a Helssing é "a melhor do mercado em tudo" — isso não
+  é verificável e soa como propaganda vazia.
+- Não fazer comparação direta nomeando concorrentes específicos por
+  nome — focar no que a Helssing resolve, não em atacar o concorrente.
+- Não prometer prazo de migração menor que 2 semanas sem confirmar o
+  volume de dados do cliente primeiro.
+
+## Abordagem recomendada
+
+Reconhecer que trocar de sistema dá trabalho de verdade, perguntar
+especificamente o que o lead mais usa hoje (só ponto? só folha?), e
+mostrar como a centralização resolve uma dor que sistemas isolados não
+resolvem — em vez de comparar feature por feature.
+SDR_PART4_EOF
+
+echo "  - ingestion/knowledge_base/07_objecao_preco.md"
+cat > "$TARGET_DIR/ingestion/knowledge_base/07_objecao_preco.md" <<'SDR_PART4_EOF'
+# Objeção: "É caro" / ROI
+
+## Contexto
+
+Comum em empresas menores comparando o custo por funcionário/mês contra
+"continuar fazendo na planilha, que é grátis".
+
+## Como pensar sobre ROI
+
+O custo comparável não é "planilha grátis vs. Helssing paga" — é o
+custo do tempo do time de RH/DP gasto em tarefas manuais, mais o risco
+de erro de cálculo de folha (que gera passivo trabalhista) e atraso em
+admissão.
+
+Alguns pontos concretos que ajudam a embasar a conversa (não são
+garantias de economia específica pro lead, cada operação é diferente):
+
+- Tempo de fechamento de folha manual costuma levar dias; com folha e
+  ponto integrados, esse tempo cai porque não há reconciliação manual
+  entre planilha de ponto e cálculo de folha.
+- Erro de cálculo de folha (esquecimento de hora extra, desconto
+  incorreto) gera retrabalho e, em caso de reclamação trabalhista,
+  passivo financeiro maior que a economia de não ter o sistema.
+- Admissão em papel atrasando o início do funcionário custa
+  produtividade perdida nos primeiros dias.
+
+## O que NÃO afirmar
+
+- Não prometer um número específico de economia ("vocês vão economizar
+  R$X por mês") sem ter dados reais da operação do lead — isso é uma
+  promessa que a Helssing não pode garantir.
+- Não minimizar a objeção de preço como se não fosse real — pra
+  empresa pequena, o custo por funcionário/mês importa de verdade.
+
+## Abordagem recomendada
+
+Reconhecer a preocupação com custo, e perguntar quanto tempo o time de
+RH/DP gasta hoje em tarefas manuais de folha e ponto — isso costuma
+reposicionar a conversa de "quanto custa o sistema" pra "quanto custa
+não ter o sistema".
+SDR_PART4_EOF
+
+echo "  - ingestion/knowledge_base/08_integracoes.md"
+cat > "$TARGET_DIR/ingestion/knowledge_base/08_integracoes.md" <<'SDR_PART4_EOF'
+# Integrações
+
+## Sistemas contábeis
+
+A Helssing exporta os dados de folha de pagamento em formato compatível
+com os principais sistemas contábeis usados por escritórios de
+contabilidade no Brasil, incluindo geração de guias (INSS, FGTS,
+IRRF) prontas pra envio.
+
+## Bancos
+
+Geração de arquivo de pagamento no padrão CNAB 240/400 pra envio direto
+ao banco, além de opção de pagamento via PIX em lote direto da
+plataforma, sem precisar exportar planilha pro internet banking.
+
+## API (plano Enterprise)
+
+Clientes do plano Enterprise têm acesso a uma API REST pra integração
+com ERP próprio ou outros sistemas internos — permite ler dados de
+funcionários, folha e ponto programaticamente. Documentação da API é
+fornecida durante a implementação.
+
+## eSocial
+
+A Helssing gera os eventos obrigatórios do eSocial (admissão,
+desligamento, alterações contratuais, folha de pagamento) automaticamente
+a partir dos dados já cadastrados no sistema — não é necessário
+preencher os eventos manualmente em outro portal.
+
+## O que a Helssing NÃO integra hoje
+
+Não há integração nativa com sistemas de recrutamento e seleção (ATS)
+de terceiros — a admissão digital da Helssing começa a partir do
+momento em que o candidato já foi aprovado, não substitui um ATS.
+Também não há app de ponto para uso offline sem internet no momento do
+registro (o registro exige conexão no momento da batida).
+SDR_PART4_EOF
+
+echo "  - mcp_server/server.py"
+cat > "$TARGET_DIR/mcp_server/server.py" <<'SDR_PART4_EOF'
+"""
+Servidor MCP que expõe retrieval sobre a base de conhecimento da
+Helssing. Roda como processo SEPARADO do app principal (igual o
+LiteLLM Proxy) -- o ADK conecta nele via subprocess/stdio
+(StdioConnectionParams em app/agents/knowledge.py), não como import
+Python. É por isso que este arquivo pode ficar fora de app/agents/ sem
+esbarrar na restrição de import-root isolado do `adk web` que já nos
+mordeu duas vezes nas Partes 1 e 2.
+
+Lê o MESMO diretório ChromaDB que ingestion/assets.py escreve
+(mcp_server/chroma_data/) -- rode a ingestão pelo menos uma vez
+(`make ingest-dev`) antes de usar este servidor, senão a coleção não
+existe ainda.
+"""
+
+from pathlib import Path
+
+import chromadb
+from fastmcp import FastMCP
+
+CHROMA_DATA_DIR = Path(__file__).parent / "chroma_data"
+COLLECTION_NAME = "helssing_knowledge_base"
+EMBEDDING_MODEL_NAME = "paraphrase-multilingual-MiniLM-L12-v2"
+
+mcp = FastMCP("helssing-knowledge-base")
+
+_collection = None
+
+
+def _get_collection():
+    """Lazy singleton -- carregar o modelo de embedding é caro (mesmo
+    motivo do singleton em app/agents/pii/engine.py na Parte 2), não
+    queremos recarregar a cada chamada de tool."""
+    global _collection
+    if _collection is None:
+        from chromadb.utils.embedding_functions import SentenceTransformerEmbeddingFunction
+
+        client = chromadb.PersistentClient(path=str(CHROMA_DATA_DIR))
+        ef = SentenceTransformerEmbeddingFunction(model_name=EMBEDDING_MODEL_NAME)
+        _collection = client.get_collection(COLLECTION_NAME, embedding_function=ef)
+    return _collection
+
+
+@mcp.tool()
+def retrieve_product_docs(query: str, top_k: int = 3) -> list[dict]:
+    """Busca trechos relevantes da base de conhecimento da Helssing
+    (produto, funcionalidades, planos, objeções comuns, integrações)
+    por similaridade semântica.
+
+    Args:
+        query: a pergunta ou tópico do lead, em português.
+        top_k: quantos trechos retornar (padrão 3).
+
+    Returns:
+        list[dict]: cada item tem 'text' (o trecho) e 'source'
+        (documento de origem, útil pra saber a procedência da
+        informação).
+    """
+    collection = _get_collection()
+    results = collection.query(query_texts=[query], n_results=top_k)
+
+    return [
+        {"text": doc, "source": meta["source"]}
+        for doc, meta in zip(results["documents"][0], results["metadatas"][0])
+    ]
+
+
+@mcp.tool()
+def get_pricing_info() -> str:
+    """Retorna o documento de planos e preços completo, direto — sem
+    depender de busca semântica. Perguntas de preço são comuns e
+    previsíveis o suficiente pra merecer um caminho determinístico em
+    vez de confiar só em similarity search (que pode, em tese, não
+    trazer o chunk certo pra queries de preço fora do padrão).
+
+    Returns:
+        str: o conteúdo completo do documento de planos e preços.
+    """
+    collection = _get_collection()
+    result = collection.get(where={"source": "02_planos_precos"})
+    return "\n\n".join(result["documents"])
+
+
+if __name__ == "__main__":
+    mcp.run()
+SDR_PART4_EOF
+
+echo "  - app/agents/knowledge.py"
+cat > "$TARGET_DIR/app/agents/knowledge.py" <<'SDR_PART4_EOF'
+"""
+Knowledge Agent — responde dúvidas sobre produto, preço e cases.
+
+Parte 4: ganhou RAG de verdade via McpToolset, conectado a um servidor
+MCP dedicado (mcp_server/server.py) que roda sobre ChromaDB. O servidor
+é um PROCESSO SEPARADO (igual o LiteLLM Proxy) -- o ADK conecta nele via
+subprocess/stdio, não como import Python. É por isso que mcp_server/ e
+ingestion/ podem ficar fora de app/agents/ sem esbarrar na restrição de
+import-root isolado do `adk web` (Partes 1 e 2).
+
+Pré-requisito pra isso funcionar: a base de conhecimento precisa ter
+sido indexada pelo menos uma vez (`make ingest-dev`), senão o servidor
+MCP não encontra a coleção no ChromaDB.
+"""
+
+from pathlib import Path
+
+from google.adk.agents import LlmAgent
+from google.adk.tools.mcp_tool.mcp_session_manager import StdioConnectionParams
+from google.adk.tools.mcp_tool.mcp_toolset import McpToolset
+from mcp import StdioServerParameters
+
+from .config.models import get_model_for_role
+from .guardrails.model_error_recovery import recover_from_duplicated_tool_call_json
+from .guardrails.output_policy import validate_output_policy
+from .guardrails.prompt_injection import detect_prompt_injection
+from .guardrails.transfer import block_unauthorized_transfer
+from .persona import PERSONA_INTRO
+from .pii.masking import mask_pii
+from .session.state_schema import STATE_LAST_RETRIEVED_CONTEXT
+
+# app/agents/knowledge.py -> app/agents -> app -> raiz do projeto.
+# Calculado em runtime (não hardcoded) pra funcionar independente de
+# onde o projeto foi clonado.
+_PROJECT_ROOT = Path(__file__).parent.parent.parent
+
+_knowledge_base_mcp = McpToolset(
+    connection_params=StdioConnectionParams(
+        server_params=StdioServerParameters(
+            command="uv",
+            args=["run", "python", "mcp_server/server.py"],
+            cwd=str(_PROJECT_ROOT),
+        ),
+        timeout=15.0,
+    ),
+)
+
+knowledge_agent = LlmAgent(
+    name="KnowledgeAgent",
+    model=get_model_for_role("knowledge"),
+    description=(
+        "Responde perguntas sobre o produto, funcionalidades, planos e "
+        "preços. Use quando o lead pergunta 'o que vocês fazem', 'quanto "
+        "custa', 'vocês integram com X', etc."
+    ),
+    instruction=(
+        PERSONA_INTRO
+        + "Você responde perguntas sobre nosso produto SaaS de forma "
+        "precisa e concisa, usando as ferramentas de busca disponíveis "
+        "-- NUNCA responda sobre preço, funcionalidade ou integração "
+        "de memória sem antes consultar retrieve_product_docs ou "
+        "get_pricing_info.\n\n"
+        "Para perguntas de preço/planos, use get_pricing_info (retorna "
+        "o documento completo, mais confiável que busca semântica pra "
+        "esse tipo de pergunta). Para tudo mais sobre produto, "
+        "funcionalidades, objeções ou integrações, use "
+        "retrieve_product_docs com a pergunta do lead.\n\n"
+        "Se o resultado da busca não cobrir o que foi perguntado, diga "
+        "explicitamente que vai confirmar com o time -- NÃO invente "
+        "números de preço ou funcionalidades que não vieram da busca."
+    ),
+    tools=[_knowledge_base_mcp],
+    output_key=STATE_LAST_RETRIEVED_CONTEXT,
+    # Chamado via AgentTool a partir do Orchestrator (ver orchestrator.py),
+    # não via sub_agents — então este agente nunca ganha a ferramenta
+    # transfer_to_agent para começar; não há transferência a bloquear. O
+    # guardrail de transfer abaixo fica como defesa em profundidade.
+    before_model_callback=[mask_pii, detect_prompt_injection],
+    after_model_callback=[validate_output_policy, block_unauthorized_transfer],
+    on_model_error_callback=recover_from_duplicated_tool_call_json,
+)
+SDR_PART4_EOF
+
+echo "  - tests/test_ingestion_chunking.py"
+cat > "$TARGET_DIR/tests/test_ingestion_chunking.py" <<'SDR_PART4_EOF'
+"""
+Layer 2 de testes pra Parte 4: chunks() é lógica pura (regex +
+manipulação de string), não precisa de ChromaDB nem de modelo de
+embedding pra testar. raw_docs() só lê arquivos do disco -- também sem
+dependência externa.
+"""
+
+from ingestion.assets import chunks, raw_docs
+
+
+def test_chunks_splits_by_section_headers():
+    docs = [
+        {
+            "source": "doc_teste",
+            "text": (
+                "# Título do Documento\n\nIntro.\n\n"
+                "## Seção A\n\nConteúdo A.\n\n"
+                "## Seção B\n\nConteúdo B."
+            ),
+        }
+    ]
+
+    result = chunks(docs)
+
+    assert len(result) == 2
+    assert result[0]["id"] == "doc_teste__0"
+    assert result[1]["id"] == "doc_teste__1"
+    assert all(c["source"] == "doc_teste" for c in result)
+
+
+def test_chunks_first_chunk_includes_title_and_preamble():
+    docs = [
+        {
+            "source": "doc_teste",
+            "text": "# Meu Produto\n\nUm resumo de uma linha.\n\n## Primeira Seção\n\nTexto aqui.",
+        }
+    ]
+
+    result = chunks(docs)
+
+    assert "Meu Produto" in result[0]["text"]
+    assert "Um resumo de uma linha" in result[0]["text"]
+    assert "Primeira Seção" in result[0]["text"]
+
+
+def test_chunks_handles_document_without_any_section_headers():
+    docs = [{"source": "doc_sem_secoes", "text": "# Título\n\nTexto corrido sem nenhum ##."}]
+
+    result = chunks(docs)
+
+    assert len(result) == 1
+    assert result[0]["id"] == "doc_sem_secoes__full"
+
+
+def test_chunks_generates_unique_ids_across_multiple_docs():
+    docs = [
+        {"source": "doc_a", "text": "# A\n\n## Um\n\nX\n\n## Dois\n\nY"},
+        {"source": "doc_b", "text": "# B\n\n## Um\n\nZ"},
+    ]
+
+    result = chunks(docs)
+    ids = [c["id"] for c in result]
+
+    assert len(ids) == len(set(ids))
+
+
+def test_raw_docs_reads_all_knowledge_base_files():
+    docs = raw_docs()
+
+    assert len(docs) == 8
+    sources = {d["source"] for d in docs}
+    assert "01_visao_geral" in sources
+    assert "02_planos_precos" in sources
+    for d in docs:
+        assert d["text"].startswith("#")
+
+
+def test_real_knowledge_base_chunks_without_error():
+    # Integração leve: confirma que a base de conhecimento REAL (não
+    # sintética) processa sem erro -- pega regressão se alguém editar
+    # um .md de um jeito que quebre o parsing de seção.
+    docs = raw_docs()
+    result = chunks(docs)
+
+    assert len(result) > len(docs)
+    assert all(c["id"] and c["source"] and c["text"] for c in result)
+SDR_PART4_EOF
+
+echo "  - tests/test_mcp_server_tools.py"
+cat > "$TARGET_DIR/tests/test_mcp_server_tools.py" <<'SDR_PART4_EOF'
+"""
+Layer 2 de testes pra Parte 4: as tools do servidor MCP, testadas
+diretamente (sem protocolo MCP de verdade, sem subprocess) usando um
+embedder falso e determinístico -- não precisam do modelo real
+(huggingface.co) pra validar a LÓGICA das tools.
+
+get_pricing_info() usa filtro de METADADO (collection.get(where=...)),
+não busca semântica -- funciona identicamente com qualquer embedder,
+então o teste dela é uma prova real de correção, não só estrutural.
+
+retrieve_product_docs() usa busca semântica de verdade -- aqui só
+testamos ESTRUTURA do retorno (formato, top_k respeitado), não
+relevância. Relevância semântica já foi validada rodando o pipeline
+real (ver README > RAG, recall@3 = 1.0 no golden query set).
+"""
+
+import hashlib
+import uuid
+
+import numpy as np
+import pytest
+from chromadb import EmbeddingFunction, EphemeralClient
+
+import mcp_server.server as server_module
+
+
+class _FakeEmbeddingFunction(EmbeddingFunction):
+    def __init__(self):
+        pass
+
+    def __call__(self, input):
+        return [
+            (
+                np.frombuffer(hashlib.sha256(t.encode()).digest(), dtype=np.uint8)[:16]
+                / 255.0
+            ).tolist()
+            for t in input
+        ]
+
+    def name(self) -> str:
+        return "fake-hash-embedder"
+
+
+@pytest.fixture
+def fake_collection(monkeypatch):
+    client = EphemeralClient()
+    # Nome único por teste -- EphemeralClient compartilha estado dentro
+    # do mesmo processo de teste, então um nome fixo colide entre testes
+    # rodando na mesma sessão do pytest.
+    collection = client.create_collection(
+        name=f"test_collection_{uuid.uuid4().hex[:8]}",
+        embedding_function=_FakeEmbeddingFunction(),
+    )
+    collection.add(
+        documents=[
+            "Helssing — Planos e Preços\n\nPlano Starter custa R$12 por funcionário/mês.",
+            "Helssing — Folha de Pagamento\n\nCalcula horas extras automaticamente.",
+            "Helssing — Objeção: É caro\n\nReconheça a preocupação com custo.",
+        ],
+        ids=["02_planos_precos__0", "03_folha_pagamento__0", "07_objecao_preco__0"],
+        metadatas=[
+            {"source": "02_planos_precos"},
+            {"source": "03_folha_pagamento"},
+            {"source": "07_objecao_preco"},
+        ],
+    )
+    monkeypatch.setattr(server_module, "_collection", collection)
+    yield collection
+    monkeypatch.setattr(server_module, "_collection", None)
+
+
+def test_retrieve_product_docs_returns_correct_structure(fake_collection):
+    results = server_module.retrieve_product_docs("qualquer pergunta", top_k=2)
+
+    assert len(results) == 2
+    for r in results:
+        assert set(r.keys()) == {"text", "source"}
+
+
+def test_retrieve_product_docs_respects_custom_top_k(fake_collection):
+    results = server_module.retrieve_product_docs("qualquer pergunta", top_k=1)
+
+    assert len(results) == 1
+
+
+def test_get_pricing_info_returns_only_pricing_document(fake_collection):
+    result = server_module.get_pricing_info()
+
+    assert "R$12" in result
+    assert "Folha de Pagamento" not in result
+    assert "Objeção" not in result
+
+
+def test_collection_singleton_is_reused_not_rebuilt(fake_collection, monkeypatch):
+    # _get_collection() não deveria tentar reconstruir a coleção (e
+    # baixar o modelo de embedding) se _collection já está setado --
+    # é isso que torna os testes acima possíveis sem rede. Prova isso
+    # fazendo SentenceTransformerEmbeddingFunction explodir se for
+    # instanciada -- é essa a chamada que baixaria o modelo real.
+    import chromadb.utils.embedding_functions as ef_module
+
+    def _boom(*args, **kwargs):
+        raise AssertionError(
+            "não deveria reconstruir a coleção -- _collection já está setado"
+        )
+
+    monkeypatch.setattr(ef_module, "SentenceTransformerEmbeddingFunction", _boom)
+
+    server_module.retrieve_product_docs("teste", top_k=1)  # não deveria levantar
+SDR_PART4_EOF
+
+echo "  - pyproject.toml"
+cat > "$TARGET_DIR/pyproject.toml" <<'SDR_PART4_EOF'
+[project]
+name = "sdr-agent"
+version = "0.1.0"
+description = "SDR Bot multi-agente (Google ADK + LiteLLM/OpenRouter) — portfolio de engenharia de IA em produção"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "google-adk>=1.0.0",
+    "litellm>=1.55.0",
+    "python-dotenv>=1.0.1",
+    "fastapi>=0.115.0",
+    "uvicorn[standard]>=0.32.0",
+    "presidio-analyzer>=2.2.360",
+    "presidio-anonymizer>=2.2.360",
+    "spacy>=3.8.0,<3.9.0",
+    "pt-core-news-lg",
+    "chromadb>=1.5.9",
+    "sentence-transformers>=6.0.0",
+    "dagster>=1.13.19",
+    "fastmcp>=3.4.7",
+    "dagster-webserver>=1.13.19",
+]
+
+# pt_core_news_lg não está no PyPI (modelos do spaCy são distribuídos como
+# wheels diretas nos releases do GitHub) — apontamos a dependência acima
+# para essa URL. Versão 3.8.0 é a compatível com spacy>=3.8,<3.9 conforme
+# https://raw.githubusercontent.com/explosion/spacy-models/master/compatibility.json
+[tool.uv.sources]
+pt-core-news-lg = { url = "https://github.com/explosion/spacy-models/releases/download/pt_core_news_lg-3.8.0/pt_core_news_lg-3.8.0-py3-none-any.whl" }
+
+# Dependências de desenvolvimento/CI (PEP 735) — nunca instaladas na
+# imagem de produção. Isso é o motivo real da migração: com
+# requirements.txt, o Dockerfile instalava pytest dentro do container
+# que vai pro Cloud Run. Com dependency-groups, `uv sync --no-dev` no
+# build de produção simplesmente não inclui nada daqui.
+[dependency-groups]
+dev = [
+    "pytest>=8.0.0",
+    "pytest-asyncio>=0.24.0",
+    "httpx>=0.27.0",
+    "ruff>=0.7.0",
+]
+
+[tool.pytest.ini_options]
+pythonpath = ["."]
+asyncio_mode = "auto"
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP"]
+SDR_PART4_EOF
+
+echo "  - uv.lock"
+cat > "$TARGET_DIR/uv.lock" <<'SDR_PART4_EOF'
 version = 1
 revision = 3
 requires-python = ">=3.12"
@@ -5089,3 +6173,823 @@ sdist = { url = "https://files.pythonhosted.org/packages/b9/d8/eab98a517c14134c0
 wheels = [
     { url = "https://files.pythonhosted.org/packages/3a/13/547360d81e6d88d58492968ffda9f9542854f11310ee556fef14260cc886/zipp-4.1.0-py3-none-any.whl", hash = "sha256:25ad4e16390cd314347dd8f1de67a2ac538ae658ed4ab9db16029c07c188e97f", size = 10238, upload-time = "2026-05-18T20:08:57.045Z" },
 ]
+SDR_PART4_EOF
+
+echo "  - Makefile"
+cat > "$TARGET_DIR/Makefile" <<'SDR_PART4_EOF'
+SHELL := /bin/bash
+.DEFAULT_GOAL := help
+
+PROXY_COMPOSE := litellm_proxy/docker-compose.yml
+AGENTS_DIR := app/agents
+PROXY_READY_URL := http://localhost:4000/health/readiness
+PROXY_READY_TIMEOUT := 30
+
+.PHONY: help sync proxy-up proxy-down proxy-restart proxy-logs proxy-status \
+        web cli api test test-pii lint clean
+
+help:
+	@echo "Comandos disponíveis:"
+	@echo ""
+	@echo "  make sync          - uv sync (instala/atualiza dependências)"
+	@echo ""
+	@echo "  make web           - sobe o proxy (se preciso) e abre a UI do adk web"
+	@echo "  make cli           - sobe o proxy (se preciso) e roda o bot via CLI"
+	@echo "  make api           - sobe o proxy (se preciso) e roda a API FastAPI (--reload)"
+	@echo ""
+	@echo "  make proxy-up      - sobe o LiteLLM Proxy e espera ele responder de verdade"
+	@echo "  make proxy-down    - derruba o LiteLLM Proxy"
+	@echo "  make proxy-restart - derruba e sobe de novo (útil após editar .env)"
+	@echo "  make proxy-logs    - segue os logs do proxy"
+	@echo "  make proxy-status  - mostra se o container está de pé"
+	@echo ""
+	@echo "  make test          - roda a suite de testes completa"
+	@echo "  make test-pii      - roda só os testes de PII (mais rápido pra iterar)"
+	@echo "  make test-guardrails - roda só os testes de guardrails (Parte 3)"
+	@echo "  make test-live     - conversas douradas contra o LLM real (custa"
+	@echo "                       API, sobe o proxy sozinho) — NÃO entra em 'make test'"
+	@echo "  make ingest-dev    - abre a UI do Dagster pra rodar a ingestão do RAG"
+	@echo "  make lint          - roda o ruff"
+	@echo "  make clean         - remove __pycache__/.pytest_cache/.ruff_cache"
+
+sync:
+	uv sync
+
+# Sobe o proxy e espera de verdade ele responder antes de liberar o
+# próximo comando -- isso existe especificamente porque "docker compose
+# up -d" retorna assim que o CONTAINER inicia, não quando o processo
+# LiteLLM lá dentro termina de registrar os modelos e está pronto pra
+# aceitar conexão. Sem esperar isso, curl/a aplicação podem chegar
+# primeiro e receber "empty reply from server" -- foi exatamente o que
+# aconteceu depurando isso manualmente antes deste Makefile existir.
+proxy-up:
+	@docker compose -f $(PROXY_COMPOSE) up -d
+	@echo -n "Esperando o proxy ficar pronto"
+	@for i in $$(seq 1 $(PROXY_READY_TIMEOUT)); do \
+		if curl -sf $(PROXY_READY_URL) > /dev/null 2>&1; then \
+			echo " OK"; \
+			exit 0; \
+		fi; \
+		echo -n "."; \
+		sleep 1; \
+	done; \
+	echo ""; \
+	echo "ERRO: proxy não respondeu após $(PROXY_READY_TIMEOUT)s."; \
+	echo "Rode 'make proxy-logs' para ver o que aconteceu."; \
+	exit 1
+
+proxy-down:
+	docker compose -f $(PROXY_COMPOSE) down
+
+proxy-restart: proxy-down proxy-up
+
+proxy-logs:
+	docker compose -f $(PROXY_COMPOSE) logs -f litellm-proxy
+
+proxy-status:
+	docker compose -f $(PROXY_COMPOSE) ps
+
+web: proxy-up
+	uv run adk web $(AGENTS_DIR)
+
+cli: proxy-up
+	uv run python -m app.main
+
+api: proxy-up
+	uv run uvicorn app.api:app --reload
+
+test:
+	uv run pytest -v
+
+test-pii:
+	uv run pytest tests/test_pii_masking.py -v
+
+test-guardrails:
+	uv run pytest tests/test_prompt_injection.py tests/test_output_policy.py \
+		tests/test_action_allowlist.py tests/test_guardrails.py -v
+
+# Testes ao vivo (Layer 3): custam chamadas reais de API, por isso não
+# entram em "make test". Sobe o proxy (se preciso) antes de rodar.
+test-live: proxy-up
+	RUN_LIVE_TESTS=1 uv run pytest tests/test_golden_conversations.py -v
+
+ingest-dev:
+	uv run dagster dev -f ingestion/definitions.py
+
+lint:
+	uv run ruff check app tests
+
+clean:
+	find . -name "__pycache__" -not -path "*/.venv/*" -exec rm -rf {} + 2>/dev/null || true
+	find . -name ".pytest_cache" -not -path "*/.venv/*" -exec rm -rf {} + 2>/dev/null || true
+	find . -name ".ruff_cache" -not -path "*/.venv/*" -exec rm -rf {} + 2>/dev/null || true
+SDR_PART4_EOF
+
+echo "  - README.md"
+cat > "$TARGET_DIR/README.md" <<'SDR_PART4_EOF'
+# SDR Bot — Sistema Multi-Agente (Partes 1–4: Esqueleto + PII + Guardrails + RAG)
+
+Chatbot SDR (Sales Development Representative) construído com **Google ADK**,
+desenhado para demonstrar, na prática, os requisitos técnicos de vagas de
+LLM/AI Engineer sênior focadas em produção: orquestração multi-agente,
+guardrails, mascaramento de PII, RAG avaliado e observabilidade.
+
+Este projeto é dividido em partes incrementais. Este README cobre as
+**Partes 1 a 4**.
+
+## O que existe nesta parte
+
+- Hierarquia multi-agente real no ADK: 1 `OrchestratorAgent` (raiz) +
+  5 agentes especialistas (`QualificationAgent`, `KnowledgeAgent`,
+  `ObjectionHandlingAgent`, `SchedulingAgent`, `EscalateToHumanAgent`),
+  consultados via **AgentTool** — não via `sub_agents`/`transfer_to_agent`
+  (ver docstring de `app/agents/orchestrator.py` para o porquê: usar
+  `sub_agents` causou dois bugs reais de transferência não intencional
+  entre agentes durante testes manuais, rastreados a issues abertas do
+  ADK — google/adk-python#1038 e #3850).
+- O Orchestrator decide qual especialista **consultar** (como uma função)
+  com base na `description` de cada um, recebe a resposta de volta, e
+  permanece no controle da conversa em todo turno — nenhum especialista
+  assume a conversa permanentemente.
+- Estado compartilhado (`session.state`) com contrato documentado em
+  `app/agents/session/state_schema.py`.
+- Camada de modelo desacoplada: cada agente usa `LiteLlm` apontando para
+  um **LiteLLM Proxy self-hosted**, que por sua vez roteia para modelos na
+  **OpenRouter** — ver `litellm_proxy/config.yaml` para o mapeamento
+  modelo-por-agente e a lógica de fallback.
+- Um agente com tools reais (`SchedulingAgent`), para validar tool-calling
+  ponta a ponta através do proxy antes de mexer em tools mais sensíveis.
+- **Mascaramento de PII (Parte 2)**: Presidio + recognizers customizados
+  para CPF/CNPJ (com validação real de dígito verificador) + telefone BR
+  (via `phonenumbers`) + spaCy `pt_core_news_lg` para nomes — ver seção
+  dedicada abaixo.
+- **Guardrails (Parte 3)**: detecção heurística de prompt injection,
+  allowlist de ação (`book_meeting` só executa se o lead estiver
+  qualificado) e validação de política de saída (nunca oferecer desconto
+  não autorizado) — em todo agente, mesmo padrão de defesa em
+  profundidade da Parte 2. Ver seção dedicada abaixo.
+- **RAG real (Parte 4)**: `KnowledgeAgent` conectado via MCP a um
+  ChromaDB populado por um pipeline de ingestão Dagster, com
+  `asset_check` de recall@3 e de vazamento de PII. Ver seção dedicada
+  abaixo.
+- Smoke tests da topologia + testes de PII + testes de guardrails +
+  testes de RAG (`tests/`) que rodam sem precisar de chave de API (as
+  únicas exceções são o download do modelo spaCy e do modelo de
+  embedding, cada um uma vez).
+
+## O que **não** está aqui ainda (de propósito)
+
+| Falta | Onde entra |
+|---|---|
+| LangFuse + Phoenix (observabilidade) | Parte 5 |
+| Golden eval set + LLM-as-judge + regressão | Parte 6 |
+
+Cada agente tem comentários `TODO Parte N` no código exatamente nos pontos
+onde essas camadas vão se conectar — não são promessas soltas, são pontos
+de extensão já identificados na arquitetura.
+
+## Atalhos com Makefile
+
+Depois do primeiro setup manual acima, o dia a dia fica mais rápido via
+`make` — em especial `make web` resolve o problema de "quero testar na
+UI do adk toda hora": ele sobe o proxy (se ainda não estiver de pé),
+**espera de verdade ele responder** antes de prosseguir (isso existe
+porque `docker compose up -d` retorna assim que o container inicia, não
+quando o LiteLLM lá dentro termina de registrar os modelos — sem essa
+espera, é fácil bater num "empty reply from server" por pura corrida de
+horário), e só então abre a interface:
+
+```bash
+make web    # proxy + adk web, tudo em um comando
+make cli    # proxy + CLI (app/main.py)
+make api    # proxy + FastAPI com --reload
+
+make proxy-status   # container está de pé?
+make proxy-logs     # acompanhar logs do proxy
+make proxy-restart  # derrubar e subir de novo (necessário após editar .env)
+
+make test            # suite completa (camadas 1 e 2 -- grátis)
+make test-pii        # só os testes de PII
+make test-guardrails # só os testes de guardrails (Parte 3)
+make test-live       # conversas douradas contra o LLM real (custa API,
+                      # camada 3 -- ver "Estratégia de testes" abaixo)
+make ingest-dev       # UI do Dagster -- materializar o índice do RAG (Parte 4)
+make lint             # ruff
+make clean            # limpa __pycache__/.pytest_cache/.ruff_cache
+```
+
+Rode `make` (sem alvo) ou `make help` pra ver a lista completa.
+
+## Como rodar
+
+### 1. Pré-requisitos
+
+```bash
+# Instala o uv (gerenciador de projeto/dependências), se ainda não tiver
+curl -LsSf https://astral.sh/uv/install.sh | sh
+
+# Cria o ambiente virtual e instala tudo (runtime + dev) a partir do
+# uv.lock, com versões travadas — reprodutível, não "funciona na minha
+# máquina"
+uv sync
+```
+
+Não precisa ativar o `.venv` manualmente — use `uv run <comando>` (ex:
+`uv run pytest`, `uv run python -m app.main`), que já roda dentro do
+ambiente certo.
+
+### 2. Configurar variáveis de ambiente
+
+```bash
+cp .env.example .env
+# edite .env e preencha OPENROUTER_API_KEY (https://openrouter.ai/keys)
+
+# gere e preencha também PII_HASH_SALT (obrigatório -- sem ele, o
+# mascaramento de CPF/CNPJ falha alto, de propósito, em vez de usar
+# um salt inseguro por padrão):
+python3 -c "import secrets; print(secrets.token_hex(32))"
+```
+
+### 3. Subir o LiteLLM Proxy
+
+```bash
+cd litellm_proxy
+docker compose up
+```
+
+Isso expõe um endpoint OpenAI-compatible em `http://localhost:4000`, que
+roteia cada alias (`orchestrator-model`, `qualification-model`, etc.) para
+o modelo real configurado em `config.yaml` na OpenRouter.
+
+Alternativa sem Docker:
+
+```bash
+uvx --from 'litellm[proxy]' litellm --config litellm_proxy/config.yaml --port 4000
+```
+
+### 4. Rodar o bot
+
+Em outro terminal, na raiz do projeto:
+
+```bash
+uv run python -m app.main
+```
+
+Exemplo de conversa esperada — note que o autor exibido é sempre
+`OrchestratorAgent` agora (ele consulta o especialista internamente via
+AgentTool e entrega a resposta final; ver trade-off documentado em
+`app/agents/orchestrator.py`):
+
+```
+Você: Oi, vi vocês no LinkedIn
+[OrchestratorAgent] Oi! Que bom que você chegou até a gente...
+
+Você: quanto custa o plano?
+[OrchestratorAgent] Sobre os planos...
+```
+
+### 6. Interface visual do ADK (`adk web`)
+
+O ADK inclui uma UI de desenvolvimento que mostra a árvore de agentes, o
+histórico de eventos turno a turno, e o payload exato de cada chamada de
+tool (nome, argumentos, retorno) — útil sobretudo para depurar problemas
+de tool-calling sem precisar ler traceback.
+
+```bash
+uv run adk web app/agents
+```
+
+Abra `http://127.0.0.1:8000` no navegador. O agente aparece na UI com o
+nome `agents` (nome da pasta) — isso é esperado, não é o nome de nenhum
+agente nosso especificamente.
+
+**Detalhe não-óbvio, documentado aqui porque nos custou tempo depurando**:
+o ADK decide como escanear a pasta baseado numa convenção específica —
+`is_single_agent_directory()` (em `google/adk/cli/utils/agent_loader.py`)
+procura por um arquivo chamado literalmente `agent.py` (ou
+`root_agent.yaml`) diretamente na pasta apontada. Sem isso, o ADK assume
+que a pasta é um **diretório pai contendo vários agentes** e escaneia
+*suas subpastas* como se cada uma fosse um agente separado — no nosso
+caso, isso faria o ADK escanear `config/` e `session/` (que não têm
+`root_agent`) em vez do próprio pacote `agents`, e a UI aparecia vazia,
+sem nenhum erro explícito.
+
+É por isso que existe `app/agents/agent.py` — um arquivo pequeno,
+somente com `from .orchestrator import root_agent`, cuja única função é
+satisfazer essa convenção. É também o motivo de `config/` e `session/`
+estarem aninhados dentro de `app/agents/` (não como pastas irmãs de
+`app/agents/`): o ADK isola a pasta apontada como raiz de import sem
+visibilidade nenhuma para pastas irmãs via import relativo — então tudo
+que os agentes precisam importar precisa estar dentro da própria pasta
+que o `adk web` aponta.
+
+### 7. Rodar os testes
+
+```bash
+uv run pytest
+```
+
+## Arquitetura (visão desta parte)
+
+```
+Usuário (CLI)
+      │
+      ▼
+OrchestratorAgent (LlmAgent, tools=[AgentTool(...), ...])
+      │  consulta o especialista certo com base na description,
+      │  recebe a resposta de volta, permanece no controle
+      ├── QualificationAgent
+      ├── KnowledgeAgent        (RAG real chega na Parte 4)
+      ├── ObjectionHandlingAgent
+      ├── SchedulingAgent        (único com tools nesta parte)
+      └── EscalateToHumanAgent
+      │
+      ▼  model=LiteLlm(model="litellm_proxy/<alias>", api_base=..., api_key=...)
+LiteLLM Proxy (Docker, litellm_proxy/config.yaml)
+      │  resolve alias -> modelo real + fallback
+      ▼
+OpenRouter ──► Claude 3.5 Sonnet / GPT-4o-mini / Llama 3.1 (fallback)
+```
+
+## CI/CD (GitLab) e deploy na GCP
+
+### Modelo de branches
+
+```
+feature branches ──MR──► develop ──MR──► main
+   (trabalho acontece)   (integração,      (só deploy — nada mais)
+                          default branch
+                          do repositório)
+```
+
+- **`develop`** é a branch padrão do repositório (configurar em Settings
+  → Repository → Default branch). Toda feature branch abre MR contra
+  ela. `lint`/`test`/`docker_build_check` rodam em qualquer MR e em todo
+  push pra `develop` — feedback rápido, sem tocar em nada de GCP.
+- **`main`** só recebe merge vindo de `develop`, quando o conjunto de
+  mudanças está pronto pra ir pro ar. É a **única** branch que os jobs
+  `build_and_push`/`deploy_*` reconhecem — um push direto em `develop`
+  nunca aciona deploy, só em `main`.
+- Deliberadamente **não** é GitFlow completo (sem release/hotfix
+  branches) — pra um projeto deste porte, esse processo extra não paga
+  o custo de manutenção.
+- Recomendado: proteger `main` em Settings → Repository → Protected
+  branches (só merge via MR, sem push direto).
+
+Isso é o motivo de `.gitlab-ci.yml` usar nomes de branch explícitos
+(`"develop"`, `"main"`) nas regras, em vez de `$CI_DEFAULT_BRANCH` — uma
+vez que "branch padrão" e "branch que decide deploy" são conceitos
+diferentes aqui, uma variável só não cobre os dois.
+
+### Pipeline
+
+O pipeline (`.gitlab-ci.yml`) é evolutivo, em duas camadas:
+
+1. **Sempre roda, sem credencial nenhuma**: `lint`, `test` (smoke tests,
+   sem chamada real de LLM) e `docker_build_check` (valida que os
+   Dockerfiles buildam) — em qualquer MR e em push pra `develop` ou
+   `main`. Isso mantém o pipeline verde desde o primeiro commit, mesmo
+   antes de qualquer configuração de nuvem.
+2. **Só aparece quando a GCP estiver configurada E o commit for em
+   `main`**: `build_and_push` (Artifact Registry) e os dois `deploy_*`
+   (Cloud Run), condicionados à variável `$GCP_PROJECT_ID` existir no
+   projeto GitLab.
+
+Arquitetura de deploy: dois serviços Cloud Run — `litellm-proxy` (o
+gateway pra OpenRouter) e `sdr-bot-api` (a API FastAPI sobre o sistema de
+agentes), o segundo apontando pro primeiro via `LITELLM_PROXY_URL`.
+
+### Configurando deploy na GCP (rodar uma vez, fora do pipeline)
+
+```bash
+# 1. Habilitar APIs necessárias
+gcloud services enable run.googleapis.com artifactregistry.googleapis.com \
+    iamcredentials.googleapis.com secretmanager.googleapis.com
+
+# 2. Criar repositório no Artifact Registry
+gcloud artifacts repositories create sdr-bot-repo \
+    --repository-format=docker --location=us-central1
+
+# 3. Criar service account que o pipeline vai impersonar
+gcloud iam service-accounts create gitlab-ci-deployer \
+    --display-name="GitLab CI/CD deployer"
+
+# Dar as permissões mínimas necessárias (Artifact Registry + Cloud Run)
+gcloud projects add-iam-policy-binding "$GCP_PROJECT_ID" \
+    --member="serviceAccount:gitlab-ci-deployer@${GCP_PROJECT_ID}.iam.gserviceaccount.com" \
+    --role="roles/artifactregistry.writer"
+gcloud projects add-iam-policy-binding "$GCP_PROJECT_ID" \
+    --member="serviceAccount:gitlab-ci-deployer@${GCP_PROJECT_ID}.iam.gserviceaccount.com" \
+    --role="roles/run.admin"
+gcloud projects add-iam-policy-binding "$GCP_PROJECT_ID" \
+    --member="serviceAccount:gitlab-ci-deployer@${GCP_PROJECT_ID}.iam.gserviceaccount.com" \
+    --role="roles/iam.serviceAccountUser"
+
+# 4. Criar o Workload Identity Pool + Provider pro GitLab
+gcloud iam workload-identity-pools create gitlab-pool \
+    --location="global" --display-name="GitLab CI"
+
+gcloud iam workload-identity-pools providers create-oidc gitlab-provider \
+    --location="global" --workload-identity-pool="gitlab-pool" \
+    --issuer-uri="https://gitlab.com" \
+    --attribute-mapping="google.subject=assertion.sub,attribute.repository=assertion.project_path" \
+    --attribute-condition="assertion.project_path == '<seu-namespace>/<seu-repo>'"
+
+# 5. Permitir que a identidade federada do GitLab impersone a service account
+gcloud iam service-accounts add-iam-policy-binding \
+    "gitlab-ci-deployer@${GCP_PROJECT_ID}.iam.gserviceaccount.com" \
+    --role="roles/iam.workloadIdentityUser" \
+    --member="principalSet://iam.googleapis.com/projects/${GCP_PROJECT_NUMBER}/locations/global/workloadIdentityPools/gitlab-pool/attribute.repository/<seu-namespace>/<seu-repo>"
+
+# 6. Guardar os segredos de runtime no Secret Manager (não em CI/CD variables)
+echo -n "sua-chave-openrouter" | gcloud secrets create openrouter-api-key --data-file=-
+echo -n "sua-master-key-do-proxy" | gcloud secrets create litellm-proxy-key --data-file=-
+```
+
+### Variáveis a configurar no GitLab (Settings > CI/CD > Variables)
+
+| Variável | Valor |
+|---|---|
+| `GCP_PROJECT_ID` | ID do projeto GCP |
+| `GCP_PROJECT_NUMBER` | Número do projeto (`gcloud projects describe`) |
+| `GCP_REGION` / `AR_REGION` | ex: `us-central1` |
+| `AR_REPOSITORY` | `sdr-bot-repo` |
+| `WIF_POOL_ID` | `gitlab-pool` |
+| `WIF_PROVIDER_ID` | `gitlab-provider` |
+| `WIF_SERVICE_ACCOUNT` | `gitlab-ci-deployer@<project-id>.iam.gserviceaccount.com` |
+
+Nenhuma chave JSON de service account é armazenada em lugar nenhum — a
+autenticação usa o ID token OIDC que o próprio GitLab emite por job
+(`id_tokens` no `.gitlab-ci.yml`), trocado por uma credencial federada de
+curta duração via `gcloud iam workload-identity-pools create-cred-config`.
+
+## Mascaramento de PII (Parte 2)
+
+### Onde a máscara acontece — desenho de "perímetro"
+
+O Orchestrator é o único ponto de entrada (recebe texto cru do usuário)
+e o único ponto de saída (entrega a resposta final) de todo o sistema
+— consequência direta da migração pra `AgentTool` na Parte 1. Por isso:
+
+- **Todo agente** (Orchestrator + 5 especialistas) registra `mask_pii`
+  em `before_model_callback` — mascarar em texto já mascarado é
+  idempotente (não-operação), então isso é defesa em profundidade
+  barata, não redundância real hoje. Importa quando a Parte 4 der a
+  algum especialista uma tool que traga dado de fora (ex: CRM).
+- **Só o Orchestrator** registra `unmask_pii` em `after_model_callback`
+  — desmascarar em qualquer outro lugar arriscaria PII crua voltando
+  pro contexto do Orchestrator antes da resposta final estar pronta.
+
+```
+Usuário (texto cru, pode ter PII)
+      │
+      ▼
+OrchestratorAgent.before_model_callback  ← mask_pii (entrada)
+      │  (a partir daqui, nenhum LLM do sistema vê PII crua)
+      ▼
+Orchestrator decide consultar um especialista (AgentTool)
+      │
+      ▼
+Specialist.before_model_callback  ← mask_pii (defesa em profundidade,
+      │                               normalmente não-operação)
+      ▼
+Specialist responde (ainda mascarado)
+      │
+      ▼
+Resultado volta pro Orchestrator como retorno de tool (ainda mascarado)
+      │
+      ▼
+OrchestratorAgent.after_model_callback  ← unmask_pii (só aqui)
+      │
+      ▼
+Usuário recebe o nome real, nunca um token
+```
+
+### As três camadas
+
+| Camada | Entidades | Ação | Por quê |
+|---|---|---|---|
+| 1 — Token reversível | `PERSON`, `EMAIL_ADDRESS`, `TELEFONE_BR` | `[PERSON_1]`, `[EMAIL_1]`... — mapa em `session.state`, revertido só na saída | Útil pra conversa soar natural |
+| 2 — Hash com salt | `CPF_BR`, `CNPJ_BR` | SHA-256 + salt fixo secreto, nunca revertido | O bot nunca precisa "falar" um CPF de volta — só correlacionar |
+| 3 — Bloqueio total | `CREDIT_CARD` | Mensagem nunca chega ao LLM; resposta de recusa curto-circuitada | Não existe motivo legítimo pra dado de cartão numa conversa de SDR |
+
+**Detalhe de segurança que importa citar em entrevista**: hash de CPF
+sem salt secreto não protege quase nada — 11 dígitos é um espaço de
+busca pequeno o suficiente pra força bruta trivial. O salt em
+`PII_HASH_SALT` precisa ser fixo (pra permitir correlação entre
+sessões: "é o mesmo lead de antes?") **e** secreto (fora do código,
+via `.env` local / Secret Manager em produção) — um hash sem essas duas
+propriedades juntas não é proteção de verdade.
+
+### Recognizers customizados vs. built-in do Presidio
+
+- `CPF_BR`, `CNPJ_BR`: customizados (`app/agents/pii/recognizers.py`),
+  com validação real de dígito verificador — um número no formato de
+  CPF que falha o dígito verificador não é tratado como PII (evita
+  falso positivo em qualquer ID de 11 dígitos). Também rejeita
+  explicitamente sequências tipo `111.111.111-11`, que passam no
+  checksum matematicamente mas nunca são CPFs reais.
+- `TELEFONE_BR`: built-in do Presidio (`PhoneRecognizer`, usa
+  `python-phonenumbers`), só reconfigurado pra região `BR` — mais
+  robusto que regex escrita à mão.
+- `CREDIT_CARD`: built-in do Presidio, mas exige atenção — o
+  recognizer padrão tem `supported_language="en"` e é **silenciosamente
+  descartado** ao carregar recognizers pra português (só loga um
+  warning, não falha). Descoberto via teste automatizado, corrigido
+  registrando-o explicitamente com `supported_language="pt"` em
+  `engine.py`.
+- `PERSON`: built-in do Presidio, mas com o backend de NLP trocado pra
+  `pt_core_news_lg` (spaCy) — o padrão do Presidio é treinado em
+  inglês e não reconhece nomes em português de forma confiável.
+
+### Rodando os testes de PII isoladamente
+
+```bash
+uv run pytest tests/test_pii_masking.py -v
+```
+
+A primeira execução carrega o modelo spaCy (~15s); chamadas seguintes
+na mesma sessão de teste reusam o engine cacheado (singleton em
+`engine.py`).
+
+## Guardrails (Parte 3)
+
+Três pontos deixaram rastro explícito de TODO no código durante as
+Partes 1 e 2 — a Parte 3 é sobre fechar exatamente esses três.
+
+### 1. Detecção de prompt injection (`before_model_callback`)
+
+Escopo desta versão: **só heurística** (regex/keyword), sem camada de
+LLM-judge — decisão deliberada de custo/latência, não limitação técnica.
+Roda depois do `mask_pii` na mesma cadeia
+(`[mask_pii, detect_prompt_injection]`), em todo agente:
+
+```python
+before_model_callback=[mask_pii, detect_prompt_injection]
+```
+
+Só avalia o **último turno do usuário**, não o histórico inteiro a cada
+chamada — uma mensagem já filtrada não precisa ser reavaliada pra
+sempre. Ver `app/agents/guardrails/prompt_injection.py`.
+
+### 2. Allowlist de ação (`before_tool_callback`)
+
+Resolve o TODO de `scheduling.py`: `book_meeting` só executa de verdade
+se `session.state[STATE_QUALIFICATION_STATUS] == "qualified"`. Isso é
+diferente de um guardrail de conteúdo — é sobre o que o sistema tem
+permissão de **executar**, não sobre o que ele diz:
+
+```
+book_meeting(slot) chamado
+      │
+      ▼
+enforce_action_allowlist verifica qualification_status
+      │
+   ┌──┴──┐
+  sim    não
+   │      │
+   ▼      ▼
+executa   retorna {"status": "blocked", "error_message": "...link..."}
+```
+
+Quando bloqueado, a resposta simula um redirecionamento (link fake —
+não existe formulário de qualificação real neste projeto) em vez de só
+recusar. O contrato de retorno imita o padrão de erro que `book_meeting`
+já usava pra "horário indisponível", deixando o modelo do
+`SchedulingAgent` transformar isso em linguagem natural, em vez da
+guardrail hardcodar a frase exata.
+
+Isso também exigiu resolver um problema real: `STATE_QUALIFICATION_STATUS`
+existia como chave reservada desde a Parte 1, mas nada escrevia um valor
+estruturado nela. A `QualificationAgent` ganhou uma tool nova pra isso:
+
+```python
+set_qualification_status(status: "qualified"|"disqualified"|"in_progress", reasoning: str)
+```
+
+Mesmo padrão que `SchedulingAgent` já usava — mudança de estado
+estruturada e auditável via tool, não texto livre que outro lugar do
+sistema teria que tentar interpretar.
+
+### 3. Validação de política de saída (`after_model_callback`)
+
+Resolve o TODO de `objection.py`: "nunca ofereça desconto" era só uma
+instrução de prompt — contornável por prompt injection. Agora também é
+verificado na resposta de verdade:
+
+```python
+after_model_callback=[validate_output_policy, block_unauthorized_transfer]  # especialistas
+after_model_callback=[validate_output_policy, unmask_pii]                    # orchestrator
+```
+
+**Escopo**: todo agente (defesa em profundidade), não só
+`ObjectionHandlingAgent` — mesma postura da Parte 2. Hoje só o
+`ObjectionHandlingAgent` fala sobre desconto, mas `KnowledgeAgent` vai
+discutir preço de verdade a partir da Parte 4, e essa proteção já
+precisa estar no lugar antes disso, não adicionada depois.
+
+### Onde o código mora
+
+```
+app/agents/guardrails/
+├── transfer.py           # bloqueio de transfer_to_agent não autorizado
+│                           # (existia desde a Parte 1 como _guardrails.py,
+│                           # movido pra cá — não é mais um stopgap solto)
+├── prompt_injection.py   # detect_prompt_injection
+├── output_policy.py      # validate_output_policy
+└── action_allowlist.py   # enforce_action_allowlist
+```
+
+### Rodando os testes de guardrails isoladamente
+
+```bash
+uv run pytest tests/test_prompt_injection.py tests/test_output_policy.py \
+  tests/test_action_allowlist.py tests/test_guardrails.py -v
+```
+
+## Estratégia de testes
+
+Pergunta prática: "editei `qualification.py`, como sei que não quebrei
+nada?" A resposta muda dependendo de QUÃO CARO você aceita que a
+resposta seja — por isso os testes deste projeto ficam em 4 camadas,
+cada uma com um trade-off diferente de custo vs. o que ela pega:
+
+| Camada | Custo | Pega | Onde |
+|---|---|---|---|
+| 1. Estrutural | Grátis, instantâneo | Wiring quebrado, tool faltando, import errado | `test_smoke.py` |
+| 2. Lógica de tool (Python puro) | Grátis, instantâneo | A parte determinística de uma tool está errada | `test_tool_logic.py` |
+| 3. Conversa dourada | Barato, chamadas reais de LLM | Agente parou de chamar a tool certa, parou de completar o fluxo, guardrail disparou sem motivo | `test_golden_conversations.py` |
+| 4. Eval set com LLM-judge | Custo real, minutos | Qualidade da resposta regrediu, não só a estrutura | Parte 6 (planejado) |
+
+**Camadas 1 e 2 rodam em `make test`** (e no pipeline de CI, sempre) —
+não custam nada, então não tem motivo pra não rodar toda vez.
+
+**Camada 3 é deliberadamente separada** (`make test-live`), porque
+custa chamadas reais de API. Ela verifica ESTRUTURA (qual chave de
+`session.state` foi escrita, qual guardrail disparou), nunca texto
+exato — isso é o que permite ela sobreviver a ajustes de prompt sem
+precisar ser reescrita toda hora:
+
+```bash
+make test-live
+# ou, sem o Makefile:
+RUN_LIVE_TESTS=1 uv run pytest tests/test_golden_conversations.py -v
+```
+
+**Camada 4** (golden eval set + LLM-as-judge + regressão versionada)
+é escopo da Parte 6 — a camada 3 é deliberadamente mais simples que
+isso (sem modelo-juiz, sem rubrica de nota), pensada pra dar confiança
+no dia a dia de edição de agente, não pra ser o critério final de
+qualidade.
+
+### Workflow prático ao editar um agente
+
+1. `uv run pytest` (grátis) — confirma que nada estrutural quebrou
+2. Se mexeu na lógica de uma tool, rode/adicione o teste direto dela
+   (camada 2, grátis)
+3. `make test-live` — confirma que o fluxo ainda completa e chama as
+   tools certas (custa uma chamada real, mas é rápido)
+4. `make web` — checagem manual de tom/qualidade da conversa (ainda
+   importa, só não é mais a ÚNICA linha de defesa)
+
+## RAG real (Parte 4)
+
+### Arquitetura: por que MCP Server como processo separado
+
+O agente ADK nunca importa `mcp_server/` ou `ingestion/` como módulo
+Python — conecta no servidor MCP via subprocess/stdio
+(`McpToolset(connection_params=StdioConnectionParams(...))`), do mesmo
+jeito que o LiteLLM Proxy já é um processo separado desde a Parte 1.
+Essa decisão não foi só estética: significa que `mcp_server/` e
+`ingestion/` nunca entram na árvore de import de `app/agents/`, então
+nunca podem reintroduzir a restrição de import-root isolado do
+`adk web` que já nos mordeu duas vezes (Partes 1 e 2).
+
+```
+KnowledgeAgent (app/agents/knowledge.py)
+      │  McpToolset via subprocess/stdio
+      ▼
+mcp_server/server.py  (fastmcp, processo separado)
+      │  lê
+      ▼
+mcp_server/chroma_data/  (ChromaDB, PersistentClient)
+      ▲  escreve
+      │
+ingestion/assets.py  (Dagster: raw_docs → chunks → chroma_index)
+      ▲  lê
+      │
+ingestion/knowledge_base/*.md  (8 documentos sobre a Helssing)
+```
+
+### Pipeline de ingestão (Dagster)
+
+`raw_docs → chunks → chroma_index`, cada estágio um asset com linhagem
+rastreada — Dagster foi escolhido sobre Prefect especificamente porque
+o modelo de software-defined assets responde bem à pergunta "o índice
+está desatualizado em relação aos documentos-fonte?" via linhagem, sem
+código extra nosso.
+
+**Chunking**: por seção de nível 2 (`##`), não por tamanho fixo — os
+documentos já são estruturados em seções semanticamente coerentes (ver
+`ingestion/knowledge_base/*.md`), então isso preserva significado
+melhor que corte por N caracteres. Cada chunk carrega o título do
+documento como prefixo, pra não perder contexto quando recuperado
+isoladamente.
+
+**Dois `asset_check`** em `chroma_index`, resposta real pro requisito
+"RAG avaliado com dados":
+- `retrieval_recall_at_k`: recall@3 contra um golden query set de 4
+  perguntas — cada uma diz "essa pergunta deveria recuperar um chunk
+  vindo deste documento". Validado rodando de verdade: recall@3 = 1.0.
+- `no_pii_leaked_into_index`: reusa o Presidio já validado na Parte 2
+  pra confirmar que a base de conhecimento (conteúdo de produto) nunca
+  tem PII de verdade nela.
+
+```bash
+make ingest-dev   # abre a UI do Dagster -- materialize os 3 assets
+```
+
+A primeira materialização baixa o modelo de embedding multilingue
+(`paraphrase-multilingual-MiniLM-L12-v2`, ~470MB) do HuggingFace Hub —
+precisa de internet normal, sem restrição de rede. **O índice persiste
+em disco** (`mcp_server/chroma_data/`, gitignored) — não precisa
+rematerializar toda vez que o app roda, só quando o conteúdo dos `.md`
+ou a lógica de chunking mudar.
+
+### Escolha de modelo de embedding
+
+`paraphrase-multilingual-MiniLM-L12-v2` (leve, ~470MB, multilingue,
+bem estabelecido) em vez de encoders específicos de português como os
+"Serafim" da PORTULAN (melhor qualidade, mas outro download pesado em
+cima do modelo do spaCy que já carregamos na Parte 2) — trade-off
+deliberado de simplicidade sobre qualidade máxima, mesmo espírito das
+outras escolhas de modelo neste projeto.
+
+### Bug real encontrado rodando isso: `on_model_error_callback`
+
+Modelos Claude, através do LiteLLM, ocasionalmente emitem argumentos
+de tool call como JSON duplicado e concatenado sem separador (ex:
+`{"status": "x"}{"status": "x"}`) — bug real e ainda aberto a
+montante ([BerriAI/litellm#20543](https://github.com/BerriAI/litellm/issues/20543)).
+Descoberto porque `test_qualification_flow_sets_status` falhou duas
+vezes seguidas com a mesma assinatura de erro — não foi um acaso raro.
+ADK já tenta reparar formatos malformados antes de desistir
+(`ast.literal_eval`, chaves sem aspas), mas nenhuma estratégia cobre
+"JSON válido duplicado", então o erro original sobe e derruba o agente
+inteiro.
+
+`app/agents/guardrails/model_error_recovery.py` intercepta via
+`on_model_error_callback` (wireado em todo agente, defesa em
+profundidade) e degrada graciosamente — pede pro lead repetir a
+mensagem, em vez de travar a conversa inteira por um bug de terceiros
+que nem o LiteLLM conseguiu corrigir de forma definitiva ainda (a
+tentativa de correção deles, #18667, foi revertida em #19243).
+
+### Rodando os testes da Parte 4 isoladamente
+
+```bash
+uv run pytest tests/test_ingestion_chunking.py tests/test_mcp_server_tools.py \
+  tests/test_model_error_recovery.py -v
+```
+
+Nenhum desses precisa do modelo de embedding real nem de rede —
+`test_mcp_server_tools.py` usa um embedder falso e determinístico
+(válido pra testar estrutura e pra `get_pricing_info`, que usa filtro
+de metadado, não busca semântica; relevância semântica de verdade já
+foi validada rodando o pipeline real).
+
+## Próxima parte
+
+**Parte 5**: observabilidade — LangFuse + Arize Phoenix, tracing de
+ponta a ponta através de todo o roteamento multi-agente, custo por
+conversa, e a primeira camada real de "consigo ver o que aconteceu"
+além dos flags manuais em `session.state`.
+SDR_PART4_EOF
+
+echo "  - .gitignore"
+cat > "$TARGET_DIR/.gitignore" <<'SDR_PART4_EOF'
+.env
+__pycache__/
+*.pyc
+.pytest_cache/
+.ruff_cache/
+.venv/
+venv/
+
+# Parte 4: dados gerados pelo pipeline de ingestão -- regenerável via
+# `make ingest-dev`, não deveria ir pro git (binário, muda a cada
+# reindexação, e o modelo de embedding baixado junto seria enorme).
+mcp_server/chroma_data/
+# Dagster cria isso automaticamente quando DAGSTER_HOME não está
+# setado (nosso caso, dev local) -- efêmero por natureza.
+.tmp_dagster_home*/
+SDR_PART4_EOF
+
+echo ""
+echo "==> Parte 4 gerada/atualizada com sucesso em $TARGET_DIR"
+echo ""
+echo "Próximos passos:"
+echo "  1. cd $TARGET_DIR && uv sync --locked"
+echo "  2. make ingest-dev"
+echo "  3. make test"
+echo "  4. make web"

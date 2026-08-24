@@ -15,6 +15,7 @@ fallback silencioso dentro de outro agente) para que:
 from google.adk.agents import LlmAgent
 
 from .config.models import get_model_for_role
+from .guardrails.model_error_recovery import recover_from_duplicated_tool_call_json
 from .guardrails.output_policy import validate_output_policy
 from .guardrails.prompt_injection import detect_prompt_injection
 from .guardrails.transfer import block_unauthorized_transfer
@@ -46,4 +47,5 @@ escalate_agent = LlmAgent(
     # guardrail de transfer abaixo fica como defesa em profundidade.
     before_model_callback=[mask_pii, detect_prompt_injection],
     after_model_callback=[validate_output_policy, block_unauthorized_transfer],
+    on_model_error_callback=recover_from_duplicated_tool_call_json,
 )
