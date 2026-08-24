@@ -115,13 +115,14 @@ docker_build_check:
   services:
     - docker:27-dind
   script:
+    # Limpa qualquer imagem/camada residual de jobs anteriores no MESMO
+    # runner antes de buildar -- não resolve a causa raiz de imagem
+    # pesada (isso é o fix em pyproject.toml: torch CPU-only em vez do
+    # build com CUDA), mas é uma rede de segurança independente,
+    # incondicional, útil mesmo que outra dependência volte a inchar a
+    # imagem no futuro.
+    - docker system prune -af || true
     - docker build -t sdr-bot-api:ci-check .
-    # Libera o disco efêmero do runner (imagem base + camadas do builder
-    # + cache do BuildKit) antes do segundo build — os runners
-    # compartilhados do GitLab.com têm disco limitado por job, e dois
-    # builds multi-stage seguidos já causaram "no space left on device"
-    # no meio do COPY do segundo build.
-    - docker system prune -af
     - docker build -t litellm-proxy:ci-check ./litellm_proxy
   rules:
     - if: $CI_PIPELINE_SOURCE == "merge_request_event"
@@ -149,9 +150,6 @@ build_and_push:
   script:
     - docker build -t "${API_IMAGE_TAG}" .
     - docker push "${API_IMAGE_TAG}"
-    # Mesmo motivo do docker_build_check: já foi enviado pro Artifact
-    # Registry, não precisa mais ficar no disco efêmero do runner.
-    - docker system prune -af
     - docker build -t "${PROXY_IMAGE_TAG}" ./litellm_proxy
     - docker push "${PROXY_IMAGE_TAG}"
   rules:

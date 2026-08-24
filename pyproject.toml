@@ -5,7 +5,8 @@ description = "SDR Bot multi-agente (Google ADK + LiteLLM/OpenRouter) — portfo
 readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
-    "google-adk>=1.0.0",
+    "google-adk>=2.6.1",
+    "deprecated",
     "litellm>=1.55.0",
     "python-dotenv>=1.0.1",
     "fastapi>=0.115.0",
@@ -23,14 +24,32 @@ dependencies = [
     "arize-phoenix>=20.3.0",
     "opentelemetry-sdk>=1.42.1",
     "opentelemetry-exporter-otlp>=1.42.1",
+    "torch>=2.13.0",
+    "deprecated>=1.3.1",
 ]
 
 # pt_core_news_lg não está no PyPI (modelos do spaCy são distribuídos como
 # wheels diretas nos releases do GitHub) — apontamos a dependência acima
 # para essa URL. Versão 3.8.0 é a compatível com spacy>=3.8,<3.9 conforme
 # https://raw.githubusercontent.com/explosion/spacy-models/master/compatibility.json
+#
+# torch: sentence-transformers (Parte 4) traz torch como dependência
+# transitiva. Por padrão, no Linux, PyPI resolve pro build com CUDA/NVIDIA
+# embutido (~4.5GB extras: pacote nvidia sozinho é 2.7GB) -- não usamos
+# GPU em lugar nenhum deste projeto (o modelo de embedding roda em CPU).
+# Apontar torch pro índice CPU-only oficial do PyTorch evita esse peso
+# inteiro sem trocar nenhuma funcionalidade. Descoberto de forma
+# concreta: pipeline do GitLab CI ficando sem espaço em disco no
+# `docker_build_check` (COPY do .venv), com .venv medindo 6.4GB local,
+# 2.7GB só em nvidia/*.
 [tool.uv.sources]
 pt-core-news-lg = { url = "https://github.com/explosion/spacy-models/releases/download/pt_core_news_lg-3.8.0/pt_core_news_lg-3.8.0-py3-none-any.whl" }
+torch = { index = "pytorch" }
+
+[[tool.uv.index]]
+name = "pytorch"
+url = "https://download.pytorch.org/whl/cpu"
+explicit = true
 
 # Dependências de desenvolvimento/CI (PEP 735) — nunca instaladas na
 # imagem de produção. Isso é o motivo real da migração: com
