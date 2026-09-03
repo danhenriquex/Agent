@@ -13,6 +13,7 @@ Lê o MESMO diretório ChromaDB que ingestion/assets.py escreve
 existe ainda.
 """
 
+import threading
 from pathlib import Path
 
 import chromadb
@@ -25,19 +26,44 @@ EMBEDDING_MODEL_NAME = "paraphrase-multilingual-MiniLM-L12-v2"
 mcp = FastMCP("helssing-knowledge-base")
 
 _collection = None
+# Bug real encontrado rodando `make eval-run` (Parte 6): o pipeline de
+# eval é o primeiro código deste projeto a chamar KnowledgeAgent a
+# partir de VÁRIAS conversas ao mesmo tempo (via
+# eval/langfuse_client.py::run_experiment_sync, max_concurrency=3) --
+# todas elas passam pelo mesmo processo/conexão MCP (McpToolset é um
+# singleton por processo, ver app/agents/knowledge.py). Sem trava, duas
+# chamadas concorrentes podiam ver `_collection is None` ao mesmo tempo
+# e as duas tentar construir um chromadb.PersistentClient sobre o MESMO
+# diretório simultaneamente -- na prática isso se manifestou como
+# `AttributeError: 'RustBindingsAPI' object has no attribute 'bindings'`
+# seguido de `Could not connect to tenant default_tenant`, uma
+# inicialização vendo o binding Rust do client concorrente ainda pela
+# metade. Antes da Parte 6, nada neste projeto chamava essa tool de
+# forma concorrente, então essa condição de corrida nunca disparava.
+_collection_lock = threading.Lock()
 
 
 def _get_collection():
     """Lazy singleton -- carregar o modelo de embedding é caro (mesmo
     motivo do singleton em app/agents/pii/engine.py na Parte 2), não
-    queremos recarregar a cada chamada de tool."""
+    queremos recarregar a cada chamada de tool.
+
+    Double-checked locking: a checagem rápida sem lock mantém o caminho
+    comum (coleção já carregada) sem contenção nenhuma; a trava só entra
+    em jogo na janela estreita da primeira inicialização, exatamente
+    onde a corrida acontecia.
+    """
     global _collection
     if _collection is None:
-        from chromadb.utils.embedding_functions import SentenceTransformerEmbeddingFunction
+        with _collection_lock:
+            if _collection is None:
+                from chromadb.utils.embedding_functions import (
+                    SentenceTransformerEmbeddingFunction,
+                )
 
-        client = chromadb.PersistentClient(path=str(CHROMA_DATA_DIR))
-        ef = SentenceTransformerEmbeddingFunction(model_name=EMBEDDING_MODEL_NAME)
-        _collection = client.get_collection(COLLECTION_NAME, embedding_function=ef)
+                client = chromadb.PersistentClient(path=str(CHROMA_DATA_DIR))
+                ef = SentenceTransformerEmbeddingFunction(model_name=EMBEDDING_MODEL_NAME)
+                _collection = client.get_collection(COLLECTION_NAME, embedding_function=ef)
     return _collection
 
 

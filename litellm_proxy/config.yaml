@@ -63,6 +63,30 @@ model_list:
       model: openrouter/meta-llama/llama-3.1-8b-instruct
       api_key: os.environ/OPENROUTER_API_KEY
 
+  # --- Parte 6: modelo-juiz (LLM-as-judge) do golden eval set ---
+  # DELIBERADAMENTE de uma família DIFERENTE dos avaliados
+  # (qualification/knowledge/objection-model, todos claude-sonnet-5) --
+  # um modelo julgando a própria família de saída como boa é um viés de
+  # auto-avaliação documentado em LLM-as-judge. A primeira escolha foi
+  # claude-opus-5 (mesma família Anthropic, uma classe de raciocínio
+  # acima) -- trocado pra gpt-4o depois de rodar `make eval-run` de
+  # verdade: Opus é bem mais caro/lento (pressão real sobre o saldo da
+  # OpenRouter, que já bloqueou a run duas vezes nesta parte) E é uma
+  # família totalmente diferente da Sonnet (evita o viés igual, ou
+  # melhor, já que nem a "linhagem" do modelo se repete), com
+  # reputação sólida de seguir formato JSON estrito -- relevante porque
+  # eval/judge.py::parse_judge_response já teve falha de parsing num
+  # item durante teste real. gpt-4o-mini (mais barato ainda) foi
+  # descartado de propósito: já é o modelo por trás de
+  # orchestrator/scheduling/escalate-model, então reintroduziria viés
+  # de auto-avaliação pra qualquer conversa que passe por eles, além de
+  # juízes mais leves tenderem a discriminar pior nuance de tom/
+  # qualidade. Ver eval/judge.py.
+  - model_name: judge-model
+    litellm_params:
+      model: openrouter/openai/gpt-4o
+      api_key: os.environ/OPENROUTER_API_KEY
+
 litellm_settings:
   # Cada alias acima cai neste fallback em caso de erro/rate-limit.
   fallbacks:
@@ -72,6 +96,7 @@ litellm_settings:
     - objection-model: ["fallback-model"]
     - scheduling-model: ["fallback-model"]
     - escalate-model: ["fallback-model"]
+    - judge-model: ["fallback-model"]
 
   # Parte 5: langfuse_otel é o callback de PRIMEIRA CLASSE atual pra
   # LangFuse via LiteLLM Proxy -- a alternativa mais simples
