@@ -15,6 +15,8 @@ real (ver README > RAG, recall@3 = 1.0 no golden query set).
 """
 
 import hashlib
+import threading
+import time
 import uuid
 
 import numpy as np
@@ -107,3 +109,71 @@ def test_collection_singleton_is_reused_not_rebuilt(fake_collection, monkeypatch
     monkeypatch.setattr(ef_module, "SentenceTransformerEmbeddingFunction", _boom)
 
     server_module.retrieve_product_docs("teste", top_k=1)  # não deveria levantar
+
+
+def test_get_collection_singleton_init_is_thread_safe(monkeypatch):
+    # Bug real encontrado rodando `make eval-run` (Parte 6):
+    # eval/langfuse_client.py::run_experiment_sync roda vários itens do
+    # golden set em paralelo (max_concurrency), e mais de um podia
+    # chamar KnowledgeAgent ao mesmo tempo através do MESMO processo MCP
+    # (McpToolset é um singleton por processo, ver
+    # app/agents/knowledge.py). Sem trava, duas chamadas concorrentes
+    # viam `_collection is None` ao mesmo tempo e as duas tentavam
+    # construir um chromadb.PersistentClient sobre o mesmo diretório --
+    # na prática isso quebrava com `AttributeError: 'RustBindingsAPI'
+    # object has no attribute 'bindings'` seguido de `Could not connect
+    # to tenant default_tenant`. Antes da Parte 6, nada neste projeto
+    # chamava essa tool de forma concorrente, então essa corrida nunca
+    # disparava.
+    #
+    # Este teste prova que o double-checked locking em _get_collection()
+    # serializa a inicialização sob concorrência REAL de threads (não só
+    # "no papel"): um `time.sleep` dentro do construtor falso alarga a
+    # janela de corrida o bastante pra, sem a trava, múltiplas threads
+    # quase certamente reconstruírem a coleção; com a trava, a segunda
+    # checagem (dentro do lock) sempre vê `_collection` já setado pela
+    # primeira thread que passou, e o construtor roda exatamente uma vez.
+    monkeypatch.setattr(server_module, "_collection", None)
+
+    build_count = 0
+    build_lock = threading.Lock()
+
+    class _FakeCollection:
+        pass
+
+    class _FakeClient:
+        def get_collection(self, name, embedding_function):
+            return _FakeCollection()
+
+    def _fake_persistent_client(path):
+        nonlocal build_count
+        with build_lock:
+            build_count += 1
+        time.sleep(0.05)
+        return _FakeClient()
+
+    monkeypatch.setattr(server_module.chromadb, "PersistentClient", _fake_persistent_client)
+
+    import chromadb.utils.embedding_functions as ef_module
+
+    monkeypatch.setattr(
+        ef_module, "SentenceTransformerEmbeddingFunction", lambda model_name: object()
+    )
+
+    results: list = []
+    results_lock = threading.Lock()
+
+    def _call():
+        result = server_module._get_collection()
+        with results_lock:
+            results.append(result)
+
+    threads = [threading.Thread(target=_call) for _ in range(8)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+
+    assert build_count == 1, f"PersistentClient foi construído {build_count} vez(es), deveria ser 1"
+    assert len(results) == 8
+    assert len({id(r) for r in results}) == 1, "threads concorrentes receberam coleções diferentes"

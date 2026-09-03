@@ -1,12 +1,13 @@
-# SDR Bot — Sistema Multi-Agente (Partes 1–5: Esqueleto + PII + Guardrails + RAG + Observabilidade)
+# SDR Bot — Sistema Multi-Agente (Partes 1–6: Esqueleto + PII + Guardrails + RAG + Observabilidade + Eval)
 
 Chatbot SDR (Sales Development Representative) construído com **Google ADK**,
 desenhado para demonstrar, na prática, os requisitos técnicos de vagas de
 LLM/AI Engineer sênior focadas em produção: orquestração multi-agente,
-guardrails, mascaramento de PII, RAG avaliado e observabilidade.
+guardrails, mascaramento de PII, RAG avaliado, observabilidade e um
+processo sistemático de avaliação de qualidade.
 
 Este projeto é dividido em partes incrementais. Este README cobre as
-**Partes 1 a 5**.
+**Partes 1 a 6** — o roadmap original completo.
 
 ## O que existe nesta parte
 
@@ -48,20 +49,27 @@ Este projeto é dividido em partes incrementais. Este README cobre as
   (custo/tokens via `langfuse_otel` no LiteLLM Proxy), com os 6
   guardrails anotando eventos direto nos spans. Ver seção dedicada
   abaixo.
+- **Golden eval set + LLM-as-judge + regressão versionada (Parte 6)**:
+  22 conversas douradas cobrindo 6 categorias de comportamento
+  (`eval/golden_set.py`), pontuadas por um modelo-juiz via LiteLLM
+  Proxy contra critério estrutural + qualitativo, publicadas como
+  Dataset/Scores no LangFuse já self-hospedado (Parte 5), com
+  `asset_check` de regressão versionado em git. Ver seção dedicada
+  abaixo.
 - Smoke tests da topologia + testes de PII + testes de guardrails +
-  testes de RAG + testes de observabilidade (`tests/`) que rodam sem
-  precisar de chave de API (as únicas exceções são o download do
-  modelo spaCy e do modelo de embedding, cada um uma vez).
+  testes de RAG + testes de observabilidade + testes do golden set/juiz/
+  regressão (`tests/`) que rodam sem precisar de chave de API (as únicas
+  exceções são o download do modelo spaCy e do modelo de embedding,
+  cada um uma vez).
 
-## O que **não** está aqui ainda (de propósito)
+## Status do roadmap
 
-| Falta | Onde entra |
-|---|---|
-| Golden eval set + LLM-as-judge + regressão | Parte 6 |
-
-Cada agente tem comentários `TODO Parte N` no código exatamente nos pontos
-onde essas camadas vão se conectar — não são promessas soltas, são pontos
-de extensão já identificados na arquitetura.
+As 6 partes planejadas originalmente estão implementadas. O que fica
+deliberadamente fora do escopo deste projeto (não é "falta", é um limite
+consciente de portfólio) é o que qualquer sistema real de produção teria
+por trás de uma integração paga/regulada: calendário real (hoje
+`check_availability`/`book_meeting` são mock), um CRM de verdade recebendo
+o `opportunity_brief`, e autenticação/multi-tenant na API.
 
 ## Atalhos com Makefile
 
@@ -96,6 +104,11 @@ make phoenix-up        # Phoenix local (tracing de agentes/tools/RAG, Parte 5)
 make langfuse-secrets  # gera os ~10 segredos do LangFuse (só imprime)
 make langfuse-up       # LangFuse self-hospedado (custo/tokens, Parte 5)
 make langfuse-down     # derruba o LangFuse
+
+make eval-run   # golden eval set + LLM-judge (custa API, Parte 6 --
+                # ver seção dedicada abaixo), precisa do proxy e do
+                # LangFuse de pé
+make eval-dev   # UI do Dagster pra rodar o pipeline de avaliação
 ```
 
 Rode `make` (sem alvo) ou `make help` pra ver a lista completa.
@@ -484,12 +497,24 @@ existia como chave reservada desde a Parte 1, mas nada escrevia um valor
 estruturado nela. A `QualificationAgent` ganhou uma tool nova pra isso:
 
 ```python
-set_qualification_status(status: "qualified"|"disqualified"|"in_progress", reasoning: str)
+set_qualification_status(
+    status: "qualified"|"disqualified"|"in_progress",
+    pain: str,
+    product_of_interest: str,
+    reasoning: str,
+    company_size: str | None = None,
+    additional_notes: str | None = None,
+)
 ```
 
 Mesmo padrão que `SchedulingAgent` já usava — mudança de estado
 estruturada e auditável via tool, não texto livre que outro lugar do
-sistema teria que tentar interpretar.
+sistema teria que tentar interpretar. Além de `status`, a tool grava um
+"opportunity brief" completo em `qualification_notes` (`pain`,
+`product_of_interest`, `company_size`, `reasoning`, `additional_notes`)
+— é isso que dá a quem assume a conversa depois (hoje, `book_meeting`
+via `SchedulingAgent`; um Closer/CRM real amanhã) contexto sobre a
+oportunidade sem precisar reler o chat inteiro.
 
 ### 3. Validação de política de saída (`after_model_callback`)
 
@@ -539,7 +564,7 @@ cada uma com um trade-off diferente de custo vs. o que ela pega:
 | 1. Estrutural | Grátis, instantâneo | Wiring quebrado, tool faltando, import errado | `test_smoke.py` |
 | 2. Lógica de tool (Python puro) | Grátis, instantâneo | A parte determinística de uma tool está errada | `test_tool_logic.py` |
 | 3. Conversa dourada | Barato, chamadas reais de LLM | Agente parou de chamar a tool certa, parou de completar o fluxo, guardrail disparou sem motivo | `test_golden_conversations.py` |
-| 4. Eval set com LLM-judge | Custo real, minutos | Qualidade da resposta regrediu, não só a estrutura | Parte 6 (planejado) |
+| 4. Eval set com LLM-judge | Custo real, minutos | Qualidade da resposta regrediu, não só a estrutura | `eval/` (Parte 6), `make eval-run` |
 
 **Camadas 1 e 2 rodam em `make test`** (e no pipeline de CI, sempre) —
 não custam nada, então não tem motivo pra não rodar toda vez.
@@ -556,11 +581,11 @@ make test-live
 RUN_LIVE_TESTS=1 uv run pytest tests/test_golden_conversations.py -v
 ```
 
-**Camada 4** (golden eval set + LLM-as-judge + regressão versionada)
-é escopo da Parte 6 — a camada 3 é deliberadamente mais simples que
-isso (sem modelo-juiz, sem rubrica de nota), pensada pra dar confiança
-no dia a dia de edição de agente, não pra ser o critério final de
-qualidade.
+**Camada 4** (golden eval set + LLM-as-judge + regressão versionada,
+`eval/`, Parte 6) é deliberadamente mais cara e mais lenta que a camada
+3 -- ela existe pra responder "a qualidade da resposta melhorou ou
+piorou?" com um número, não pra dar feedback rápido durante edição de
+prompt. Ver seção dedicada abaixo.
 
 ### Workflow prático ao editar um agente
 
@@ -571,6 +596,9 @@ qualidade.
    tools certas (custa uma chamada real, mas é rápido)
 4. `make web` — checagem manual de tom/qualidade da conversa (ainda
    importa, só não é mais a ÚNICA linha de defesa)
+5. Antes de considerar uma mudança de prompt/modelo "pronta" pra
+   produção, `make eval-run` — é isso que transforma "parece melhor" em
+   uma métrica que sobe ou desce (ver Parte 6)
 
 ## RAG real (Parte 4)
 
@@ -808,10 +836,224 @@ Não precisa de Phoenix nem LangFuse rodando -- usa um `TracerProvider`
 local isolado por teste, não o global registrado por
 `app/agents/observability.py`.
 
-## Próxima parte
+## Eval set + LLM-as-judge (Parte 6)
 
-**Parte 6**: golden eval set + LLM-as-judge + regressão versionada —
-fecha o requisito "processo de avaliação sistemático, prova que uma
+Fecha o requisito "processo de avaliação sistemático, prova que uma
 mudança melhorou, não acha". A camada 3 de testes (`test-live`) já
-verifica estrutura; a Parte 6 mede qualidade de verdade, com um
-critério explícito e rastreável ao longo do tempo.
+verifica ESTRUTURA (qual tool foi chamada, qual chave de estado foi
+escrita); a Parte 6 mede QUALIDADE de verdade, com um critério
+explícito por item e rastreável ao longo do tempo.
+
+### Decisão de arquitetura: reusar o LangFuse já self-hospedado
+
+Em vez de construir um mecanismo de persistência de avaliação
+separado, esta parte reusa o LangFuse da Parte 5, que já tem suporte
+nativo a **Datasets** (o golden eval set) e **Scores** (os resultados
+de avaliação) — a UI dele já mostra tendência ao longo do tempo sem
+código extra nosso. `dataset.run_experiment(...)` (SDK Python do
+LangFuse) é o mecanismo central: dado um dataset e uma função de task,
+ele roda a task pra cada item, aplica os evaluators fornecidos, e
+publica tanto os resultados quanto os scores como uma "run" nomeada do
+dataset, visível na UI.
+
+```
+eval/golden_set.py (22 itens, versionado em git -- fonte de verdade)
+      │  eval/langfuse_client.py::ensure_golden_dataset (upsert por id)
+      ▼
+LangFuse Dataset "sdr-bot-golden-set"
+      │  dataset.run_experiment(task=..., evaluators=[...])
+      ▼
+Pra cada item: eval/runner.py::run_conversation roda a conversa contra
+o agente real (Runner + InMemorySessionService -- mesmo padrão de
+tests/test_golden_conversations.py::_run_conversation)
+      │
+      ├─▶ eval/runner.py::check_structural -- mesma checagem
+      │    determinística da camada 3 (chave de session.state, ou
+      │    substring em guardrail_flags), sem custar LLM
+      │
+      └─▶ eval/judge.py::judge_response -- judge-model (LiteLLM Proxy)
+           pontua tom/aderência ao critério/faithfulness, 1-5 por
+           dimensão + justificativa (nunca um número solto)
+      │
+      ▼ Evaluation(s) devolvidos ao SDK -> LangFuse submete os Scores,
+        anexados ao trace de cada item da run, automaticamente
+      ▼
+eval/assets.py::eval_regression (asset_check Dagster) compara a média
+combinada desta run contra eval/baseline.json -- falha se caiu mais
+que o threshold (ver eval/regression.py)
+```
+
+### Por que golden_set.py, não a UI do LangFuse, é a fonte de verdade
+
+O dataset "sdr-bot-golden-set" no LangFuse é uma **projeção** de
+`eval/golden_set.py` (`ensure_golden_dataset` faz upsert por `id` toda
+vez que o pipeline roda), nunca o contrário. Um critério de sucesso é
+uma decisão de produto/comportamento — merece review de PR como
+qualquer mudança de código, o que editar direto numa UI não dá.
+
+### Duplo critério por item, não só "o juiz achou bom"
+
+Cada um dos 22 itens (`eval/golden_set.py`, 6 categorias do roadmap:
+qualidade de qualificação, faithfulness do RAG, tom de objeção,
+correção de guardrail, aderência de persona, escalonamento correto)
+carrega dois critérios independentes:
+
+- **Estrutural** (`expected_state_keys`/`expected_state_values`/
+  `forbidden_state_keys`/`expected_guardrail_flag_substrings`):
+  determinístico, o mesmo tipo de checagem que a camada 3 já faz.
+  `GoldenSetItem` recusa (`pydantic.ValidationError`) qualquer item que
+  não declare pelo menos um sinal estrutural — um item "só vibe",
+  avaliado apenas pelo juiz, não é aceito.
+- **Qualitativo** (`qualitative_criteria`, linguagem natural): cobre o
+  que nenhuma chave de estado consegue -- tom, se a resposta soa como
+  interrogatório, se uma alegação de produto realmente vem do
+  `reference_context` fornecido (só preenchido nos itens de
+  `rag_faithfulness`, com trechos reais de `ingestion/knowledge_base/`).
+
+Uma resposta que falha o critério ESTRUTURAL tem a nota do juiz
+limitada a no máximo 2/5 (`eval/assets.py::_STRUCTURAL_FAILURE_SCORE_CAP`)
+mesmo se o tom estiver ótimo -- uma resposta educada que confirma um
+agendamento sem qualificação, por exemplo, não é "boa" só porque soa
+bem.
+
+### `judge-model`: por que um modelo diferente dos avaliados
+
+`litellm_proxy/config.yaml` ganhou o alias `judge-model`, apontando
+pra `openai/gpt-4o` -- deliberadamente de uma família diferente de
+`qualification-model`/`knowledge-model`/`objection-model` (todos
+`claude-sonnet-5`). Um modelo julgando a própria família de saída como
+boa é um viés de auto-avaliação documentado em LLM-as-judge.
+
+A primeira escolha tinha sido `claude-opus-5` (mesma família Anthropic,
+uma classe de raciocínio acima do avaliado) -- trocado pra `gpt-4o`
+depois de rodar `make eval-run` de verdade: Opus é bem mais caro/lento
+(pressão real sobre o saldo da OpenRouter, que já bloqueou a run com
+402 nesta parte), e `gpt-4o` já é uma família totalmente diferente da
+Sonnet (elimina o viés igual ou melhor) com reputação sólida de seguir
+formato JSON estrito -- relevante porque uma falha real de parsing
+apareceu num item durante teste (ver descoberta abaixo). `gpt-4o-mini`
+(mais barato ainda) foi descartado de propósito: já é o modelo por trás
+de `orchestrator-model`/`scheduling-model`/`escalate-model`, então
+reintroduziria viés de auto-avaliação pra qualquer conversa que passe
+por eles, e um juiz mais leve tende a discriminar pior nuance de tom/
+qualidade.
+
+`eval/judge.py` pede ao juiz um JSON com nota 1-5 **por dimensão**
+(`criteria_adherence`, `tone_and_persona`, `faithfulness` quando
+aplicável) mais justificativa -- nunca um score solto, pra que uma
+regressão detectada aponte pra ONDE a qualidade caiu.
+
+### Regressão: por que um arquivo local versionado, não só a UI
+
+`eval/regression.py::compare_to_baseline` compara a média combinada da
+run atual contra `eval/baseline.json` e falha o `asset_check` se a
+queda passar do threshold (0.4, numa escala 1-5). A UI do LangFuse
+mostra tendência pra inspeção humana; o `asset_check` precisa de algo
+que possa **falhar sozinho**, então a baseline vive num arquivo
+versionado em git (auditável via `git blame`/PR, igual qualquer outra
+mudança de comportamento esperado). A baseline só AVANÇA -- só é
+sobrescrita quando a run atual não regrediu, pra não deslizar pra baixo
+aos poucos através de várias pequenas quedas, cada uma dentro do
+threshold.
+
+**Verificado rodando o pipeline de ponta a ponta com as dependências
+externas (LiteLLM Proxy/OpenRouter, LangFuse) mockadas**: uma run limpa
+sem baseline anterior passa e grava a baseline; uma segunda run com
+scores do juiz deliberadamente ruins (simulando um prompt degradado)
+reprova o `asset_check` com a mensagem de regressão esperada, **e não**
+sobrescreve a baseline -- confirmando que a lógica de regressão
+detecta e é resiliente a uma degradação real, não só teórica.
+
+### Bug real encontrado rodando `make eval-run` de verdade
+
+A primeira versão de `eval/assets.py::_task` era uma função **síncrona**
+que chamava `asyncio.run(...)` internamente pra poder dar `await` em
+`run_conversation` (que precisa de `Runner.run_async`). Rodando contra
+o LiteLLM Proxy/LangFuse reais pela primeira vez, todos os 22 itens
+falharam com `asyncio.run() cannot be called from a running event
+loop`: `dataset.run_experiment(...)` já executa a task **dentro do
+próprio event loop do SDK** (é assim que ele consegue paralelizar itens
+via `max_concurrency`) -- uma task síncrona que tenta abrir outro loop
+por dentro colide com esse loop já rodando. A correção foi tornar
+`_task` uma `async def` de verdade e deixar o SDK dar o `await` nela
+diretamente, sem gerenciar o loop manualmente (o SDK aceita task
+functions síncronas OU assíncronas, ver `eval/langfuse_client.py`).
+
+Esse mesmo incidente expôs uma segunda lacuna: como todos os 22 itens
+falharam na task, `result.item_results` não trazia nenhuma `Evaluation`
+pra eles, e o código original simplesmente calculava a média sobre o
+que sobrava -- nesse caso, uma lista vazia (`StatisticsError`), mas com
+uma falha PARCIAL (alguns itens falhando, outros não) o mesmo código
+teria calculado uma média só sobre os itens que sobreviveram, sem
+avisar que faltou gente. `eval_run` agora detecta itens sem os dois
+scores esperados e falha alto, nomeando o(s) item(ns) afetado(s), em
+vez de reportar uma média silenciosamente parcial -- verificado
+forçando uma falha sintética de task num item.
+
+Rodando contra a OpenRouter de verdade (não mais mockada), uma terceira
+descoberta: TODA chamada de TODO agente (não só do eval) falhava com
+`402` -- `"requested up to 65536 tokens, but can only afford..."`. A
+OpenRouter pré-autoriza crédito com base no TETO de output do modelo
+(65536 no Sonnet, mais ainda no Opus usado pelo `judge-model`), não no
+uso real, e nenhum agente definia `max_tokens` explicitamente (ver
+`app/agents/config/models.py::get_model_for_role`) -- então toda
+request implicitamente pedia esse teto inteiro, e uma conta sem saldo
+pra cobrir o PIOR CASO era rejeitada antes de gerar uma palavra, mesmo
+a resposta de verdade precisando de uma fração disso. Corrigido
+definindo `max_tokens=2048` pra todos os agentes e `max_tokens=512`
+pro `judge-model` (que só produz um JSON pequeno) -- isso é uma
+mudança fora do escopo original da Parte 6 (toca `app/agents/config/`,
+usado por todas as partes), feita porque sem ela nenhuma chamada real
+de LLM funcionava, em `eval-run` ou em qualquer outro fluxo.
+
+Uma quarta descoberta, essa em `mcp_server/server.py` (Parte 4): um
+item do golden set falhou com `AttributeError: 'RustBindingsAPI' object
+has no attribute 'bindings'` seguido de `Could not connect to tenant
+default_tenant`. Causa raiz -- `eval/langfuse_client.py::run_experiment_sync`
+roda vários itens do golden set em paralelo (`max_concurrency`), e mais
+de um podia chamar `KnowledgeAgent` ao mesmo tempo através do MESMO
+processo MCP (`McpToolset` é um singleton por processo, ver
+`app/agents/knowledge.py`). O singleton lazy `_get_collection()` do
+servidor MCP fazia só `if _collection is None:` sem trava nenhuma --
+duas chamadas concorrentes podiam ver `None` ao mesmo tempo e as duas
+tentarem construir um `chromadb.PersistentClient` sobre o MESMO
+diretório simultaneamente, corrompendo a inicialização do binding Rust
+de uma das duas. Antes da Parte 6, nada neste projeto chamava essa tool
+de forma concorrente (uma conversa de cada vez em `test-live`/`adk
+web`), então essa condição de corrida nunca tinha disparado. Corrigido
+com double-checked locking (`threading.Lock`) em `_get_collection()` --
+verificado com um teste real de concorrência
+(`test_get_collection_singleton_init_is_thread_safe`, com 8 threads e
+um `time.sleep` alargando a janela de corrida): a versão sem trava
+reconstrói a coleção 8 de 8 vezes; com a trava, exatamente 1.
+
+```bash
+make eval-run   # roda o golden set completo -- custa chamadas reais de
+                # LLM (uma conversa por item + uma chamada ao
+                # judge-model por item), precisa do proxy E do LangFuse
+                # de pé (make proxy-up feito automaticamente; make
+                # langfuse-up precisa já estar rodando)
+make eval-dev   # abre a UI do Dagster pra rodar o pipeline manualmente
+```
+
+Depois de um `make eval-run` bem-sucedido, confirme na UI do LangFuse
+(`http://localhost:3000`): **Datasets** mostra `sdr-bot-golden-set` com
+22 itens, e cada item tem uma **run** com os `Scores`
+(`structural_pass`, `judge_criteria_adherence`, `judge_tone_and_persona`,
+`judge_overall`, `judge_faithfulness` quando aplicável) anexados ao
+trace correspondente. `eval/baseline.json` (gerado localmente, não
+versionado ainda no commit inicial desta parte) deveria ser commitado
+depois da primeira run bem-sucedida, pra virar a baseline conhecida do
+time.
+
+### Rodando os testes da Parte 6 isoladamente
+
+```bash
+uv run pytest tests/test_eval_golden_set.py tests/test_eval_judge.py \
+  tests/test_eval_regression.py tests/test_eval_runner.py -v
+```
+
+Camada 2 pura -- formato do golden set, parsing do JSON do juiz, lógica
+de comparação de regressão, `check_structural` com `session.state`
+sintético. Nenhum desses custa LLM nem precisa do LangFuse/proxy
+rodando, mesmo padrão rigoroso de `test_ingestion_chunking.py` (Parte 4).

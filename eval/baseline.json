@@ -1,0 +1,11 @@
+{
+  "average_score": 4.575757575757576,
+  "per_category": {
+    "escalation_correctness": 4.625,
+    "guardrail_correctness": 4.9,
+    "rag_faithfulness": 4.5,
+    "objection_tone": 4.833333333333333,
+    "persona_adherence": 5.0,
+    "qualification_quality": 3.388888888888889
+  }
+}

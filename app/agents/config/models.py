@@ -19,6 +19,19 @@ from google.adk.models.lite_llm import LiteLlm
 PROXY_URL = os.getenv("LITELLM_PROXY_URL", "http://localhost:4000")
 PROXY_KEY = os.getenv("LITELLM_PROXY_KEY", "sk-local-master-key")
 
+# Bug real encontrado rodando `make eval-run` (Parte 6) contra a
+# OpenRouter de verdade: nenhum agente definia `max_tokens`, então cada
+# request implicitamente pedia o teto de OUTPUT do modelo por trás do
+# alias (65536 pro Sonnet, mais ainda pro Opus) -- e a OpenRouter faz
+# pré-autorização de crédito baseada nesse teto, não no uso real. Com
+# saldo abaixo do necessário pra cobrir o PIOR CASO (65536+ tokens),
+# toda chamada era rejeitada com 402 antes mesmo de gerar uma palavra,
+# mesmo a resposta de verdade precisando de uma fração disso -- uma
+# resposta de chat de SDR nunca precisa de mais que uma fração deste
+# valor. Capar explicitamente evita o 402 independente do saldo restante
+# na conta.
+_DEFAULT_MAX_TOKENS = 2048
+
 # Aliases devem bater exatamente com "model_name" em litellm_proxy/config.yaml
 _ROLE_TO_ALIAS = {
     "orchestrator": "orchestrator-model",
@@ -57,4 +70,5 @@ def get_model_for_role(role: str) -> LiteLlm:
         model=f"litellm_proxy/{alias}",
         api_base=PROXY_URL,
         api_key=PROXY_KEY,
+        max_tokens=_DEFAULT_MAX_TOKENS,
     )

@@ -8,7 +8,8 @@ PROXY_READY_TIMEOUT := 30
 
 .PHONY: help sync proxy-up proxy-down proxy-restart proxy-logs proxy-status \
         web cli api test test-pii test-guardrails test-live lint clean \
-        ingest-dev langfuse-secrets langfuse-up langfuse-down phoenix-up
+        ingest-dev langfuse-secrets langfuse-up langfuse-down phoenix-up \
+        eval-run eval-dev
 
 help:
 	@echo "Comandos disponíveis:"
@@ -31,6 +32,10 @@ help:
 	@echo "  make test-live     - conversas douradas contra o LLM real (custa"
 	@echo "                       API, sobe o proxy sozinho) — NÃO entra em 'make test'"
 	@echo "  make ingest-dev    - abre a UI do Dagster pra rodar a ingestão do RAG"
+	@echo ""
+	@echo "  make eval-run      - roda o golden eval set completo (LLM-judge,"
+	@echo "                       custa API, precisa do proxy e do LangFuse de pé)"
+	@echo "  make eval-dev      - abre a UI do Dagster pra rodar o eval set (Parte 6)"
 	@echo ""
 	@echo "  make phoenix-up      - sobe o Phoenix local (tracing de agentes/RAG)"
 	@echo "  make langfuse-up     - sobe o LangFuse self-hospedado (custo/tokens)"
@@ -127,6 +132,29 @@ test-live: proxy-up
 
 ingest-dev:
 	uv run dagster dev -f ingestion/definitions.py
+
+# Parte 6: golden eval set + LLM-as-judge. Custa chamadas reais de LLM
+# (uma conversa por item do golden set, mais uma chamada ao judge-model
+# por item) -- por isso, como test-live, nunca roda em `make test`/CI.
+# Precisa do LangFuse (make langfuse-up) já de pé além do proxy -- os
+# scores são submetidos lá, não guardados só localmente.
+eval-run: proxy-up
+	@python3 -c "\
+from pathlib import Path; \
+import re, sys; \
+env_path = Path('.env'); \
+env_text = env_path.read_text() if env_path.exists() else ''; \
+values = dict(re.findall(r'^([A-Z_]+)=(.*)\$$', env_text, re.MULTILINE)); \
+missing = [k for k in ('LANGFUSE_PUBLIC_KEY', 'LANGFUSE_SECRET_KEY') if not values.get(k, '').strip()]; \
+sys.exit(0) if not missing else (\
+    print('ERRO: eval-run submete scores ao LangFuse -- faltam no .env:'), \
+    [print(f'  - {m}') for m in missing], \
+    print('Rode make langfuse-secrets, cole no .env, e make langfuse-up antes.'), \
+    sys.exit(1))"
+	uv run dagster asset materialize -f eval/definitions.py --select '*'
+
+eval-dev:
+	uv run dagster dev -f eval/definitions.py
 
 # Parte 5: gera os ~10 segredos do LangFuse de uma vez -- só IMPRIME,
 # nunca escreve no .env sozinho (mesmo espírito de PII_HASH_SALT:
