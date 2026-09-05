@@ -5,62 +5,95 @@ Existe principalmente para dar ao pipeline de CI/CD (e ao deploy na GCP)
 algo real para buildar e servir — o fluxo de teste interativo continua
 sendo app/main.py (CLI) enquanto o projeto evolui.
 
-TODO Parte 5: instrumentar esta camada com LangFuse (tracing por request,
-custo por conversa).
-TODO: trocar InMemorySessionService por um session service persistente
-(Redis, já previsto na arquitetura original) antes de qualquer uso real —
-sessão em memória não sobrevive a um restart/autoscaling do Cloud Run
-(cada revisão/instância teria seu próprio estado isolado).
+Handoff humano: /chat agora é "handoff-aware" -- checa
+STATE_HANDOFF_MODE antes de rodar o agente. Isso vale pra QUALQUER
+canal que chame /chat (widget web, whatsapp_service, futuro Telegram),
+não só WhatsApp -- a decisão bot-vs-humano mora aqui, num lugar só, não
+duplicada em cada adaptador de canal (ver app/handoff/delivery.py pro
+racional completo).
 """
 
 import os
 
-from fastapi import FastAPI
+from fastapi import FastAPI, HTTPException
+from google.adk.events import Event, EventActions
 from google.adk.runners import Runner
-from google.adk.sessions import InMemorySessionService
 from google.genai import types
 from pydantic import BaseModel
 
 from app.agents import root_agent  # importar isso já carrega o .env (ver app/config/__init__.py)
+from app.agents.session.state_schema import (
+    STATE_CHANNEL,
+    STATE_HANDOFF_CLAIMED_BY,
+    STATE_HANDOFF_MODE,
+)
+from app.handoff.delivery import get_delivery_adapter
+from app.session_service import get_or_create_session, get_session_service
 
 APP_NAME = os.getenv("SDR_APP_NAME", "sdr-bot")
 
 app = FastAPI(title="SDR Bot API", version="0.1.0")
 
-_session_service = InMemorySessionService()
+_session_service = get_session_service()
 _runner = Runner(agent=root_agent, app_name=APP_NAME, session_service=_session_service)
-_known_sessions: set[tuple[str, str]] = set()
 
 
 class ChatRequest(BaseModel):
     user_id: str
     session_id: str
     message: str
+    channel: str = "web"  # setado na criação da sessão, ignorado depois
 
 
 class ChatResponse(BaseModel):
     agent: str
     response: str
+    handoff_mode: bool = False  # True = sem resposta do bot, um humano vai responder
+
+
+class ClaimRequest(BaseModel):
+    claimed_by: str | None = None
+
+
+class ReplyRequest(BaseModel):
+    text: str
+
+
+class HistoryEvent(BaseModel):
+    author: str
+    text: str | None
+    timestamp: float
+
+
+class HistoryResponse(BaseModel):
+    session_id: str
+    handoff_mode: bool
+    events: list[HistoryEvent]
 
 
 @app.get("/health")
 async def health() -> dict:
-    # Usado pelo Cloud Run (liveness/readiness probe) e pelo job de test
-    # do CI/CD — não faz nenhuma chamada de LLM, só confirma que o
-    # processo subiu e a hierarquia de agentes foi construída sem erro.
     return {"status": "ok"}
 
 
 @app.post("/chat", response_model=ChatResponse)
 async def chat(payload: ChatRequest) -> ChatResponse:
-    session_key = (payload.user_id, payload.session_id)
-    if session_key not in _known_sessions:
-        await _session_service.create_session(
-            app_name=APP_NAME,
-            user_id=payload.user_id,
-            session_id=payload.session_id,
+    session = await get_or_create_session(
+        _session_service,
+        app_name=APP_NAME,
+        user_id=payload.user_id,
+        session_id=payload.session_id,
+        initial_state={STATE_CHANNEL: payload.channel},
+    )
+
+    if session.state.get(STATE_HANDOFF_MODE):
+        event = Event(
+            author="user",
+            content=types.Content(role="user", parts=[types.Part(text=payload.message)]),
+            invocation_id=f"handoff-{payload.session_id}",
         )
-        _known_sessions.add(session_key)
+        await _session_service.append_event(session, event)
+        return ChatResponse(agent="human", response="", handoff_mode=True)
 
     content = types.Content(role="user", parts=[types.Part(text=payload.message)])
 
@@ -77,3 +110,108 @@ async def chat(payload: ChatRequest) -> ChatResponse:
             response_text = event.content.parts[0].text
 
     return ChatResponse(agent=agent_name, response=response_text)
+
+
+@app.post("/handoff/{user_id}/{session_id}/claim")
+async def claim_handoff(user_id: str, session_id: str, payload: ClaimRequest) -> dict:
+    """Um humano assume a conversa -- a partir daqui, /chat pra essa
+    sessão para de rodar o agente. Idempotente: chamar de novo só
+    atualiza claimed_by, não é erro.
+
+    Mutação de estado precisa ir via EventActions.state_delta -- mudar
+    session.state diretamente e chamar append_event() com um Event
+    sem state_delta NÃO persiste (confirmado rodando de verdade: o
+    dict local muda, mas nada chega no banco)."""
+    session = await _session_service.get_session(
+        app_name=APP_NAME, user_id=user_id, session_id=session_id
+    )
+    if session is None:
+        raise HTTPException(status_code=404, detail="Sessão não encontrada")
+
+    event = Event(
+        author="system",
+        actions=EventActions(
+            state_delta={
+                STATE_HANDOFF_MODE: True,
+                STATE_HANDOFF_CLAIMED_BY: payload.claimed_by,
+            }
+        ),
+        invocation_id=f"handoff-claim-{session_id}",
+    )
+    await _session_service.append_event(session, event)
+
+    return {"status": "claimed", "session_id": session_id, "claimed_by": payload.claimed_by}
+
+
+@app.post("/handoff/{user_id}/{session_id}/reply")
+async def handoff_reply(user_id: str, session_id: str, payload: ReplyRequest) -> dict:
+    """Um humano responde -- registra a mensagem na sessão E entrega
+    pro canal de origem do lead (web, whatsapp, etc)."""
+    session = await _session_service.get_session(
+        app_name=APP_NAME, user_id=user_id, session_id=session_id
+    )
+    if session is None:
+        raise HTTPException(status_code=404, detail="Sessão não encontrada")
+    if not session.state.get(STATE_HANDOFF_MODE):
+        raise HTTPException(
+            status_code=409,
+            detail="Sessão não está em modo handoff -- chame /claim primeiro",
+        )
+
+    event = Event(
+        author="human",
+        content=types.Content(role="model", parts=[types.Part(text=payload.text)]),
+        invocation_id=f"handoff-reply-{session_id}",
+    )
+    await _session_service.append_event(session, event)
+
+    channel = session.state.get(STATE_CHANNEL)
+    delivery = get_delivery_adapter(channel)
+    await delivery.deliver(user_id=user_id, session_id=session_id, text=payload.text)
+
+    return {"status": "delivered", "channel": channel}
+
+
+def _extract_event_text(event: Event) -> str | None:
+    """Extrai um texto legível de um evento -- nem todo evento tem
+    .text direto: tool calls têm function_call, tool results têm
+    function_response, e eventos de sistema (ex: o que claim_handoff
+    gera, só com state_delta) podem não ter content nenhum."""
+    if event.content is None or not event.content.parts:
+        return None
+
+    texts = []
+    for part in event.content.parts:
+        if part.text:
+            texts.append(part.text)
+        elif part.function_call:
+            texts.append(f"[chamou {part.function_call.name}]")
+        elif part.function_response:
+            texts.append(f"[resposta de {part.function_response.name}]")
+
+    return " ".join(texts) if texts else None
+
+
+@app.get("/handoff/{user_id}/{session_id}/history", response_model=HistoryResponse)
+async def get_history(user_id: str, session_id: str) -> HistoryResponse:
+    """Histórico completo de uma conversa -- pré-requisito pra QUALQUER
+    fluxo de handoff de verdade: um humano precisa ver o que o lead já
+    disse antes de decidir se vale a pena assumir (/claim), e um
+    dashboard futuro precisa disso pra renderizar a conversa inteira,
+    não só as mensagens a partir do momento em que foi aberto."""
+    session = await _session_service.get_session(
+        app_name=APP_NAME, user_id=user_id, session_id=session_id
+    )
+    if session is None:
+        raise HTTPException(status_code=404, detail="Sessão não encontrada")
+
+    events = [
+        HistoryEvent(author=e.author, text=_extract_event_text(e), timestamp=e.timestamp)
+        for e in session.events
+    ]
+
+    return HistoryResponse(
+        session_id=session_id,
+        handoff_mode=bool(session.state.get(STATE_HANDOFF_MODE)),
+        events=events,
+    )

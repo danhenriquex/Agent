@@ -46,3 +46,25 @@ STATE_ESCALATED = "escalated"
 # debug e pra futuro dashboard de observabilidade (Parte 5).
 STATE_PII_TOKEN_MAP = "pii_token_map"        # token -> valor original; NUNCA vai ao LLM nem a logs
 STATE_GUARDRAIL_FLAGS = "guardrail_flags"
+
+# --- Handoff humano (assunção humana da conversa, ver app/handoff/) ---
+
+# True quando um atendente humano assumiu a conversa (POST
+# /handoff/{user_id}/{session_id}/claim). Enquanto True, POST /chat NÃO
+# invoca o Runner/LLM -- a mensagem do lead só é anexada ao histórico da
+# sessão (ver app/api.py), esperando resposta manual via POST
+# /handoff/.../reply.
+STATE_HANDOFF_MODE = "handoff_mode"
+
+# Identificador do atendente humano que fez o claim (string livre --
+# e-mail, ID de usuário do CRM, etc). Ausente/None quando handoff_mode é
+# False.
+STATE_HANDOFF_CLAIMED_BY = "handoff_claimed_by"
+
+# Canal de origem da conversa ("web" | "whatsapp", ver
+# app/handoff/delivery.py:get_delivery_adapter). Setado uma vez na
+# criação da sessão (ChatRequest.channel, default "web") e nunca
+# sobrescrito depois -- uma conversa não deveria trocar de canal no
+# meio. Usado pelo endpoint de reply pra saber como entregar a resposta
+# do atendente de volta pro lead.
+STATE_CHANNEL = "channel"

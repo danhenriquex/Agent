@@ -15,3 +15,8 @@ mcp_server/chroma_data/
 .tmp_dagster_home*/
 
 scripts/*
+
+# SQLite local (dev) da sessão persistente (app/session_service.py) --
+# nunca commitar dados de sessão; produção usa Postgres via SESSION_DB_URL.
+sdr_bot_sessions.db
+sdr_bot_sessions.db-*

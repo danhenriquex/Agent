@@ -9,16 +9,20 @@ Uso:
            cd litellm_proxy && docker compose up
     3. Na raiz do projeto:
            python -m app.main
+
+Sessão persiste em disco (SQLite por padrão, ver app/session_service.py)
+-- rodar de novo com o mesmo SESSION_ID continua a mesma conversa em vez
+de começar do zero.
 """
 
 import asyncio
 import os
 
 from google.adk.runners import Runner
-from google.adk.sessions import InMemorySessionService
 from google.genai import types
 
 from app.agents import root_agent  # importar isso já carrega o .env (ver app/config/__init__.py)
+from app.session_service import get_or_create_session, get_session_service
 
 APP_NAME = os.getenv("SDR_APP_NAME", "sdr-bot")
 USER_ID = "demo_lead"
@@ -42,8 +46,9 @@ async def send_message(runner: Runner, text: str) -> None:
 
 
 async def main() -> None:
-    session_service = InMemorySessionService()
-    await session_service.create_session(
+    session_service = get_session_service()
+    await get_or_create_session(
+        session_service,
         app_name=APP_NAME,
         user_id=USER_ID,
         session_id=SESSION_ID,
