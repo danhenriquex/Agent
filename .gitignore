@@ -28,3 +28,4 @@ sdr_bot_sessions.db-*
 terraform/.terraform/
 terraform/*.tfstate*
 terraform/terraform.tfvars
+app/agents/.adk/session.db
