@@ -61,7 +61,7 @@ STATE_HANDOFF_MODE = "handoff_mode"
 # False.
 STATE_HANDOFF_CLAIMED_BY = "handoff_claimed_by"
 
-# Canal de origem da conversa ("web" | "whatsapp", ver
+# Canal de origem da conversa ("web" | "whatsapp" | "telegram", ver
 # app/handoff/delivery.py:get_delivery_adapter). Setado uma vez na
 # criação da sessão (ChatRequest.channel, default "web") e nunca
 # sobrescrito depois -- uma conversa não deveria trocar de canal no

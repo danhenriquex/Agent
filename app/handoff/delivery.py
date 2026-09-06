@@ -46,6 +46,23 @@ class WhatsAppDeliveryAdapter(MessageDeliveryPort):
             response.raise_for_status()
 
 
+class TelegramDeliveryAdapter(MessageDeliveryPort):
+    """Chama o telegram_service (processo separado) -- mesmo padrão do
+    WhatsAppDeliveryAdapter. Nenhum conhecimento da API do Telegram
+    mora aqui, só um contrato HTTP simples."""
+
+    def __init__(self, base_url: str):
+        self._base_url = base_url.rstrip("/")
+
+    async def deliver(self, *, user_id: str, session_id: str, text: str) -> None:
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            response = await client.post(
+                f"{self._base_url}/send",
+                json={"user_id": user_id, "session_id": session_id, "text": text},
+            )
+            response.raise_for_status()
+
+
 def get_delivery_adapter(channel: str | None) -> MessageDeliveryPort:
     if channel == "whatsapp":
         whatsapp_url = os.environ.get("WHATSAPP_SERVICE_URL")
@@ -55,4 +72,12 @@ def get_delivery_adapter(channel: str | None) -> MessageDeliveryPort:
                 "entregar respostas de handoff no canal 'whatsapp'."
             )
         return WhatsAppDeliveryAdapter(whatsapp_url)
+    if channel == "telegram":
+        telegram_url = os.environ.get("TELEGRAM_SERVICE_URL")
+        if not telegram_url:
+            raise RuntimeError(
+                "TELEGRAM_SERVICE_URL não configurado -- necessário pra "
+                "entregar respostas de handoff no canal 'telegram'."
+            )
+        return TelegramDeliveryAdapter(telegram_url)
     return NoOpDeliveryAdapter()

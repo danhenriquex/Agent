@@ -16,7 +16,7 @@ PROXY_READY_TIMEOUT := 30
 SESSION_DB_URL ?= sqlite+aiosqlite:///./sdr_bot_sessions.db
 
 .PHONY: help sync proxy-up proxy-down proxy-restart proxy-logs proxy-status \
-        web cli api test test-pii test-guardrails test-live lint clean \
+        web cli api telegram-up test test-pii test-guardrails test-live lint clean \
         ingest-dev langfuse-secrets langfuse-up langfuse-down phoenix-up \
         eval-run eval-dev
 
@@ -28,6 +28,7 @@ help:
 	@echo "  make web           - sobe o proxy (se preciso) e abre a UI do adk web (porta 8000)"
 	@echo "  make cli           - sobe o proxy (se preciso) e roda o bot via CLI"
 	@echo "  make api           - sobe o proxy (se preciso) e roda a API FastAPI em localhost:8001"
+	@echo "  make telegram-up   - roda o telegram_service em localhost:8200 (deps próprias)"
 	@echo ""
 	@echo "  make proxy-up      - sobe o LiteLLM Proxy e espera ele responder de verdade"
 	@echo "  make proxy-down    - derruba o LiteLLM Proxy"
@@ -123,6 +124,13 @@ cli: proxy-up
 
 api: proxy-up
 	uv run uvicorn app.api:app --reload --port 8001
+
+# telegram_service tem deps próprias e mínimas (fastapi/uvicorn/httpx),
+# separadas do pyproject.toml raiz -- por isso roda de dentro do próprio
+# diretório, com seu próprio venv isolado (uv resolve a partir do
+# pyproject.toml mais próximo do cwd).
+telegram-up:
+	cd telegram_service && uv run uvicorn main:app --port 8200 --reload
 
 test:
 	uv run pytest -v
