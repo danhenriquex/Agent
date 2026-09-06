@@ -183,8 +183,11 @@ build_and_push:
     # docker.io sozinho não basta: nesta base Debian esse pacote só traz
     # dockerd/docker-proxy/docker-init (confirmado via `dpkg -L docker.io`
     # rodando a própria imagem google/cloud-sdk:slim) -- o binário
-    # `docker` em si está no pacote docker-cli, separado.
-    - apt-get update && apt-get install -y --no-install-recommends docker-cli
+    # `docker` em si está no pacote docker-cli, separado. E a partir do
+    # docker-cli 23+, `docker build` é só um alias pra `docker buildx
+    # build` -- sem o plugin docker-buildx instalado, DOCKER_BUILDKIT=1
+    # não basta (confirmado: falha com "buildx component is missing").
+    - apt-get update && apt-get install -y --no-install-recommends docker-cli docker-buildx
     - *gcp_auth
     - gcloud auth configure-docker "${AR_REGION}-docker.pkg.dev" --quiet
   script:
