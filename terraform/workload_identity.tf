@@ -66,13 +66,21 @@ resource "google_project_iam_member" "deploy_sa_secret_accessor" {
   member  = "serviceAccount:${google_service_account.deploy_sa.email}"
 }
 
-# NÃO é iam.serviceAccountUser a nível de projeto: escopado só à SA de
-# runtime do sdr-bot-api (definida em cloud_sql.tf), que é a única que o
-# deploy precisa impersonar via `--service-account=`. Um binding
+# NÃO é iam.serviceAccountUser a nível de projeto: escopado só às duas SAs
+# que o deploy de fato impersona -- a de runtime do sdr-bot-api (definida
+# em cloud_sql.tf, via --service-account=) e a default do Compute Engine
+# (litellm-proxy/telegram-service rodam nela, sem --service-account=
+# explícito -- ver secrets.tf > compute_default_reads_*). Um binding
 # project-wide deixaria o deployer agir-como QUALQUER SA atual ou futura
 # do projeto, sem nenhum ganho correspondente.
 resource "google_service_account_iam_member" "deploy_sa_can_actas_runtime_sa" {
   service_account_id = google_service_account.sdr_bot_api_runtime.name
+  role                = "roles/iam.serviceAccountUser"
+  member              = "serviceAccount:${google_service_account.deploy_sa.email}"
+}
+
+resource "google_service_account_iam_member" "deploy_sa_can_actas_compute_default" {
+  service_account_id = "projects/${var.gcp_project_id}/serviceAccounts/${local.compute_default_sa}"
   role                = "roles/iam.serviceAccountUser"
   member              = "serviceAccount:${google_service_account.deploy_sa.email}"
 }
