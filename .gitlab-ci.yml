@@ -330,6 +330,15 @@ container_scanning_auth:
 container_scanning:
   stage: deploy
   needs: ["build_and_push", "container_scanning_auth"]
+  # O template oficial seta `dependencies: []` no job (proposital: com
+  # GIT_STRATEGY: none, ele não espera herdar artifact nenhum por
+  # padrão) -- isso sobrevive ao merge porque não redefinimos
+  # `dependencies` aqui, e SUPRIME o download do dotenv mesmo com
+  # `needs` acima (confirmado: log do job não mostra nenhuma etapa
+  # "Downloading artifacts", e o Trivy chega sem credencial nenhuma).
+  # Precisa sobrescrever explicitamente pra o dotenv de
+  # container_scanning_auth (CS_REGISTRY_USER/PASSWORD) realmente chegar.
+  dependencies: ["container_scanning_auth"]
   # Sem isso o job herda as rules default do template, que rodam na
   # branch padrão do repositório (develop, não main -- ver comentário no
   # topo deste arquivo) onde build_and_push nem existe no pipeline
