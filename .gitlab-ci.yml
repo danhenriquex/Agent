@@ -156,6 +156,9 @@ build_and_push:
     GCP_ID_TOKEN:
       aud: "https://iam.googleapis.com/projects/${GCP_PROJECT_NUMBER}/locations/global/workloadIdentityPools/${WIF_POOL_ID}/providers/${WIF_PROVIDER_ID}"
   before_script:
+    # google/cloud-sdk:slim traz gcloud mas não o binário docker -- só o
+    # daemon dind (serviço) está disponível, não o CLI pra falar com ele.
+    - apt-get update && apt-get install -y --no-install-recommends docker.io
     - *gcp_auth
     - gcloud auth configure-docker "${AR_REGION}-docker.pkg.dev" --quiet
   script:
