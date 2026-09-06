@@ -20,3 +20,11 @@ scripts/*
 # nunca commitar dados de sessão; produção usa Postgres via SESSION_DB_URL.
 sdr_bot_sessions.db
 sdr_bot_sessions.db-*
+
+# Terraform (Parte 7): state e vars locais nunca vão pro git -- o state
+# guarda IDs de recurso/emails de SA (não segredo, mas não deveria vazar
+# à toa), e terraform.tfvars real não precisa ser versionado sobre o
+# .example.
+terraform/.terraform/
+terraform/*.tfstate*
+terraform/terraform.tfvars

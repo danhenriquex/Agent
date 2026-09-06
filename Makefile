@@ -15,7 +15,7 @@ PROXY_READY_TIMEOUT := 30
 # precisa estar setado como "agents" pra bater com o que a API espera.
 SESSION_DB_URL ?= sqlite+aiosqlite:///./sdr_bot_sessions.db
 
-.PHONY: help sync proxy-up proxy-down proxy-restart proxy-logs proxy-status \
+.PHONY: help sync gcloud-install proxy-up proxy-down proxy-restart proxy-logs proxy-status \
         web cli api telegram-up test test-pii test-guardrails test-live lint clean \
         ingest-dev langfuse-secrets langfuse-up langfuse-down phoenix-up \
         eval-run eval-dev
@@ -24,6 +24,9 @@ help:
 	@echo "Comandos disponíveis:"
 	@echo ""
 	@echo "  make sync          - uv sync (instala/atualiza dependências)"
+	@echo "  make gcloud-install - baixa e instala o Google Cloud CLI em ~/google-cloud-sdk"
+	@echo "                       (não dá pra ser dependência do uv/pyproject.toml --"
+	@echo "                       gcloud é um binário nativo, não é publicado no PyPI)"
 	@echo ""
 	@echo "  make web           - sobe o proxy (se preciso) e abre a UI do adk web (porta 8000)"
 	@echo "  make cli           - sobe o proxy (se preciso) e roda o bot via CLI"
@@ -56,6 +59,19 @@ help:
 
 sync:
 	uv sync
+
+# gcloud não é um pacote PyPI -- é um bundle de binário nativo distribuído só
+# pelo instalador/apt repo/tarball do Google, então uv/pyproject.toml não
+# conseguem instalá-lo. Esse alvo só empacota o tarball install pra ficar um
+# comando só.
+gcloud-install:
+	@if [ -d "$$HOME/google-cloud-sdk" ]; then \
+		echo "google-cloud-sdk já existe em $$HOME/google-cloud-sdk, rodando o instalador mesmo assim (idempotente)"; \
+	fi
+	curl -o /tmp/google-cloud-cli-linux-x86_64.tar.gz https://dl.google.com/dl/cloudsdk/channels/rapid/downloads/google-cloud-cli-linux-x86_64.tar.gz
+	tar -xf /tmp/google-cloud-cli-linux-x86_64.tar.gz -C $$HOME
+	$$HOME/google-cloud-sdk/install.sh --quiet
+	@echo "Abra um novo terminal (ou 'source ~/.bashrc') e rode: gcloud auth login"
 
 # Sobe o proxy e espera de verdade ele responder antes de liberar o
 # próximo comando -- isso existe especificamente porque "docker compose

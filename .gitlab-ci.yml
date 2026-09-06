@@ -42,6 +42,15 @@
 #   WIF_POOL_ID          - ID do Workload Identity Pool
 #   WIF_PROVIDER_ID      - ID do Provider dentro do pool
 #   WIF_SERVICE_ACCOUNT  - email da service account impersonada
+#   CLOUD_SQL_CONNECTION_NAME - PROJETO:REGIAO:INSTANCIA (sai de
+#                               `terraform output`), usada por
+#                               deploy_sdr_bot_api pra montar
+#                               --add-cloudsql-instances
+#
+# Todas essas variáveis (e a infra que elas apontam: Artifact Registry, WIF,
+# Secret Manager, Cloud SQL) são provisionadas via Terraform -- ver
+# terraform/ e README.md > "Deploy via Terraform". `terraform output` gera
+# exatamente os valores a colar aqui.
 #
 # Autenticação: usamos Workload Identity Federation (OIDC), não uma chave
 # JSON de service account estática — os tokens são de curta duração e
@@ -59,6 +68,7 @@ stages:
 variables:
   API_IMAGE_TAG: "${AR_REGION}-docker.pkg.dev/${GCP_PROJECT_ID}/${AR_REPOSITORY}/sdr-bot-api:${CI_COMMIT_SHORT_SHA}"
   PROXY_IMAGE_TAG: "${AR_REGION}-docker.pkg.dev/${GCP_PROJECT_ID}/${AR_REPOSITORY}/litellm-proxy:${CI_COMMIT_SHORT_SHA}"
+  TELEGRAM_IMAGE_TAG: "${AR_REGION}-docker.pkg.dev/${GCP_PROJECT_ID}/${AR_REPOSITORY}/telegram-service:${CI_COMMIT_SHORT_SHA}"
 
 # Bloco reutilizado pelos jobs que precisam autenticar na GCP via WIF.
 # Troca o ID token do GitLab por uma credencial federada de curta duração,
@@ -124,6 +134,7 @@ docker_build_check:
     - docker system prune -af || true
     - docker build -t sdr-bot-api:ci-check .
     - docker build -t litellm-proxy:ci-check ./litellm_proxy
+    - docker build -t telegram-service:ci-check ./telegram_service
   rules:
     - if: $CI_PIPELINE_SOURCE == "merge_request_event"
     - if: $CI_COMMIT_BRANCH == "develop"
@@ -152,6 +163,8 @@ build_and_push:
     - docker push "${API_IMAGE_TAG}"
     - docker build -t "${PROXY_IMAGE_TAG}" ./litellm_proxy
     - docker push "${PROXY_IMAGE_TAG}"
+    - docker build -t "${TELEGRAM_IMAGE_TAG}" ./telegram_service
+    - docker push "${TELEGRAM_IMAGE_TAG}"
   rules:
     - if: '$GCP_PROJECT_ID && $CI_COMMIT_BRANCH == "main"'
 
@@ -206,11 +219,46 @@ deploy_sdr_bot_api:
       --platform=managed
       --port=8080
       --allow-unauthenticated
+      --service-account="sdr-bot-api-runtime@${GCP_PROJECT_ID}.iam.gserviceaccount.com"
+      --add-cloudsql-instances="${CLOUD_SQL_CONNECTION_NAME}"
       --set-env-vars="LITELLM_PROXY_URL=${PROXY_URL},SDR_APP_NAME=sdr-bot"
-      --set-secrets="LITELLM_PROXY_KEY=litellm-proxy-key:latest"
+      --set-secrets="LITELLM_PROXY_KEY=litellm-proxy-key:latest,SESSION_DB_URL=session-db-url:latest"
   environment:
     name: production/sdr-bot-api
   needs: ["deploy_litellm_proxy"]
+  rules:
+    - if: '$GCP_PROJECT_ID && $CI_COMMIT_BRANCH == "main"'
+      when: manual
+
+deploy_telegram_service:
+  stage: deploy
+  image: google/cloud-sdk:slim
+  id_tokens:
+    GCP_ID_TOKEN:
+      aud: "https://iam.googleapis.com/projects/${GCP_PROJECT_NUMBER}/locations/global/workloadIdentityPools/${WIF_POOL_ID}/providers/${WIF_PROVIDER_ID}"
+  before_script:
+    - *gcp_auth
+  script:
+    - >
+      SDR_BOT_API_URL=$(gcloud run services describe sdr-bot-api
+      --region="${GCP_REGION}" --format='value(status.url)')
+    - >
+      gcloud run deploy telegram-service
+      --image="${TELEGRAM_IMAGE_TAG}"
+      --region="${GCP_REGION}"
+      --platform=managed
+      --port=8200
+      --allow-unauthenticated
+      --set-env-vars="SDR_BOT_API_URL=${SDR_BOT_API_URL}"
+      --set-secrets="TELEGRAM_BOT_TOKEN=telegram-bot-token:latest,TELEGRAM_WEBHOOK_SECRET=telegram-webhook-secret:latest"
+  environment:
+    name: production/telegram-service
+  # needs sdr-bot-api (não build_and_push): a URL do sdr-bot-api é
+  # descoberta dinamicamente via `gcloud run services describe`, mesmo
+  # padrão que deploy_sdr_bot_api já usa pra descobrir litellm-proxy --
+  # então este job só pode rodar depois que sdr-bot-api já existe como
+  # serviço Cloud Run.
+  needs: ["deploy_sdr_bot_api"]
   rules:
     - if: '$GCP_PROJECT_ID && $CI_COMMIT_BRANCH == "main"'
       when: manual
