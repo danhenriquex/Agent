@@ -168,7 +168,11 @@ build_and_push:
   before_script:
     # google/cloud-sdk:slim traz gcloud mas não o binário docker -- só o
     # daemon dind (serviço) está disponível, não o CLI pra falar com ele.
-    - apt-get update && apt-get install -y --no-install-recommends docker.io
+    # docker.io sozinho não basta: nesta base Debian esse pacote só traz
+    # dockerd/docker-proxy/docker-init (confirmado via `dpkg -L docker.io`
+    # rodando a própria imagem google/cloud-sdk:slim) -- o binário
+    # `docker` em si está no pacote docker-cli, separado.
+    - apt-get update && apt-get install -y --no-install-recommends docker-cli
     - *gcp_auth
     - gcloud auth configure-docker "${AR_REGION}-docker.pkg.dev" --quiet
   script:
