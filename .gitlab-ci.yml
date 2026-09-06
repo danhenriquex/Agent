@@ -79,6 +79,10 @@ variables:
   # compartilhado entre job e serviço.
   DOCKER_HOST: "tcp://docker:2375"
   DOCKER_TLS_CERTDIR: ""
+  # Dockerfiles usam --mount=type=cache/bind (sintaxe BuildKit-only) --
+  # sem isso o CLI cai no builder legado e falha com "the --mount option
+  # requires BuildKit".
+  DOCKER_BUILDKIT: "1"
   API_IMAGE_TAG: "${AR_REGION}-docker.pkg.dev/${GCP_PROJECT_ID}/${AR_REPOSITORY}/sdr-bot-api:${CI_COMMIT_SHORT_SHA}"
   PROXY_IMAGE_TAG: "${AR_REGION}-docker.pkg.dev/${GCP_PROJECT_ID}/${AR_REPOSITORY}/litellm-proxy:${CI_COMMIT_SHORT_SHA}"
   TELEGRAM_IMAGE_TAG: "${AR_REGION}-docker.pkg.dev/${GCP_PROJECT_ID}/${AR_REPOSITORY}/telegram-service:${CI_COMMIT_SHORT_SHA}"
