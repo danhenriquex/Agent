@@ -1,0 +1,24 @@
+# Copie este arquivo para terraform.tfvars e preencha com os valores reais
+# do seu projeto GCP e do seu repositório GitLab. terraform.tfvars (o real)
+# não deve ser commitado -- não tem segredo nenhum, mas não há motivo pra
+# versionar o arquivo real em vez do .example.
+
+gcp_project_id     = "meu-projeto-gcp-123"
+gcp_project_number = "123456789012" # gcloud projects describe meu-projeto-gcp-123 --format='value(projectNumber)'
+gcp_region         = "us-central1"
+ar_region          = "us-central1"
+ar_repository      = "sdr-bot-repo"
+
+wif_pool_id     = "gitlab-pool"
+wif_provider_id = "gitlab-provider"
+
+# assertion.project_path do GitLab (namespace/repo), não o nome/ID do
+# projeto GCP -- é o que restringe o WIF a só este repositório.
+gitlab_project_path = "seu-namespace/agents"
+
+deploy_sa_account_id              = "gitlab-ci-deployer"
+sdr_bot_api_runtime_sa_account_id = "sdr-bot-api-runtime"
+
+cloud_sql_instance_name = "sdr-bot-sessions-db"
+cloud_sql_tier          = "db-f1-micro" # o mais barato -- ver aviso de custo no README antes de mudar
+cloud_sql_database_name = "sdr_bot"

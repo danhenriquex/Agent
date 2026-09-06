@@ -350,11 +350,162 @@ echo -n "sua-master-key-do-proxy" | gcloud secrets create litellm-proxy-key --da
 | `WIF_POOL_ID` | `gitlab-pool` |
 | `WIF_PROVIDER_ID` | `gitlab-provider` |
 | `WIF_SERVICE_ACCOUNT` | `gitlab-ci-deployer@<project-id>.iam.gserviceaccount.com` |
+| `CLOUD_SQL_CONNECTION_NAME` | `PROJETO:REGIAO:INSTANCIA` (sai de `terraform output`) |
 
 Nenhuma chave JSON de service account é armazenada em lugar nenhum — a
 autenticação usa o ID token OIDC que o próprio GitLab emite por job
 (`id_tokens` no `.gitlab-ci.yml`), trocado por uma credencial federada de
 curta duração via `gcloud iam workload-identity-pools create-cred-config`.
+
+### Deploy via Terraform
+
+O setup manual acima (`gcloud` passo a passo) funciona, mas não é
+idempotente nem versionado — rodar os mesmos comandos duas vezes por
+engano, ou esquecer um passo num projeto GCP novo, é o tipo de drift que só
+aparece três meses depois, num incidente. `terraform/` provisiona a mesma
+infraestrutura (e mais: Cloud SQL e os secrets do `telegram_service`, que o
+script manual nunca cobriu) de forma declarativa — o script acima vira,
+efetivamente, "o que o Terraform faz por baixo dos panos", não mais o
+procedimento a seguir manualmente.
+
+**Divisão de responsabilidade**: o Terraform provisiona a infraestrutura
+fundacional (APIs, Artifact Registry, WIF, secrets vazios, Cloud SQL, IAM).
+O pipeline de CI continua fazendo o deploy em si (`gcloud run deploy`, já
+idempotente — cria ou atualiza a revisão). Os três serviços Cloud Run
+(`litellm-proxy`, `sdr-bot-api`, `telegram-service`) **não** são recursos
+Terraform — recriá-los ali geraria conflito de posse com os deploys
+imperativos do CI.
+
+#### Pré-requisitos
+
+- Projeto GCP com billing ativo (crie um novo se for só testar isto —
+  ver aviso de custo abaixo antes de deixar rodando).
+- `gcloud auth application-default login` (Terraform usa essas
+  credenciais para provisionar).
+- Permissão de Owner/Editor no projeto (é operação de bootstrap, feita
+  uma vez só, por isso não vale a pena desenhar um papel mais restrito
+  só para isto).
+
+#### Estrutura de `terraform/`
+
+```
+terraform/
+├── main.tf               # provider, APIs habilitadas
+├── artifact_registry.tf  # repositório Docker
+├── secrets.tf            # openrouter-api-key, litellm-proxy-key, session-db-url (recursos vazios)
+├── workload_identity.tf  # pool + provider OIDC do GitLab, SA de deploy, bindings
+├── cloud_sql.tf          # instância Postgres + SA de runtime do sdr-bot-api
+├── telegram.tf           # telegram-bot-token, telegram-webhook-secret
+├── variables.tf
+├── outputs.tf             # os 9 valores que viram CI/CD variables
+└── terraform.tfvars.example
+```
+
+#### 1. Configurar variáveis e aplicar
+
+```bash
+cd terraform
+cp terraform.tfvars.example terraform.tfvars
+# preencha gcp_project_id, gcp_project_number e gitlab_project_path
+# (terraform.tfvars não deve ser commitado -- já está no .gitignore)
+
+terraform init
+terraform apply
+```
+
+#### 2. Popular os 5 secrets manualmente (nunca via Terraform)
+
+Os recursos `google_secret_manager_secret` ficam vazios de propósito — os
+valores reais nunca entram em `.tf` nem no state:
+
+```bash
+echo -n "sua-chave-openrouter"      | gcloud secrets versions add openrouter-api-key     --data-file=-
+echo -n "sua-master-key-do-proxy"   | gcloud secrets versions add litellm-proxy-key       --data-file=-
+echo -n "token-do-bot-do-telegram"  | gcloud secrets versions add telegram-bot-token       --data-file=-
+echo -n "segredo-do-webhook"        | gcloud secrets versions add telegram-webhook-secret --data-file=-
+```
+
+#### 3. Cloud SQL: criar usuário e popular `session-db-url`
+
+O Terraform cria a instância e o banco (`sdr_bot`), mas **não** o
+usuário/senha — isso é criado à mão pelo mesmo motivo dos outros secrets
+(nenhuma credencial no state):
+
+```bash
+gcloud sql users create sdr_bot_app --instance=sdr-bot-sessions-db --password="<senha-gerada>"
+
+CONN=$(terraform output -raw CLOUD_SQL_CONNECTION_NAME)
+echo -n "postgresql+asyncpg://sdr_bot_app:<senha-gerada>@/sdr_bot?host=/cloudsql/${CONN}" \
+  | gcloud secrets versions add session-db-url --data-file=-
+```
+
+> **Aviso de custo**: dos quatro recursos com custo fixo deste stack
+> (Artifact Registry, Secret Manager, Cloud Run e Cloud SQL), o **Cloud
+> SQL é de longe o mais caro** — mesmo o tier mais barato (`db-f1-micro`)
+> fica em torno de US$9-10/mês só de instância, mais ~US$1,70/mês de 10GB
+> de disco, cobrado o mês inteiro **mesmo sem nenhum tráfego** (Cloud Run,
+> em contraste, só cobra por uso real). Para um projeto de portfólio que
+> não fica no ar o tempo todo, considere `terraform destroy
+> -target=google_sql_database_instance.sessions_db` entre demonstrações, e
+> recriar (+ recriar o usuário e repopular `session-db-url`) quando for
+> mostrar de novo.
+
+#### 4. Copiar os outputs para as CI/CD Variables do GitLab
+
+```bash
+terraform output
+```
+
+Cole cada um dos 9 valores em Settings > CI/CD > Variables (tabela acima,
+já atualizada com `CLOUD_SQL_CONNECTION_NAME`).
+
+#### 5. Rodar o pipeline
+
+Push para `main`, depois disparar manualmente, em ordem, os jobs
+`when: manual`: `deploy_litellm_proxy` → `deploy_sdr_bot_api` →
+`deploy_telegram_service`.
+
+#### 6. Verificação pós-deploy
+
+```bash
+API_URL=$(gcloud run services describe sdr-bot-api      --region="$GCP_REGION" --format='value(status.url)')
+TG_URL=$(gcloud run services describe telegram-service   --region="$GCP_REGION" --format='value(status.url)')
+curl -sf "$API_URL/health"
+curl -sf "$TG_URL/health"
+
+# Persistência de sessão: mesma session_id, duas chamadas sequenciais --
+# prova de que o Cloud SQL está de fato conectado, não só provisionado.
+curl -s -X POST "$API_URL/chat" -H 'content-type: application/json' \
+  -d '{"user_id":"test:1","session_id":"sess-A","message":"meu nome é Danilo","channel":"web"}'
+curl -s -X POST "$API_URL/chat" -H 'content-type: application/json' \
+  -d '{"user_id":"test:1","session_id":"sess-A","message":"qual é o meu nome?","channel":"web"}'
+# esperado: a segunda resposta referencia "Danilo"
+
+# Telegram real: registrar o webhook apontando pra URL pública do Cloud Run
+curl -s "https://api.telegram.org/bot<TELEGRAM_BOT_TOKEN>/setWebhook" \
+  -d "url=${TG_URL}/webhook" -d "secret_token=<TELEGRAM_WEBHOOK_SECRET>"
+# enviar uma mensagem real pelo Telegram, depois conferir os logs:
+gcloud run services logs read telegram-service --region="$GCP_REGION" --limit=50
+gcloud run services logs read sdr-bot-api       --region="$GCP_REGION" --limit=50
+```
+
+#### Gaps conhecidos, documentados e não resolvidos aqui
+
+- **RAG em produção (`mcp_server/chroma_data/`)**: o índice Chroma é
+  gitignored e só existe localmente após `make ingest-dev`. O
+  `Dockerfile` raiz hoje só copia `app/` — se deployado como está, o
+  `KnowledgeAgent` quebra silenciosamente no primeiro `get_collection()`
+  (a coleção não existe). Decisão tomada: materializar o índice **durante
+  o build da imagem** (stage extra no `Dockerfile` rodando `uv run dagster
+  asset materialize -f ingestion/definitions.py --select '*'`), não via
+  GCS + sync em runtime — exige zero recursos Terraform novos, e o
+  trade-off (rebuild necessário a cada mudança na base de conhecimento,
+  download do modelo de embedding em cache miss) é aceitável para uma base
+  de conhecimento que muda com pouca frequência. Fica como TODO: a mudança
+  em si é no `Dockerfile`, fora do escopo deste Terraform.
+- **Hardening do `--allow-unauthenticated`** (`litellm-proxy` e
+  `telegram-service`, mesma decisão já documentada no `.gitlab-ci.yml`
+  para o proxy): TODO consciente, junto dos guardrails da Parte 3.
 
 ## Mascaramento de PII (Parte 2)
 

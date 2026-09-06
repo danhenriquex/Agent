@@ -15,8 +15,8 @@ PROXY_READY_TIMEOUT := 30
 # precisa estar setado como "agents" pra bater com o que a API espera.
 SESSION_DB_URL ?= sqlite+aiosqlite:///./sdr_bot_sessions.db
 
-.PHONY: help sync proxy-up proxy-down proxy-restart proxy-logs proxy-status \
-        web cli api test test-pii test-guardrails test-live lint clean \
+.PHONY: help sync gcloud-install proxy-up proxy-down proxy-restart proxy-logs proxy-status \
+        web cli api telegram-up test test-pii test-guardrails test-live lint clean \
         ingest-dev langfuse-secrets langfuse-up langfuse-down phoenix-up \
         eval-run eval-dev
 
@@ -24,10 +24,14 @@ help:
 	@echo "Comandos disponíveis:"
 	@echo ""
 	@echo "  make sync          - uv sync (instala/atualiza dependências)"
+	@echo "  make gcloud-install - baixa e instala o Google Cloud CLI em ~/google-cloud-sdk"
+	@echo "                       (não dá pra ser dependência do uv/pyproject.toml --"
+	@echo "                       gcloud é um binário nativo, não é publicado no PyPI)"
 	@echo ""
 	@echo "  make web           - sobe o proxy (se preciso) e abre a UI do adk web (porta 8000)"
 	@echo "  make cli           - sobe o proxy (se preciso) e roda o bot via CLI"
 	@echo "  make api           - sobe o proxy (se preciso) e roda a API FastAPI em localhost:8001"
+	@echo "  make telegram-up   - roda o telegram_service em localhost:8200 (deps próprias)"
 	@echo ""
 	@echo "  make proxy-up      - sobe o LiteLLM Proxy e espera ele responder de verdade"
 	@echo "  make proxy-down    - derruba o LiteLLM Proxy"
@@ -55,6 +59,19 @@ help:
 
 sync:
 	uv sync
+
+# gcloud não é um pacote PyPI -- é um bundle de binário nativo distribuído só
+# pelo instalador/apt repo/tarball do Google, então uv/pyproject.toml não
+# conseguem instalá-lo. Esse alvo só empacota o tarball install pra ficar um
+# comando só.
+gcloud-install:
+	@if [ -d "$$HOME/google-cloud-sdk" ]; then \
+		echo "google-cloud-sdk já existe em $$HOME/google-cloud-sdk, rodando o instalador mesmo assim (idempotente)"; \
+	fi
+	curl -o /tmp/google-cloud-cli-linux-x86_64.tar.gz https://dl.google.com/dl/cloudsdk/channels/rapid/downloads/google-cloud-cli-linux-x86_64.tar.gz
+	tar -xf /tmp/google-cloud-cli-linux-x86_64.tar.gz -C $$HOME
+	$$HOME/google-cloud-sdk/install.sh --quiet
+	@echo "Abra um novo terminal (ou 'source ~/.bashrc') e rode: gcloud auth login"
 
 # Sobe o proxy e espera de verdade ele responder antes de liberar o
 # próximo comando -- isso existe especificamente porque "docker compose
@@ -123,6 +140,13 @@ cli: proxy-up
 
 api: proxy-up
 	uv run uvicorn app.api:app --reload --port 8001
+
+# telegram_service tem deps próprias e mínimas (fastapi/uvicorn/httpx),
+# separadas do pyproject.toml raiz -- por isso roda de dentro do próprio
+# diretório, com seu próprio venv isolado (uv resolve a partir do
+# pyproject.toml mais próximo do cwd).
+telegram-up:
+	cd telegram_service && uv run uvicorn main:app --port 8200 --reload
 
 test:
 	uv run pytest -v
