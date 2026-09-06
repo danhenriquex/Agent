@@ -217,12 +217,19 @@ deploy_litellm_proxy:
     # service account do sdr-bot-api, com o cliente anexando um ID token
     # do Google na chamada — isso fica como TODO de hardening, junto com
     # os guardrails da Parte 3.
+    #
+    # --memory=1Gi: o default do Cloud Run (512 MiB) não é suficiente --
+    # confirmado via `gcloud logging read` na revision que falhou:
+    # "Memory limit of 512 MiB exceeded with 519 MiB used", processo
+    # morto por OOM antes de conseguir bindar na porta 4000, e daí o
+    # STARTUP TCP probe nunca passa.
     - >
       gcloud run deploy litellm-proxy
       --image="${PROXY_IMAGE_TAG}"
       --region="${GCP_REGION}"
       --platform=managed
       --port=4000
+      --memory=1Gi
       --allow-unauthenticated
       --set-secrets="OPENROUTER_API_KEY=openrouter-api-key:latest,LITELLM_PROXY_KEY=litellm-proxy-key:latest"
   environment:
