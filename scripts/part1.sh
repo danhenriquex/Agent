@@ -1,8 +1,21 @@
 #!/usr/bin/env bash
+# Gerado em: 2026-08-09T13:30:38Z -- se os outros scripts (part1/cicd/part2/part3) que você tem localmente têm datas MUITO diferentes desta, você está misturando versões antigas com novas. Baixe os 4 de novo, juntos, na mesma resposta/mensagem.
 #
 # part1_setup.sh — gera/atualiza os arquivos da Parte 1 do SDR Bot
 # (esqueleto multi-agente com ADK + LiteLLM Proxy + OpenRouter,
 # empacotado com uv/pyproject.toml).
+#
+# IMPORTANTE: desde a Parte 2, este script SOZINHO não produz mais
+# uma árvore de agentes importável. Os arquivos de agente (aqui)
+# já chamam `from .pii.masking import mask_pii` (Parte 2) e
+# `from .guardrails...` (Parte 3) — cada parte editou esses
+# arquivos NO LUGAR em vez de manter isso separado. É uma escolha
+# deliberada (PII e guardrails são preocupações transversais, faz
+# sentido morar na construção do agente), mas o efeito colateral
+# é: rode SEMPRE part1_setup.sh seguido de part2_setup.sh E
+# part3_setup.sh — nunca só o primeiro sozinho.
+# cicd_setup.sh é independente disso (Docker/CI/Makefile não se
+# importam com o conteúdo interno dos agentes).
 #
 # Uso:
 #   bash part1_setup.sh [diretorio-destino]
@@ -19,8 +32,8 @@ echo "==> Gerando projeto em: $TARGET_DIR"
 
 mkdir -p "$TARGET_DIR/app"
 mkdir -p "$TARGET_DIR/app/agents"
-mkdir -p "$TARGET_DIR/app/config"
-mkdir -p "$TARGET_DIR/app/session"
+mkdir -p "$TARGET_DIR/app/agents/config"
+mkdir -p "$TARGET_DIR/app/agents/session"
 mkdir -p "$TARGET_DIR/litellm_proxy"
 mkdir -p "$TARGET_DIR/tests"
 
@@ -38,6 +51,13 @@ LITELLM_PROXY_KEY=sk-local-master-key
 
 # === App ===
 SDR_APP_NAME=sdr-bot
+
+# === PII (Parte 2) ===
+# Salt fixo e secreto usado no hash de CPF/CNPJ (nunca reversível,
+# usado só pra correlação "é o mesmo lead de antes?"). Gere com:
+#   python -c "import secrets; print(secrets.token_hex(32))"
+# NUNCA reutilize o mesmo salt entre ambientes (dev/staging/produção).
+PII_HASH_SALT=
 SDR_PART1_EOF
 
 echo "  - .gitignore"
@@ -82,7 +102,7 @@ Este projeto é dividido em partes incrementais. Este README cobre a **Parte 1**
   permanece no controle da conversa em todo turno — nenhum especialista
   assume a conversa permanentemente.
 - Estado compartilhado (`session.state`) com contrato documentado em
-  `app/session/state_schema.py`.
+  `app/agents/session/state_schema.py`.
 - Camada de modelo desacoplada: cada agente usa `LiteLlm` apontando para
   um **LiteLLM Proxy self-hosted**, que por sua vez roteia para modelos na
   **OpenRouter** — ver `litellm_proxy/config.yaml` para o mapeamento
@@ -169,7 +189,42 @@ Você: quanto custa o plano?
 [OrchestratorAgent] Sobre os planos...
 ```
 
-### 5. Rodar os testes
+### 6. Interface visual do ADK (`adk web`)
+
+O ADK inclui uma UI de desenvolvimento que mostra a árvore de agentes, o
+histórico de eventos turno a turno, e o payload exato de cada chamada de
+tool (nome, argumentos, retorno) — útil sobretudo para depurar problemas
+de tool-calling sem precisar ler traceback.
+
+```bash
+uv run adk web app/agents
+```
+
+Abra `http://127.0.0.1:8000` no navegador. O agente aparece na UI com o
+nome `agents` (nome da pasta) — isso é esperado, não é o nome de nenhum
+agente nosso especificamente.
+
+**Detalhe não-óbvio, documentado aqui porque nos custou tempo depurando**:
+o ADK decide como escanear a pasta baseado numa convenção específica —
+`is_single_agent_directory()` (em `google/adk/cli/utils/agent_loader.py`)
+procura por um arquivo chamado literalmente `agent.py` (ou
+`root_agent.yaml`) diretamente na pasta apontada. Sem isso, o ADK assume
+que a pasta é um **diretório pai contendo vários agentes** e escaneia
+*suas subpastas* como se cada uma fosse um agente separado — no nosso
+caso, isso faria o ADK escanear `config/` e `session/` (que não têm
+`root_agent`) em vez do próprio pacote `agents`, e a UI aparecia vazia,
+sem nenhum erro explícito.
+
+É por isso que existe `app/agents/agent.py` — um arquivo pequeno,
+somente com `from .orchestrator import root_agent`, cuja única função é
+satisfazer essa convenção. É também o motivo de `config/` e `session/`
+estarem aninhados dentro de `app/agents/` (não como pastas irmãs de
+`app/agents/`): o ADK isola a pasta apontada como raiz de import sem
+visibilidade nenhuma para pastas irmãs via import relativo — então tudo
+que os agentes precisam importar precisa estar dentro da própria pasta
+que o `adk web` aponta.
+
+### 7. Rodar os testes
 
 ```bash
 uv run pytest
@@ -228,6 +283,7 @@ dev = [
 
 [tool.pytest.ini_options]
 pythonpath = ["."]
+asyncio_mode = "auto"
 SDR_PART1_EOF
 
 echo "  - uv.lock"
@@ -2301,9 +2357,27 @@ SDR_PART1_EOF
 
 echo "  - app/agents/__init__.py"
 cat > "$TARGET_DIR/app/agents/__init__.py" <<'SDR_PART1_EOF'
-from app.agents.orchestrator import root_agent
+from .orchestrator import root_agent
 
 __all__ = ["root_agent"]
+SDR_PART1_EOF
+
+echo "  - app/agents/agent.py"
+cat > "$TARGET_DIR/app/agents/agent.py" <<'SDR_PART1_EOF'
+"""
+Este arquivo existe só para satisfazer a convenção de descoberta do
+`adk web`/`adk run`: o loader do ADK (is_single_agent_directory em
+google/adk/cli/utils/agent_loader.py) procura especificamente por um
+arquivo chamado `agent.py` (não `orchestrator.py`) diretamente nesta
+pasta para tratá-la como "single agent mode" — sem ele, o ADK acha que
+esta pasta é um DIRETÓRIO PAI contendo vários agentes, e escaneia suas
+subpastas (`config/`, `session/`) como se cada uma fosse um agente
+separado, encontra nenhuma com root_agent, e a UI mostra vazio.
+
+O agente em si é definido em orchestrator.py — este arquivo só reexporta.
+"""
+
+from .orchestrator import root_agent  # noqa: F401
 SDR_PART1_EOF
 
 echo "  - app/agents/_guardrails.py"
@@ -2333,7 +2407,7 @@ from google.adk.agents.callback_context import CallbackContext
 from google.adk.models import LlmResponse
 from google.genai import types
 
-from app.session.state_schema import STATE_GUARDRAIL_FLAGS
+from .session.state_schema import STATE_GUARDRAIL_FLAGS
 
 _LEAKED_TRANSFER_PATTERN = re.compile(r"transfer_to_agent\s*\{")
 
@@ -2395,22 +2469,27 @@ fallback silencioso dentro de outro agente) para que:
 
 from google.adk.agents import LlmAgent
 
-from app.agents._guardrails import block_unauthorized_transfer
-from app.config.models import get_model_for_role
-from app.session.state_schema import STATE_ESCALATED
+from .config.models import get_model_for_role
+from .guardrails.output_policy import validate_output_policy
+from .guardrails.prompt_injection import detect_prompt_injection
+from .guardrails.transfer import block_unauthorized_transfer
+from .persona import PERSONA_INTRO
+from .pii.masking import mask_pii
+from .session.state_schema import STATE_ESCALATED
 
 escalate_agent = LlmAgent(
     name="EscalateToHumanAgent",
     model=get_model_for_role("escalate"),
     description=(
         "Encerra o atendimento automatizado e transfere para um humano. "
-        "Use quando: o guardrail bloquear uma mensagem (Parte 3), o lead "
-        "pedir explicitamente para falar com uma pessoa, ou a conversa "
-        "sair do escopo comercial (suporte técnico, reclamação, assunto "
-        "não relacionado a vendas)."
+        "Use quando: o guardrail bloquear uma mensagem, o lead pedir "
+        "explicitamente para falar com uma pessoa, ou a conversa sair do "
+        "escopo comercial (suporte técnico, reclamação, assunto não "
+        "relacionado a vendas)."
     ),
     instruction=(
-        "Informe de forma clara e cordial que você vai conectar o lead "
+        PERSONA_INTRO
+        + "Informe de forma clara e cordial que você vai conectar o lead "
         "com um especialista humano, e que alguém do time vai continuar "
         "a conversa em breve. Não tente resolver o pedido original você "
         "mesmo."
@@ -2419,9 +2498,9 @@ escalate_agent = LlmAgent(
     # Chamado via AgentTool a partir do Orchestrator (ver orchestrator.py),
     # não via sub_agents — então este agente nunca ganha a ferramenta
     # transfer_to_agent para começar; não há transferência a bloquear. O
-    # guardrail abaixo fica como defesa em profundidade, não a proteção
-    # primária (ver docstring de _guardrails.py para o histórico do bug).
-    after_model_callback=block_unauthorized_transfer,
+    # guardrail de transfer abaixo fica como defesa em profundidade.
+    before_model_callback=[mask_pii, detect_prompt_injection],
+    after_model_callback=[validate_output_policy, block_unauthorized_transfer],
 )
 SDR_PART1_EOF
 
@@ -2439,9 +2518,13 @@ termos avaliação de faithfulness (Parte 6).
 
 from google.adk.agents import LlmAgent
 
-from app.agents._guardrails import block_unauthorized_transfer
-from app.config.models import get_model_for_role
-from app.session.state_schema import STATE_LAST_RETRIEVED_CONTEXT
+from .config.models import get_model_for_role
+from .guardrails.output_policy import validate_output_policy
+from .guardrails.prompt_injection import detect_prompt_injection
+from .guardrails.transfer import block_unauthorized_transfer
+from .persona import PERSONA_INTRO
+from .pii.masking import mask_pii
+from .session.state_schema import STATE_LAST_RETRIEVED_CONTEXT
 
 knowledge_agent = LlmAgent(
     name="KnowledgeAgent",
@@ -2452,7 +2535,8 @@ knowledge_agent = LlmAgent(
         "custa', 'vocês integram com X', etc."
     ),
     instruction=(
-        "Você responde perguntas sobre nosso produto SaaS de forma "
+        PERSONA_INTRO
+        + "Você responde perguntas sobre nosso produto SaaS de forma "
         "precisa e concisa. "
         "IMPORTANTE (temporário — Parte 1): você ainda não tem acesso à "
         "base de conhecimento real. Se não tiver certeza absoluta da "
@@ -2466,9 +2550,9 @@ knowledge_agent = LlmAgent(
     # Chamado via AgentTool a partir do Orchestrator (ver orchestrator.py),
     # não via sub_agents — então este agente nunca ganha a ferramenta
     # transfer_to_agent para começar; não há transferência a bloquear. O
-    # guardrail abaixo fica como defesa em profundidade, não a proteção
-    # primária (ver docstring de _guardrails.py para o histórico do bug).
-    after_model_callback=block_unauthorized_transfer,
+    # guardrail de transfer abaixo fica como defesa em profundidade.
+    before_model_callback=[mask_pii, detect_prompt_injection],
+    after_model_callback=[validate_output_policy, block_unauthorized_transfer],
 )
 SDR_PART1_EOF
 
@@ -2477,13 +2561,22 @@ cat > "$TARGET_DIR/app/agents/objection.py" <<'SDR_PART1_EOF'
 """
 Objection Handling Agent — lida com objeções comuns (preço, concorrente,
 "preciso falar com meu time", timing).
+
+Parte 3: a regra "nunca ofereça desconto" era só uma instrução de
+prompt (facilmente contornável por prompt injection) — agora também é
+aplicada via validate_output_policy, que checa a resposta do modelo
+DE VERDADE, não só confia que ele vai seguir a instrução.
 """
 
 from google.adk.agents import LlmAgent
 
-from app.agents._guardrails import block_unauthorized_transfer
-from app.config.models import get_model_for_role
-from app.session.state_schema import STATE_OBJECTIONS_RAISED
+from .config.models import get_model_for_role
+from .guardrails.output_policy import validate_output_policy
+from .guardrails.prompt_injection import detect_prompt_injection
+from .guardrails.transfer import block_unauthorized_transfer
+from .persona import PERSONA_INTRO
+from .pii.masking import mask_pii
+from .session.state_schema import STATE_OBJECTIONS_RAISED
 
 objection_agent = LlmAgent(
     name="ObjectionHandlingAgent",
@@ -2494,23 +2587,20 @@ objection_agent = LlmAgent(
         "agora). Use quando o lead expressar hesitação ou recusa."
     ),
     instruction=(
-        "Você lida com objeções de forma empática, sem ser insistente. "
+        PERSONA_INTRO
+        + "Você lida com objeções de forma empática, sem ser insistente. "
         "Reconheça a objeção antes de responder a ela. Nunca ofereça "
         "desconto, condição especial ou prazo que não foi explicitamente "
         "autorizado — se o lead pedir desconto, diga que pode conectar "
-        "com um account executive para discutir condições comerciais. "
-        "TODO Parte 3: essa regra de 'nunca ofereça desconto' precisa "
-        "virar um guardrail verificável (after_model_callback), não só "
-        "uma instrução no prompt — instrução sozinha não é garantia "
-        "contra prompt injection."
+        "com um account executive para discutir condições comerciais."
     ),
     output_key=STATE_OBJECTIONS_RAISED,
     # Chamado via AgentTool a partir do Orchestrator (ver orchestrator.py),
     # não via sub_agents — então este agente nunca ganha a ferramenta
     # transfer_to_agent para começar; não há transferência a bloquear. O
-    # guardrail abaixo fica como defesa em profundidade, não a proteção
-    # primária (ver docstring de _guardrails.py para o histórico do bug).
-    after_model_callback=block_unauthorized_transfer,
+    # guardrail de transfer abaixo fica como defesa em profundidade.
+    before_model_callback=[mask_pii, detect_prompt_injection],
+    after_model_callback=[validate_output_policy, block_unauthorized_transfer],
 )
 SDR_PART1_EOF
 
@@ -2551,17 +2641,36 @@ específica. Aceitável por ora; pode ser recuperado depois inspecionando
 eventos intermediários, se necessário.
 
 Documentação: https://google.github.io/adk-docs/agents/multi-agents/#agents-as-tools
+
+Parte 2 — mascaramento de PII: este agente é o único ponto de entrada
+(recebe a mensagem crua do usuário) e o único ponto de saída (entrega a
+resposta final) de todo o sistema. Por isso ele é o único que registra
+unmask_pii — reverter tokens em qualquer outro lugar arriscaria vazar
+PII de volta pro contexto antes da resposta final estar pronta. Todos
+os agentes (incluindo este) registram mask_pii, para que nenhum deles
+jamais veja PII crua, mesmo que uma ferramenta futura (Parte 4+) traga
+dado bruto de algum lugar. Ver app/agents/pii/masking.py.
+
+Parte 3 — guardrails: mesmo padrão de defesa em profundidade.
+detect_prompt_injection e validate_output_policy rodam em TODO agente
+(incluindo este); enforce_action_allowlist (before_tool_callback) só
+existe em SchedulingAgent, porque é a única tool com uma ação que
+precisa de allowlist hoje. Ver app/agents/guardrails/.
 """
 
 from google.adk.agents import LlmAgent
 from google.adk.tools.agent_tool import AgentTool
 
-from app.agents.escalate import escalate_agent
-from app.agents.knowledge import knowledge_agent
-from app.agents.objection import objection_agent
-from app.agents.qualification import qualification_agent
-from app.agents.scheduling import scheduling_agent
-from app.config.models import get_model_for_role
+from .config.models import get_model_for_role
+from .escalate import escalate_agent
+from .guardrails.output_policy import validate_output_policy
+from .guardrails.prompt_injection import detect_prompt_injection
+from .knowledge import knowledge_agent
+from .objection import objection_agent
+from .persona import COMPANY_NAME, PERSONA_INTRO
+from .pii.masking import mask_pii, unmask_pii
+from .qualification import qualification_agent
+from .scheduling import scheduling_agent
 
 root_agent = LlmAgent(
     name="OrchestratorAgent",
@@ -2571,26 +2680,39 @@ root_agent = LlmAgent(
         "decide qual especialista consultar antes de responder."
     ),
     instruction=(
-        "Você é o orquestrador de um time de vendas (SDR) automatizado. "
+        PERSONA_INTRO
+        + "Você é o orquestrador de um time de vendas (SDR) automatizado. "
         "Para a maioria das mensagens, você deve CONSULTAR o especialista "
         "certo (chamando-o como ferramenta) antes de responder — não "
         "responda de memória sobre produto, preço, objeções ou "
         "agendamento.\n\n"
-        "Regras de consulta:\n"
-        "1) Se é o início da conversa ou ainda não sabemos se o lead é "
-        "qualificado, consulte QualificationAgent.\n"
+        "Para uma saudação simples (ex: 'oi', 'olá', 'bom dia'), responda "
+        "você mesmo, sem consultar ninguém, seguindo este padrão -- "
+        "direto ao ponto, nunca um 'como posso ajudar?' genérico e vazio:\n"
+        f"1) Se apresente em uma frase: seu nome, {COMPANY_NAME}, e o que "
+        "a empresa faz.\n"
+        "2) Ofereça dois caminhos ao mesmo tempo, na mesma mensagem: uma "
+        "pergunta leve sobre o desafio do lead, OU a opção de já ver "
+        "horários pra uma conversa rápida com o time. Deixe explícito que "
+        "agendar é uma opção disponível desde já -- não algo que só "
+        "aparece depois de uma qualificação longa.\n\n"
+        "Regras de consulta pro resto da conversa:\n"
+        "1) Se ainda não sabemos se o lead é qualificado, consulte "
+        "QualificationAgent.\n"
         "2) Se o lead pergunta sobre produto, funcionalidade ou preço, "
         "consulte KnowledgeAgent.\n"
         "3) Se o lead expressa hesitação, recusa ou objeção, consulte "
         "ObjectionHandlingAgent.\n"
-        "4) Se o lead concorda em avançar / quer marcar uma conversa, "
-        "consulte SchedulingAgent.\n"
+        "4) Se o lead concorda em avançar / já quer marcar uma conversa, "
+        "consulte SchedulingAgent -- mesmo que a qualificação não esteja "
+        "completa. É papel do SchedulingAgent (e do guardrail de "
+        "allowlist) decidir se já pode confirmar ou se precisa voltar "
+        "pra qualificação primeiro; você não precisa bloquear isso aqui.\n"
         "5) Se o pedido está fora do escopo comercial, ou o lead pede "
         "explicitamente um humano, consulte EscalateToHumanAgent.\n\n"
         "Depois de consultar o especialista, entregue a resposta dele ao "
         "lead de forma natural (pode repassar quase literalmente — não "
-        "precisa reescrever tudo). Só responda diretamente, sem consultar "
-        "ninguém, para saudações simples."
+        "precisa reescrever tudo)."
     ),
     tools=[
         AgentTool(agent=qualification_agent),
@@ -2599,6 +2721,43 @@ root_agent = LlmAgent(
         AgentTool(agent=scheduling_agent),
         AgentTool(agent=escalate_agent),
     ],
+    before_model_callback=[mask_pii, detect_prompt_injection],
+    after_model_callback=[validate_output_policy, unmask_pii],
+)
+SDR_PART1_EOF
+
+echo "  - app/agents/persona.py"
+cat > "$TARGET_DIR/app/agents/persona.py" <<'SDR_PART1_EOF'
+"""
+Persona compartilhada do bot -- nome, empresa, e o "elevator pitch" de
+uma frase, usado na saudação inicial e como contexto leve em todo
+agente. Centralizado aqui em vez de duplicado em cada instruction, pra
+ter um único lugar pra atualizar quando o produto/vertical mudar (ex:
+quando a Parte 4 trouxer conteúdo real da base de conhecimento).
+
+Empresa e nome são fictícios, pensados pro portfólio: "Helssing" como
+uma SaaS de RH e DP (Departamento Pessoal) -- um vertical B2B comum e
+bem reconhecível no mercado brasileiro.
+
+Decisão deliberada: o bot se identifica como assistente de IA, nunca
+finge ser humano. Isso não é só postura ética -- é o tipo de
+transparência que regulação (ex: EU AI Act, art. 50) já está exigindo
+de sistemas conversacionais automatizados, e vale citar isso como
+escolha consciente, não descuido.
+"""
+
+BOT_NAME = "Bia"
+COMPANY_NAME = "Helssing"
+COMPANY_PITCH = (
+    "plataforma de RH e DP que automatiza folha de pagamento, admissão "
+    "e ponto pra empresas que ainda dependem de planilha"
+)
+
+PERSONA_INTRO = (
+    f"Você é {BOT_NAME}, assistente de IA da {COMPANY_NAME} -- seja "
+    "transparente que é um assistente automatizado sempre que "
+    f"perguntado, nunca finja ser humano. A {COMPANY_NAME} é "
+    f"{COMPANY_PITCH}.\n\n"
 )
 SDR_PART1_EOF
 
@@ -2608,16 +2767,57 @@ cat > "$TARGET_DIR/app/agents/qualification.py" <<'SDR_PART1_EOF'
 Qualification Agent — conduz a descoberta inicial (framework BANT) para
 decidir se o lead deveria avançar no funil comercial.
 
-Nesta Parte 1, o agente só conversa e escreve um resumo em texto livre no
-estado (via output_key). A Parte 6 (eval set) vai cobrar qualificação mais
-estruturada e mensurável — ajustaremos o schema então.
+Parte 3: ganhou a tool set_qualification_status, que é a forma
+estruturada e auditável de declarar "esse lead está qualificado" —
+antes disso, só existia texto livre em qualification_notes, o que não
+dava pra checagem confiável em outro lugar do sistema (ex: o
+before_tool_callback de scheduling.py que agora depende desse status).
+
+Padrão "booking-first" (o mesmo que Drift/Qualified/Chili Piper usam):
+o objetivo não é completar um checklist BANT inteiro antes de sugerir
+agendar -- é chegar a um convite pra marcar uma conversa o quanto antes,
+usando qualificação como um filtro leve, não uma barreira. "in_progress"
+é um status perfeitamente aceitável pra deixar pro SDR humano completar
+na call, em vez de segurar o lead numa qualificação longa via chat.
 """
 
 from google.adk.agents import LlmAgent
+from google.adk.tools import ToolContext
 
-from app.agents._guardrails import block_unauthorized_transfer
-from app.config.models import get_model_for_role
-from app.session.state_schema import STATE_QUALIFICATION_NOTES
+from .config.models import get_model_for_role
+from .guardrails.output_policy import validate_output_policy
+from .guardrails.prompt_injection import detect_prompt_injection
+from .guardrails.transfer import block_unauthorized_transfer
+from .persona import PERSONA_INTRO
+from .pii.masking import mask_pii
+from .session.state_schema import STATE_QUALIFICATION_NOTES, STATE_QUALIFICATION_STATUS
+
+
+def set_qualification_status(status: str, reasoning: str, tool_context: ToolContext) -> dict:
+    """Registra o status de qualificação do lead com base na conversa até agora.
+
+    Chame isso assim que tiver informação suficiente pra decidir —
+    não precisa esperar cobrir todos os critérios BANT se já ficou
+    claro que o lead é ou não um bom fit.
+
+    Args:
+        status: um de "qualified", "disqualified", "in_progress".
+        reasoning: justificativa breve (1-2 frases) pra essa decisão,
+            citando o que da conversa embasou isso.
+
+    Returns:
+        dict: confirmação do status registrado.
+    """
+    valid_statuses = {"qualified", "disqualified", "in_progress"}
+    if status not in valid_statuses:
+        return {
+            "status": "error",
+            "error_message": f"status inválido: {status!r}. Use um de {valid_statuses}.",
+        }
+
+    tool_context.state[STATE_QUALIFICATION_STATUS] = status
+    return {"status": "success", "recorded_status": status, "reasoning": reasoning}
+
 
 qualification_agent = LlmAgent(
     name="QualificationAgent",
@@ -2629,24 +2829,36 @@ qualification_agent = LlmAgent(
         "ainda não sabemos se ele é um bom fit."
     ),
     instruction=(
-        "Você é um SDR conduzindo a qualificação inicial de um lead B2B. "
-        "Faça perguntas curtas e naturais, uma de cada vez, cobrindo ao "
-        "longo da conversa: qual problema o lead quer resolver, se ele "
-        "tem orçamento definido, se ele é o decisor ou influencia a "
-        "decisão, e em que prazo pretende resolver isso. "
-        "Não faça um interrogatório — intercale com contexto útil sobre "
-        "como ajudamos empresas parecidas. "
+        PERSONA_INTRO
+        + "Você conduz a qualificação inicial de um lead B2B, mas de "
+        "forma LEVE e RÁPIDA -- o objetivo é chegar a um convite pra "
+        "agendar uma conversa o quanto antes, não completar um checklist "
+        "inteiro antes de sugerir isso. Um SDR de verdade não interroga "
+        "por várias perguntas seguidas antes de oferecer uma reunião.\n\n"
+        "Faça no máximo 1-2 perguntas curtas e naturais sobre o desafio "
+        "do lead (o que ele quer resolver) e, se render, o tamanho da "
+        "empresa. Intercale com contexto útil sobre como ajudamos "
+        "empresas parecidas -- não faça um interrogatório.\n\n"
+        "Assim que tiver QUALQUER sinal razoável de fit -- não precisa "
+        "ser orçamento, autoridade e prazo completos -- convide pra "
+        "marcar uma conversa rápida com o time. 'in_progress' é um "
+        "status perfeitamente aceitável: é normal deixar o resto da "
+        "qualificação pra call em vez de segurar o lead no chat.\n\n"
+        "Assim que tiver informação suficiente pra decidir, chame "
+        "set_qualification_status com o status apropriado — isso é o "
+        "que libera (ou não) o lead pra avançar pro agendamento. "
         "Se o lead perguntar algo sobre o produto/preço que você não "
         "sabe, diga que vai verificar (o Orchestrator vai rotear para o "
         "agente certo)."
     ),
+    tools=[set_qualification_status],
     output_key=STATE_QUALIFICATION_NOTES,
     # Chamado via AgentTool a partir do Orchestrator (ver orchestrator.py),
     # não via sub_agents — então este agente nunca ganha a ferramenta
     # transfer_to_agent para começar; não há transferência a bloquear. O
-    # guardrail abaixo fica como defesa em profundidade, não a proteção
-    # primária (ver docstring de _guardrails.py para o histórico do bug).
-    after_model_callback=block_unauthorized_transfer,
+    # guardrail de transfer abaixo fica como defesa em profundidade.
+    before_model_callback=[mask_pii, detect_prompt_injection],
+    after_model_callback=[validate_output_policy, block_unauthorized_transfer],
 )
 SDR_PART1_EOF
 
@@ -2659,17 +2871,28 @@ Scheduling Agent — tarefa estruturada: verifica disponibilidade e
 Modelo: barato/rápido (ver app/config/models.py) porque a tarefa é
 majoritariamente extração estruturada, não raciocínio aberto.
 
-Este é o único agente com tools nesta Parte 1 — propositalmente, para
-validar que tool-calling funciona ponta a ponta através do LiteLLM Proxy
-+ OpenRouter antes de adicionarmos tools mais sensíveis (RAG, MCP) nas
-próximas partes.
+Este foi o primeiro agente com tools reais no projeto — propositalmente,
+para validar que tool-calling funciona ponta a ponta através do LiteLLM
+Proxy + OpenRouter antes de adicionarmos tools mais sensíveis (RAG, MCP)
+nas próximas partes.
+
+Parte 3: book_meeting agora é protegido por enforce_action_allowlist
+(before_tool_callback) — só executa de verdade se
+session.state[STATE_QUALIFICATION_STATUS] == "qualified". Isso é
+allowlist de AÇÃO (o que o sistema pode EXECUTAR), diferente dos
+guardrails de conteúdo (o que o sistema pode DIZER).
 """
 
 from google.adk.agents import LlmAgent
 
-from app.agents._guardrails import block_unauthorized_transfer
-from app.config.models import get_model_for_role
-from app.session.state_schema import STATE_MEETING_SLOT
+from .config.models import get_model_for_role
+from .guardrails.action_allowlist import enforce_action_allowlist
+from .guardrails.output_policy import validate_output_policy
+from .guardrails.prompt_injection import detect_prompt_injection
+from .guardrails.transfer import block_unauthorized_transfer
+from .persona import PERSONA_INTRO
+from .pii.masking import mask_pii
+from .session.state_schema import STATE_MEETING_SLOT
 
 _MOCK_SLOTS = ["terça-feira às 10h", "quarta-feira às 15h", "quinta-feira às 11h"]
 
@@ -2702,10 +2925,8 @@ def book_meeting(slot: str) -> dict:
             ),
         }
 
-    # TODO Parte 3: antes de confirmar de verdade, isso deveria passar por
-    # um before_tool_callback validando que o lead está QUALIFICADO
-    # (session.state[STATE_QUALIFICATION_STATUS] == "qualified") —
-    # allowlist de AÇÃO, não só allowlist de tool disponível.
+    # A checagem de qualificação acontece ANTES desta função sequer
+    # rodar -- ver enforce_action_allowlist (before_tool_callback).
     return {"status": "success", "confirmed_slot": slot}
 
 
@@ -2718,28 +2939,33 @@ scheduling_agent = LlmAgent(
         "avançar para uma próxima etapa comercial."
     ),
     instruction=(
-        "Você ajuda o lead a marcar uma reunião. Primeiro chame "
+        PERSONA_INTRO
+        + "Você ajuda o lead a marcar uma reunião. Primeiro chame "
         "check_availability para ver os horários livres, apresente as "
         "opções de forma natural, e depois chame book_meeting com o "
         "horário escolhido. Seja objetivo — esse não é o momento de "
-        "reabrir a qualificação ou discutir preço."
+        "reabrir a qualificação ou discutir preço. Se book_meeting "
+        "retornar status 'blocked', explique ao lead de forma natural "
+        "que precisa completar o perfil antes, usando o link fornecido "
+        "no error_message."
     ),
     tools=[check_availability, book_meeting],
     output_key=STATE_MEETING_SLOT,
     # Chamado via AgentTool a partir do Orchestrator (ver orchestrator.py),
     # não via sub_agents — então este agente nunca ganha a ferramenta
     # transfer_to_agent para começar; não há transferência a bloquear. O
-    # guardrail abaixo fica como defesa em profundidade, não a proteção
-    # primária (ver docstring de _guardrails.py para o histórico do bug).
-    after_model_callback=block_unauthorized_transfer,
+    # guardrail de transfer abaixo fica como defesa em profundidade.
+    before_model_callback=[mask_pii, detect_prompt_injection],
+    after_model_callback=[validate_output_policy, block_unauthorized_transfer],
+    before_tool_callback=enforce_action_allowlist,
 )
 SDR_PART1_EOF
 
-echo "  - app/config/__init__.py"
-cat > "$TARGET_DIR/app/config/__init__.py" <<'SDR_PART1_EOF'
+echo "  - app/agents/config/__init__.py"
+cat > "$TARGET_DIR/app/agents/config/__init__.py" <<'SDR_PART1_EOF'
 """
 Carrega o .env como efeito colateral da primeira vez que algo sob
-app.config é importado.
+app.agents.config é importado.
 
 Isso acontece cedo o suficiente — antes dos agentes serem construídos,
 que já leem variáveis de ambiente durante a própria importação (ver
@@ -2753,8 +2979,8 @@ from dotenv import load_dotenv
 load_dotenv()
 SDR_PART1_EOF
 
-echo "  - app/config/models.py"
-cat > "$TARGET_DIR/app/config/models.py" <<'SDR_PART1_EOF'
+echo "  - app/agents/config/models.py"
+cat > "$TARGET_DIR/app/agents/config/models.py" <<'SDR_PART1_EOF'
 """
 Mapeia cada papel de agente para o alias configurado no LiteLLM Proxy.
 
@@ -2815,6 +3041,56 @@ def get_model_for_role(role: str) -> LiteLlm:
         api_base=PROXY_URL,
         api_key=PROXY_KEY,
     )
+SDR_PART1_EOF
+
+echo "  - app/agents/session/__init__.py"
+cat > "$TARGET_DIR/app/agents/session/__init__.py" <<'SDR_PART1_EOF'
+SDR_PART1_EOF
+
+echo "  - app/agents/session/state_schema.py"
+cat > "$TARGET_DIR/app/agents/session/state_schema.py" <<'SDR_PART1_EOF'
+"""
+Chaves do session.state compartilhado entre os agentes.
+
+Centralizar isso aqui evita o erro clássico de sistema multi-agente: um
+agente escreve "lead_name" e outro lê "leadName" ou "nome_lead". Toda
+leitura/escrita de estado no projeto deve usar essas constantes, nunca
+strings soltas espalhadas pelos agentes.
+
+Isso também documenta o "contrato" entre agentes — qualquer pessoa lendo
+este arquivo entende o que cada agente espera receber e o que produz, sem
+precisar ler os prompts inteiros de cada um.
+"""
+
+# Escrito pelo Qualification Agent
+STATE_QUALIFICATION_NOTES = "qualification_notes"      # texto livre nesta Parte 1
+# "in_progress" | "qualified" | "disqualified" — escrito pela tool
+# set_qualification_status (Parte 3). Consumido por
+# app/agents/guardrails/action_allowlist.py pra decidir se book_meeting
+# pode executar de verdade.
+STATE_QUALIFICATION_STATUS = "qualification_status"
+# TODO Parte 6: qualification_notes deveria virar um dict estruturado
+# (budget, authority, need, timeline) para o eval set conseguir medir
+# "qualificação correta" de forma objetiva, não só ler texto livre.
+
+# Escrito pelo Knowledge Agent (Parte 4 vai popular de fato via RAG/MCP)
+STATE_LAST_RETRIEVED_CONTEXT = "last_retrieved_context"
+
+# Escrito pelo Objection Agent
+STATE_OBJECTIONS_RAISED = "objections_raised"
+
+# Escrito pelo Scheduling Agent
+STATE_MEETING_SLOT = "meeting_slot"
+
+# Escrito pelo Escalate Agent
+STATE_ESCALATED = "escalated"
+
+# Escrito pela camada de guardrails (Partes 2 e 3): PII (redação de
+# cartão), prompt injection, política de saída, allowlist de ação, e
+# tentativa de transfer_to_agent não autorizada. list[str], útil pra
+# debug e pra futuro dashboard de observabilidade (Parte 5).
+STATE_PII_TOKEN_MAP = "pii_token_map"        # token -> valor original; NUNCA vai ao LLM nem a logs
+STATE_GUARDRAIL_FLAGS = "guardrail_flags"
 SDR_PART1_EOF
 
 echo "  - app/main.py"
@@ -2893,51 +3169,6 @@ if __name__ == "__main__":
     asyncio.run(main())
 SDR_PART1_EOF
 
-echo "  - app/session/__init__.py"
-cat > "$TARGET_DIR/app/session/__init__.py" <<'SDR_PART1_EOF'
-SDR_PART1_EOF
-
-echo "  - app/session/state_schema.py"
-cat > "$TARGET_DIR/app/session/state_schema.py" <<'SDR_PART1_EOF'
-"""
-Chaves do session.state compartilhado entre os agentes.
-
-Centralizar isso aqui evita o erro clássico de sistema multi-agente: um
-agente escreve "lead_name" e outro lê "leadName" ou "nome_lead". Toda
-leitura/escrita de estado no projeto deve usar essas constantes, nunca
-strings soltas espalhadas pelos agentes.
-
-Isso também documenta o "contrato" entre agentes — qualquer pessoa lendo
-este arquivo entende o que cada agente espera receber e o que produz, sem
-precisar ler os prompts inteiros de cada um.
-"""
-
-# Escrito pelo Qualification Agent
-STATE_QUALIFICATION_NOTES = "qualification_notes"      # texto livre nesta Parte 1
-# "in_progress" | "qualified" | "disqualified"
-STATE_QUALIFICATION_STATUS = "qualification_status"
-# TODO Parte 6: qualification_notes deveria virar um dict estruturado
-# (budget, authority, need, timeline) para o eval set conseguir medir
-# "qualificação correta" de forma objetiva, não só ler texto livre.
-
-# Escrito pelo Knowledge Agent (Parte 4 vai popular de fato via RAG/MCP)
-STATE_LAST_RETRIEVED_CONTEXT = "last_retrieved_context"
-
-# Escrito pelo Objection Agent
-STATE_OBJECTIONS_RAISED = "objections_raised"
-
-# Escrito pelo Scheduling Agent
-STATE_MEETING_SLOT = "meeting_slot"
-
-# Escrito pelo Escalate Agent
-STATE_ESCALATED = "escalated"
-
-# Escrito pela camada de guardrail/PII (Partes 2 e 3 — placeholder aqui
-# para já deixar o contrato visível desde a Parte 1)
-STATE_PII_TOKEN_MAP = "pii_token_map"        # token -> valor original; NUNCA vai ao LLM nem a logs
-STATE_GUARDRAIL_FLAGS = "guardrail_flags"    # list[str]: violações detectadas na sessão
-SDR_PART1_EOF
-
 echo "  - litellm_proxy/config.yaml"
 cat > "$TARGET_DIR/litellm_proxy/config.yaml" <<'SDR_PART1_EOF'
 # litellm_proxy/config.yaml
@@ -2950,6 +3181,16 @@ cat > "$TARGET_DIR/litellm_proxy/config.yaml" <<'SDR_PART1_EOF'
 # Racional de qual modelo vai em cada papel está documentado na arquitetura
 # (README.md) — resumo: tarefas de raciocínio/nuance usam modelo mais forte,
 # tarefas estruturadas/roteamento usam modelo mais barato e rápido.
+#
+# NOTA: qualification/knowledge/objection-model apontavam originalmente
+# pra anthropic/claude-3.5-sonnet — esse modelo foi oficialmente
+# aposentado pela Anthropic em 5 de janeiro de 2026 e a OpenRouter parou
+# de rotear pra ele ("No endpoints found"), o que quebrou os testes ao
+# vivo (test_golden_conversations.py). Migrado pra anthropic/claude-
+# sonnet-5 (sucessor direto na mesma faixa Sonnet, lançado 30/06/2026).
+# Isso é um lembrete de que aliases de modelo em provedores terceiros
+# precisam de manutenção periódica -- não é "configura uma vez e
+# esquece".
 
 model_list:
   # --- Orquestrador: roteamento de intenção, não precisa de raciocínio pesado ---
@@ -2961,19 +3202,19 @@ model_list:
   # --- Qualificação: precisa conduzir perguntas de discovery coerentes ---
   - model_name: qualification-model
     litellm_params:
-      model: openrouter/anthropic/claude-3.5-sonnet
+      model: openrouter/anthropic/claude-sonnet-5
       api_key: os.environ/OPENROUTER_API_KEY
 
   # --- Knowledge/RAG: faithfulness importa, não pode alucinar sobre produto ---
   - model_name: knowledge-model
     litellm_params:
-      model: openrouter/anthropic/claude-3.5-sonnet
+      model: openrouter/anthropic/claude-sonnet-5
       api_key: os.environ/OPENROUTER_API_KEY
 
   # --- Objeções: nuance e persuasão ---
   - model_name: objection-model
     litellm_params:
-      model: openrouter/anthropic/claude-3.5-sonnet
+      model: openrouter/anthropic/claude-sonnet-5
       api_key: os.environ/OPENROUTER_API_KEY
 
   # --- Agendamento: tarefa estruturada (extrair data/hora), modelo barato ---
@@ -3049,7 +3290,7 @@ from google.adk.models import LlmResponse
 from google.genai import types
 
 from app.agents._guardrails import block_unauthorized_transfer
-from app.session.state_schema import STATE_GUARDRAIL_FLAGS
+from app.agents.session.state_schema import STATE_GUARDRAIL_FLAGS
 
 
 def _fake_context(agent_name: str = "KnowledgeAgent") -> MagicMock:
@@ -3186,21 +3427,130 @@ def test_specialists_have_no_parent_agent():
         )
 
 
+def test_every_agent_instruction_includes_company_name():
+    # Barato e sem chamada de LLM -- pega o caso "criei um agente novo e
+    # esqueci de importar PERSONA_INTRO", antes de precisar de um teste
+    # ao vivo pra descobrir isso.
+    from app.agents.persona import COMPANY_NAME
+
+    all_agents = [root_agent, *_specialist_agents()]
+    for agent in all_agents:
+        assert COMPANY_NAME in agent.instruction, (
+            f"{agent.name} não tem {COMPANY_NAME} na instruction -- "
+            "provavelmente esqueceu de usar PERSONA_INTRO"
+        )
+
+
 def test_scheduling_agent_tools_are_registered():
     scheduling_agent = next(
         agent for agent in _specialist_agents() if agent.name == "SchedulingAgent"
     )
     tool_names = {tool.__name__ for tool in scheduling_agent.tools}
     assert tool_names == {"check_availability", "book_meeting"}
+
+
+def test_qualification_agent_has_set_status_tool():
+    qualification_agent = next(
+        agent for agent in _specialist_agents() if agent.name == "QualificationAgent"
+    )
+    tool_names = {tool.__name__ for tool in qualification_agent.tools}
+    assert tool_names == {"set_qualification_status"}
+
+
+def _as_list(callback):
+    """ADK aceita um único callback ou uma lista -- normaliza pra lista
+    pra comparar de forma consistente nos testes."""
+    if callback is None:
+        return []
+    return callback if isinstance(callback, list) else [callback]
+
+
+def test_every_agent_masks_pii_before_calling_the_model():
+    # Defesa em profundidade: TODO agente (Orchestrator + especialistas)
+    # precisa mascarar PII antes de chamar seu próprio modelo — mesmo
+    # que hoje só o Orchestrator receba texto cru do usuário, um futuro
+    # tool de especialista (Parte 4+) poderia trazer PII de outro lugar.
+    from app.agents.pii.masking import mask_pii
+
+    all_agents = [root_agent, *_specialist_agents()]
+    for agent in all_agents:
+        assert mask_pii in _as_list(agent.before_model_callback), (
+            f"{agent.name} não tem mask_pii registrado em before_model_callback"
+        )
+
+
+def test_every_agent_detects_prompt_injection():
+    # Parte 3: mesma postura de defesa em profundidade do mask_pii.
+    from app.agents.guardrails.prompt_injection import detect_prompt_injection
+
+    all_agents = [root_agent, *_specialist_agents()]
+    for agent in all_agents:
+        assert detect_prompt_injection in _as_list(agent.before_model_callback), (
+            f"{agent.name} não tem detect_prompt_injection registrado"
+        )
+
+
+def test_every_agent_validates_output_policy():
+    # Parte 3: resolve o TODO de objection.py -- "nunca ofereça desconto"
+    # precisa ser verificado na resposta de verdade, não só confiado ao
+    # prompt. Defesa em profundidade em todo agente, não só onde o TODO
+    # original estava (ver decisão de escopo da Parte 3).
+    from app.agents.guardrails.output_policy import validate_output_policy
+
+    all_agents = [root_agent, *_specialist_agents()]
+    for agent in all_agents:
+        assert validate_output_policy in _as_list(agent.after_model_callback), (
+            f"{agent.name} não tem validate_output_policy registrado"
+        )
+
+
+def test_only_orchestrator_unmasks_pii():
+    # unmask_pii só pode estar no Orchestrator -- ele é o único ponto de
+    # saída pro usuário. Se algum especialista também desmascarasse, PII
+    # voltaria pro contexto do Orchestrator antes da resposta final.
+    from app.agents.pii.masking import unmask_pii
+
+    assert unmask_pii in _as_list(root_agent.after_model_callback)
+
+    for agent in _specialist_agents():
+        assert unmask_pii not in _as_list(agent.after_model_callback), (
+            f"{agent.name} não deveria desmascarar PII por conta própria"
+        )
+
+
+def test_only_scheduling_agent_has_action_allowlist():
+    # enforce_action_allowlist só faz sentido em SchedulingAgent hoje --
+    # é o único agente com uma ação (book_meeting) que precisa de
+    # allowlist. Se aparecer em outro agente sem querer, ou sumir do
+    # SchedulingAgent, isso pega a regressão.
+    from app.agents.guardrails.action_allowlist import enforce_action_allowlist
+
+    for agent in [root_agent, *_specialist_agents()]:
+        callbacks = _as_list(agent.before_tool_callback)
+        if agent.name == "SchedulingAgent":
+            assert enforce_action_allowlist in callbacks, (
+                "SchedulingAgent deveria ter enforce_action_allowlist em "
+                "before_tool_callback"
+            )
+        else:
+            assert enforce_action_allowlist not in callbacks, (
+                f"{agent.name} não deveria ter enforce_action_allowlist"
+            )
 SDR_PART1_EOF
 
 echo ""
 echo "==> Parte 1 gerada/atualizada com sucesso em $TARGET_DIR"
 echo ""
 echo "Próximos passos:"
-echo "  1. cd $TARGET_DIR"
-echo "  2. curl -LsSf https://astral.sh/uv/install.sh | sh   # se ainda não tiver uv"
-echo "  3. uv sync"
-echo "  4. cp .env.example .env   # preencha OPENROUTER_API_KEY"
-echo "  5. (cd litellm_proxy && docker compose up -d)"
-echo "  6. uv run python -m app.main"
+echo "  ATENÇÃO: rode também part2_setup.sh E part3_setup.sh antes de"
+echo "  instalar/testar -- os arquivos de agente aqui já importam os"
+echo "  módulos de PII (Parte 2) e guardrails (Parte 3)."
+echo ""
+echo "  1. bash part2_setup.sh $TARGET_DIR"
+echo "  2. bash part3_setup.sh $TARGET_DIR   # (e cicd_setup.sh, se quiser)"
+echo "  3. cd $TARGET_DIR"
+echo "  4. curl -LsSf https://astral.sh/uv/install.sh | sh   # se ainda não tiver uv"
+echo "  5. uv sync"
+echo "  6. cp .env.example .env   # preencha OPENROUTER_API_KEY e PII_HASH_SALT"
+echo "  7. (cd litellm_proxy && docker compose up -d)"
+echo "  8. uv run python -m app.main"

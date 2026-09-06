@@ -1,7 +1,7 @@
 """
-Unit tests for the interim guardrail that blocks unauthorized
-transfer_to_agent attempts (see app/agents/_guardrails.py for context on
-why this exists — adk-python#3850, still open upstream).
+Unit tests for the guardrail that blocks unauthorized transfer_to_agent
+attempts (see app/agents/guardrails/transfer.py for context on why this
+exists — adk-python#3850, still open upstream).
 
 No LLM calls here: we construct fake LlmResponse objects directly to
 test the detection/blocking logic in isolation.
@@ -12,8 +12,8 @@ from unittest.mock import MagicMock
 from google.adk.models import LlmResponse
 from google.genai import types
 
-from app.agents._guardrails import block_unauthorized_transfer
-from app.session.state_schema import STATE_GUARDRAIL_FLAGS
+from app.agents.guardrails.transfer import block_unauthorized_transfer
+from app.agents.session.state_schema import STATE_GUARDRAIL_FLAGS
 
 
 def _fake_context(agent_name: str = "KnowledgeAgent") -> MagicMock:

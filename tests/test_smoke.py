@@ -67,9 +67,128 @@ def test_specialists_have_no_parent_agent():
         )
 
 
+def test_every_agent_instruction_includes_company_name():
+    # Barato e sem chamada de LLM -- pega o caso "criei um agente novo e
+    # esqueci de importar PERSONA_INTRO", antes de precisar de um teste
+    # ao vivo pra descobrir isso.
+    from app.agents.persona import COMPANY_NAME
+
+    all_agents = [root_agent, *_specialist_agents()]
+    for agent in all_agents:
+        assert COMPANY_NAME in agent.instruction, (
+            f"{agent.name} não tem {COMPANY_NAME} na instruction -- "
+            "provavelmente esqueceu de usar PERSONA_INTRO"
+        )
+
+
+def test_every_agent_recovers_from_duplicated_tool_call_json():
+    # BerriAI/litellm#20543: modelos Claude ocasionalmente emitem
+    # argumentos de tool call como JSON duplicado. Defesa em
+    # profundidade -- qualquer agente com tools pode ser afetado, não
+    # só onde foi observado a primeira vez (QualificationAgent).
+    from app.agents.guardrails.model_error_recovery import (
+        recover_from_duplicated_tool_call_json,
+    )
+
+    all_agents = [root_agent, *_specialist_agents()]
+    for agent in all_agents:
+        assert agent.on_model_error_callback is recover_from_duplicated_tool_call_json, (
+            f"{agent.name} não tem recover_from_duplicated_tool_call_json registrado"
+        )
+
+
 def test_scheduling_agent_tools_are_registered():
     scheduling_agent = next(
         agent for agent in _specialist_agents() if agent.name == "SchedulingAgent"
     )
     tool_names = {tool.__name__ for tool in scheduling_agent.tools}
     assert tool_names == {"check_availability", "book_meeting"}
+
+
+def test_qualification_agent_has_set_status_tool():
+    qualification_agent = next(
+        agent for agent in _specialist_agents() if agent.name == "QualificationAgent"
+    )
+    tool_names = {tool.__name__ for tool in qualification_agent.tools}
+    assert tool_names == {"set_qualification_status"}
+
+
+def _as_list(callback):
+    """ADK aceita um único callback ou uma lista -- normaliza pra lista
+    pra comparar de forma consistente nos testes."""
+    if callback is None:
+        return []
+    return callback if isinstance(callback, list) else [callback]
+
+
+def test_every_agent_masks_pii_before_calling_the_model():
+    # Defesa em profundidade: TODO agente (Orchestrator + especialistas)
+    # precisa mascarar PII antes de chamar seu próprio modelo — mesmo
+    # que hoje só o Orchestrator receba texto cru do usuário, um futuro
+    # tool de especialista (Parte 4+) poderia trazer PII de outro lugar.
+    from app.agents.pii.masking import mask_pii
+
+    all_agents = [root_agent, *_specialist_agents()]
+    for agent in all_agents:
+        assert mask_pii in _as_list(agent.before_model_callback), (
+            f"{agent.name} não tem mask_pii registrado em before_model_callback"
+        )
+
+
+def test_every_agent_detects_prompt_injection():
+    # Parte 3: mesma postura de defesa em profundidade do mask_pii.
+    from app.agents.guardrails.prompt_injection import detect_prompt_injection
+
+    all_agents = [root_agent, *_specialist_agents()]
+    for agent in all_agents:
+        assert detect_prompt_injection in _as_list(agent.before_model_callback), (
+            f"{agent.name} não tem detect_prompt_injection registrado"
+        )
+
+
+def test_every_agent_validates_output_policy():
+    # Parte 3: resolve o TODO de objection.py -- "nunca ofereça desconto"
+    # precisa ser verificado na resposta de verdade, não só confiado ao
+    # prompt. Defesa em profundidade em todo agente, não só onde o TODO
+    # original estava (ver decisão de escopo da Parte 3).
+    from app.agents.guardrails.output_policy import validate_output_policy
+
+    all_agents = [root_agent, *_specialist_agents()]
+    for agent in all_agents:
+        assert validate_output_policy in _as_list(agent.after_model_callback), (
+            f"{agent.name} não tem validate_output_policy registrado"
+        )
+
+
+def test_only_orchestrator_unmasks_pii():
+    # unmask_pii só pode estar no Orchestrator -- ele é o único ponto de
+    # saída pro usuário. Se algum especialista também desmascarasse, PII
+    # voltaria pro contexto do Orchestrator antes da resposta final.
+    from app.agents.pii.masking import unmask_pii
+
+    assert unmask_pii in _as_list(root_agent.after_model_callback)
+
+    for agent in _specialist_agents():
+        assert unmask_pii not in _as_list(agent.after_model_callback), (
+            f"{agent.name} não deveria desmascarar PII por conta própria"
+        )
+
+
+def test_only_scheduling_agent_has_action_allowlist():
+    # enforce_action_allowlist só faz sentido em SchedulingAgent hoje --
+    # é o único agente com uma ação (book_meeting) que precisa de
+    # allowlist. Se aparecer em outro agente sem querer, ou sumir do
+    # SchedulingAgent, isso pega a regressão.
+    from app.agents.guardrails.action_allowlist import enforce_action_allowlist
+
+    for agent in [root_agent, *_specialist_agents()]:
+        callbacks = _as_list(agent.before_tool_callback)
+        if agent.name == "SchedulingAgent":
+            assert enforce_action_allowlist in callbacks, (
+                "SchedulingAgent deveria ter enforce_action_allowlist em "
+                "before_tool_callback"
+            )
+        else:
+            assert enforce_action_allowlist not in callbacks, (
+                f"{agent.name} não deveria ter enforce_action_allowlist"
+            )

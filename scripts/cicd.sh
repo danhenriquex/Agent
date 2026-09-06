@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# Gerado em: 2026-08-09T13:30:38Z -- se os outros scripts (part1/cicd/part2/part3) que você tem localmente têm datas MUITO diferentes desta, você está misturando versões antigas com novas. Baixe os 4 de novo, juntos, na mesma resposta/mensagem.
 #
 # cicd_setup.sh — adiciona/atualiza a camada de CI/CD + deploy GCP:
 #   - app/api.py e tests/test_api.py (camada HTTP sobre os agentes)
@@ -8,6 +9,7 @@
 #   - pyproject.toml/uv.lock/.python-version atualizados (adiciona
 #     fastapi/uvicorn as deps de runtime e httpx/ruff ao grupo dev)
 #   - README.md atualizado com a secao de deploy na GCP
+#   - Makefile com atalhos (make web / make cli / make test / etc)
 #
 # Pré-requisito: rode isso DEPOIS de part1_setup.sh — este script só
 # adiciona a camada de CI/CD por cima do que já existe, não recria o
@@ -142,6 +144,266 @@ def test_health_returns_ok():
     assert response.json() == {"status": "ok"}
 SDR_CICD_EOF
 
+echo "  - tests/test_tool_logic.py"
+cat > "$TARGET_DIR/tests/test_tool_logic.py" <<'SDR_CICD_EOF'
+"""
+Layer 2 de testes: as funções de tool que são Python puro (sem chamada
+de LLM) merecem teste direto, não só indireto via guardrail. Rápido,
+grátis, e pega regressão na lógica determinística antes de qualquer
+chamada de API real.
+
+Ver README > "Estratégia de testes" para onde isso se encaixa na
+pirâmide de 4 camadas (estrutural → lógica de tool → conversa dourada →
+eval set com LLM-judge).
+"""
+
+from unittest.mock import MagicMock
+
+from app.agents.qualification import set_qualification_status
+from app.agents.scheduling import book_meeting, check_availability
+from app.agents.session.state_schema import STATE_QUALIFICATION_STATUS
+
+
+def _fake_tool_context() -> MagicMock:
+    ctx = MagicMock()
+    ctx.state = {}
+    return ctx
+
+
+# --- check_availability ---
+
+
+def test_check_availability_returns_success_with_slots():
+    result = check_availability()
+
+    assert result["status"] == "success"
+    assert len(result["available_slots"]) == 3
+
+
+# --- book_meeting ---
+
+
+def test_book_meeting_confirms_valid_slot():
+    result = book_meeting("terça-feira às 10h")
+
+    assert result["status"] == "success"
+    assert result["confirmed_slot"] == "terça-feira às 10h"
+
+
+def test_book_meeting_rejects_invalid_slot():
+    result = book_meeting("sexta-feira às 20h")
+
+    assert result["status"] == "error"
+    assert "não está disponível" in result["error_message"]
+
+
+def test_book_meeting_slot_list_matches_check_availability():
+    # Trava a consistência entre as duas tools -- se alguém mudar
+    # _MOCK_SLOTS num lugar só, isso pega a divergência.
+    available = check_availability()["available_slots"]
+    for slot in available:
+        assert book_meeting(slot)["status"] == "success"
+
+
+# --- set_qualification_status ---
+
+
+def test_set_qualification_status_accepts_valid_status():
+    ctx = _fake_tool_context()
+
+    result = set_qualification_status("qualified", "orçamento e prazo confirmados", ctx)
+
+    assert result["status"] == "success"
+    assert result["recorded_status"] == "qualified"
+    assert ctx.state[STATE_QUALIFICATION_STATUS] == "qualified"
+
+
+def test_set_qualification_status_rejects_invalid_status():
+    ctx = _fake_tool_context()
+
+    result = set_qualification_status("super_qualified", "não é um status real", ctx)
+
+    assert result["status"] == "error"
+    assert STATE_QUALIFICATION_STATUS not in ctx.state
+
+
+def test_set_qualification_status_all_valid_values_accepted():
+    for status in ("qualified", "disqualified", "in_progress"):
+        ctx = _fake_tool_context()
+        result = set_qualification_status(status, "teste", ctx)
+        assert result["status"] == "success"
+        assert ctx.state[STATE_QUALIFICATION_STATUS] == status
+SDR_CICD_EOF
+
+echo "  - tests/test_golden_conversations.py"
+cat > "$TARGET_DIR/tests/test_golden_conversations.py" <<'SDR_CICD_EOF'
+"""
+Layer 3 de testes: "conversas douradas" -- rodam contra o LLM de
+verdade (via LiteLLM Proxy -> OpenRouter) e verificam ESTRUTURA (qual
+tool foi chamada, o que foi escrito em session.state), não texto exato.
+Isso é deliberadamente MAIS simples que o eval set da Parte 6 (sem
+modelo-juiz, sem rubrica de nota) -- o objetivo aqui é pegar "um ajuste
+de prompt fez o agente parar de chamar set_qualification_status", não
+avaliar qualidade de resposta.
+
+Custam chamadas reais de API e precisam do LiteLLM Proxy rodando --
+por isso ficam FORA do `pytest`/`make test` padrão, rodando só quando
+explicitamente pedido:
+
+    make test-live
+    # ou
+    RUN_LIVE_TESTS=1 uv run pytest tests/test_golden_conversations.py -v
+
+Pré-requisito: proxy de pé (`make proxy-up`) e .env configurado
+(OPENROUTER_API_KEY, PII_HASH_SALT).
+"""
+
+import os
+import uuid
+
+import pytest
+from google.adk.runners import Runner
+from google.adk.sessions import InMemorySessionService
+from google.genai import types
+
+pytestmark = pytest.mark.skipif(
+    os.environ.get("RUN_LIVE_TESTS") != "1",
+    reason=(
+        "Testes ao vivo -- custam chamadas reais de API e precisam do "
+        "LiteLLM Proxy rodando. Rode com RUN_LIVE_TESTS=1 (ou `make test-live`)."
+    ),
+)
+
+_APP_NAME = "sdr-bot-test"
+
+
+async def _run_conversation(agent, messages: list[str]) -> tuple[dict, str]:
+    """Roda uma conversa multi-turno contra um agente real (specialist
+    OU root_agent) e retorna (session.state final, texto da última
+    resposta).
+
+    Cada teste usa um session_id novo (uuid) -- sessões não devem
+    vazar estado entre testes.
+    """
+    session_service = InMemorySessionService()
+    user_id = "test-user"
+    session_id = f"golden-{uuid.uuid4().hex[:8]}"
+
+    await session_service.create_session(
+        app_name=_APP_NAME, user_id=user_id, session_id=session_id
+    )
+    runner = Runner(agent=agent, app_name=_APP_NAME, session_service=session_service)
+
+    last_response_text = ""
+    for message in messages:
+        content = types.Content(role="user", parts=[types.Part(text=message)])
+        async for event in runner.run_async(
+            user_id=user_id, session_id=session_id, new_message=content
+        ):
+            if event.is_final_response() and event.content and event.content.parts:
+                last_response_text = event.content.parts[0].text or last_response_text
+
+    session = await session_service.get_session(
+        app_name=_APP_NAME, user_id=user_id, session_id=session_id
+    )
+    return session.state, last_response_text
+
+
+# --- Orchestrator: saudação (padrão booking-first) ---
+
+
+async def test_greeting_introduces_bot_and_company():
+    from app.agents import root_agent
+    from app.agents.persona import COMPANY_NAME
+
+    _state, response_text = await _run_conversation(root_agent, ["oi"])
+
+    # A queixa original era literal: "oi" respondia só "como posso
+    # ajudar", sem contexto nenhum. Isso verifica a correção de forma
+    # estrutural (nome da empresa presente), não texto exato -- resiste
+    # a ajustes futuros de tom/redação do prompt.
+    assert COMPANY_NAME.lower() in response_text.lower(), (
+        f"Resposta à saudação não menciona {COMPANY_NAME}: {response_text!r}"
+    )
+
+
+# --- QualificationAgent ---
+
+
+async def test_qualification_flow_sets_status():
+    from app.agents.qualification import qualification_agent
+    from app.agents.session.state_schema import STATE_QUALIFICATION_STATUS
+
+    state, _response_text = await _run_conversation(
+        qualification_agent,
+        [
+            "Oi, vi vocês no LinkedIn",
+            "Temos uns 50 funcionários, orçamento de uns R$5k/mês",
+            "Sou eu quem decide isso",
+            "Precisamos resolver isso ainda esse trimestre",
+        ],
+    )
+
+    # Não afirmamos QUAL status -- isso depende de julgamento do modelo
+    # e mudaria a cada ajuste de prompt. Afirmamos que a tool foi
+    # chamada com ALGUM valor válido -- é isso que prova que o fluxo
+    # não quebrou.
+    assert state.get(STATE_QUALIFICATION_STATUS) in {
+        "qualified",
+        "in_progress",
+        "disqualified",
+    }
+
+
+# --- SchedulingAgent (allowlist deveria bloquear sem qualificação prévia) ---
+
+
+async def test_scheduling_blocks_booking_without_qualification():
+    from app.agents.scheduling import scheduling_agent
+    from app.agents.session.state_schema import STATE_GUARDRAIL_FLAGS
+
+    state, _response_text = await _run_conversation(
+        scheduling_agent,
+        ["quero marcar uma reunião", "pode ser terça-feira às 10h"],
+    )
+
+    # Sessão nova = sem qualification_status setado = allowlist deveria
+    # ter bloqueado book_meeting. Verificamos pelo flag de guardrail,
+    # não pelo texto da resposta (que varia).
+    flags = state.get(STATE_GUARDRAIL_FLAGS, [])
+    assert any("book_meeting" in f and "bloqueado" in f for f in flags), (
+        f"Esperava um flag de bloqueio de book_meeting, achei: {flags}"
+    )
+
+
+# --- Orchestrator (roteamento ponta a ponta) ---
+
+
+async def test_orchestrator_routes_pricing_question_to_knowledge_agent():
+    from app.agents import root_agent
+    from app.agents.session.state_schema import STATE_LAST_RETRIEVED_CONTEXT
+
+    state, _response_text = await _run_conversation(
+        root_agent, ["quanto custa o plano de vocês?"]
+    )
+
+    # Confirma que o Orchestrator consultou o KnowledgeAgent -- pelo
+    # state que ele escreve, não pelo texto exato da resposta (isso
+    # continua válido depois que a Parte 4 trocar o stub por RAG real).
+    assert STATE_LAST_RETRIEVED_CONTEXT in state
+
+
+async def test_orchestrator_routes_objection_to_objection_agent():
+    from app.agents import root_agent
+    from app.agents.session.state_schema import STATE_OBJECTIONS_RAISED
+
+    state, _response_text = await _run_conversation(
+        root_agent, ["isso parece caro pra gente agora"]
+    )
+
+    assert STATE_OBJECTIONS_RAISED in state
+SDR_CICD_EOF
+
 echo "  - Dockerfile"
 cat > "$TARGET_DIR/Dockerfile" <<'SDR_CICD_EOF'
 # syntax=docker/dockerfile:1
@@ -231,11 +493,38 @@ echo "  - .gitlab-ci.yml"
 cat > "$TARGET_DIR/.gitlab-ci.yml" <<'SDR_CICD_EOF'
 # .gitlab-ci.yml
 #
+# Modelo de branches deste projeto (deliberadamente simples, não é
+# GitFlow completo — não há release/hotfix branches, o que seria
+# overhead desproporcional para um projeto deste porte):
+#
+#   feature branches ──MR──► develop ──MR──► main
+#      (trabalho acontece)   (integração,     (só deploy —
+#                             default branch    nada mais)
+#                             do repositório)
+#
+# Por isso as regras abaixo usam nomes de branch explícitos
+# ("develop", "main"), não $CI_DEFAULT_BRANCH — uma vez que
+# "branch padrão do repositório" (develop) e "branch que decide o
+# deploy" (main) passam a ser conceitos diferentes, uma variável só não
+# dá conta dos dois.
+#
 # Pipeline evolutivo: lint + test + validação de Dockerfile rodam SEMPRE
-# e não dependem de nenhuma credencial. Os estágios de push/deploy na GCP
-# só entram no pipeline quando as variáveis de CI/CD abaixo estiverem
-# configuradas em Settings > CI/CD > Variables — até lá, o pipeline fica
-# verde só com lint+test+build_check, sem quebrar por falta de credencial.
+# em MR e em push pra develop/main, e não dependem de nenhuma credencial.
+# Os estágios de push/deploy na GCP só entram no pipeline quando as
+# variáveis de CI/CD abaixo estiverem configuradas E o commit for em
+# main especificamente — até lá, o pipeline fica verde só com
+# lint+test+build_check.
+#
+# `uv sync --locked` (não --frozen): --frozen instala o que estiver no
+# uv.lock SEM checar se bate com pyproject.toml -- se o lock commitado
+# estiver desatualizado (ex: uma dependência de dev foi adicionada no
+# pyproject.toml mas o uv.lock não foi regenerado), --frozen instala
+# silenciosamente incompleto, sem erro nenhum. Foi exatamente assim que
+# um `ruff check` falhou em CI com "No such file or directory" — o lock
+# commitado não tinha o ruff, e --frozen nunca reclamou disso. --locked
+# falha alto e claro nesse cenário ("lockfile não está atualizado"), o
+# que é um erro muito mais fácil de diagnosticar que "comando não
+# encontrado" no meio de um job de lint.
 #
 # Variáveis de CI/CD esperadas (configurar quando for ativar o deploy):
 #   GCP_PROJECT_ID       - ID do projeto GCP de destino
@@ -288,21 +577,23 @@ lint:
   stage: lint
   image: ghcr.io/astral-sh/uv:python3.12-bookworm-slim
   script:
-    - uv sync --frozen
+    - uv sync --locked
     - uv run ruff check app tests
   rules:
     - if: $CI_PIPELINE_SOURCE == "merge_request_event"
-    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
+    - if: $CI_COMMIT_BRANCH == "develop"
+    - if: $CI_COMMIT_BRANCH == "main"
 
 test:
   stage: test
   image: ghcr.io/astral-sh/uv:python3.12-bookworm-slim
   script:
-    - uv sync --frozen
+    - uv sync --locked
     - uv run pytest tests/ -v
   rules:
     - if: $CI_PIPELINE_SOURCE == "merge_request_event"
-    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
+    - if: $CI_COMMIT_BRANCH == "develop"
+    - if: $CI_COMMIT_BRANCH == "main"
   # Nota: os testes atuais (smoke test da topologia de agentes + /health
   # da API) não fazem nenhuma chamada real de LLM nem precisam de
   # OPENROUTER_API_KEY — seguro rodar em qualquer pipeline, inclusive de
@@ -321,7 +612,8 @@ docker_build_check:
     - docker build -t litellm-proxy:ci-check ./litellm_proxy
   rules:
     - if: $CI_PIPELINE_SOURCE == "merge_request_event"
-    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
+    - if: $CI_COMMIT_BRANCH == "develop"
+    - if: $CI_COMMIT_BRANCH == "main"
   # Roda SEMPRE, mesmo sem GCP configurado — só valida que os Dockerfiles
   # buildam de verdade. Pega Dockerfile quebrado antes de qualquer
   # tentativa de deploy, sem precisar de nenhuma credencial de nuvem.
@@ -347,7 +639,7 @@ build_and_push:
     - docker build -t "${PROXY_IMAGE_TAG}" ./litellm_proxy
     - docker push "${PROXY_IMAGE_TAG}"
   rules:
-    - if: '$GCP_PROJECT_ID && $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH'
+    - if: '$GCP_PROJECT_ID && $CI_COMMIT_BRANCH == "main"'
 
 deploy_litellm_proxy:
   stage: deploy
@@ -378,7 +670,7 @@ deploy_litellm_proxy:
     name: production/litellm-proxy
   needs: ["build_and_push"]
   rules:
-    - if: '$GCP_PROJECT_ID && $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH'
+    - if: '$GCP_PROJECT_ID && $CI_COMMIT_BRANCH == "main"'
       when: manual
 
 deploy_sdr_bot_api:
@@ -406,8 +698,114 @@ deploy_sdr_bot_api:
     name: production/sdr-bot-api
   needs: ["deploy_litellm_proxy"]
   rules:
-    - if: '$GCP_PROJECT_ID && $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH'
+    - if: '$GCP_PROJECT_ID && $CI_COMMIT_BRANCH == "main"'
       when: manual
+SDR_CICD_EOF
+
+echo "  - Makefile"
+cat > "$TARGET_DIR/Makefile" <<'SDR_CICD_EOF'
+SHELL := /bin/bash
+.DEFAULT_GOAL := help
+
+PROXY_COMPOSE := litellm_proxy/docker-compose.yml
+AGENTS_DIR := app/agents
+PROXY_READY_URL := http://localhost:4000/health/readiness
+PROXY_READY_TIMEOUT := 30
+
+.PHONY: help sync proxy-up proxy-down proxy-restart proxy-logs proxy-status \
+        web cli api test test-pii lint clean
+
+help:
+	@echo "Comandos disponíveis:"
+	@echo ""
+	@echo "  make sync          - uv sync (instala/atualiza dependências)"
+	@echo ""
+	@echo "  make web           - sobe o proxy (se preciso) e abre a UI do adk web"
+	@echo "  make cli           - sobe o proxy (se preciso) e roda o bot via CLI"
+	@echo "  make api           - sobe o proxy (se preciso) e roda a API FastAPI (--reload)"
+	@echo ""
+	@echo "  make proxy-up      - sobe o LiteLLM Proxy e espera ele responder de verdade"
+	@echo "  make proxy-down    - derruba o LiteLLM Proxy"
+	@echo "  make proxy-restart - derruba e sobe de novo (útil após editar .env)"
+	@echo "  make proxy-logs    - segue os logs do proxy"
+	@echo "  make proxy-status  - mostra se o container está de pé"
+	@echo ""
+	@echo "  make test          - roda a suite de testes completa"
+	@echo "  make test-pii      - roda só os testes de PII (mais rápido pra iterar)"
+	@echo "  make test-guardrails - roda só os testes de guardrails (Parte 3)"
+	@echo "  make test-live     - conversas douradas contra o LLM real (custa"
+	@echo "                       API, sobe o proxy sozinho) — NÃO entra em 'make test'"
+	@echo "  make lint          - roda o ruff"
+	@echo "  make clean         - remove __pycache__/.pytest_cache/.ruff_cache"
+
+sync:
+	uv sync
+
+# Sobe o proxy e espera de verdade ele responder antes de liberar o
+# próximo comando -- isso existe especificamente porque "docker compose
+# up -d" retorna assim que o CONTAINER inicia, não quando o processo
+# LiteLLM lá dentro termina de registrar os modelos e está pronto pra
+# aceitar conexão. Sem esperar isso, curl/a aplicação podem chegar
+# primeiro e receber "empty reply from server" -- foi exatamente o que
+# aconteceu depurando isso manualmente antes deste Makefile existir.
+proxy-up:
+	@docker compose -f $(PROXY_COMPOSE) up -d
+	@echo -n "Esperando o proxy ficar pronto"
+	@for i in $$(seq 1 $(PROXY_READY_TIMEOUT)); do \
+		if curl -sf $(PROXY_READY_URL) > /dev/null 2>&1; then \
+			echo " OK"; \
+			exit 0; \
+		fi; \
+		echo -n "."; \
+		sleep 1; \
+	done; \
+	echo ""; \
+	echo "ERRO: proxy não respondeu após $(PROXY_READY_TIMEOUT)s."; \
+	echo "Rode 'make proxy-logs' para ver o que aconteceu."; \
+	exit 1
+
+proxy-down:
+	docker compose -f $(PROXY_COMPOSE) down
+
+proxy-restart: proxy-down proxy-up
+
+proxy-logs:
+	docker compose -f $(PROXY_COMPOSE) logs -f litellm-proxy
+
+proxy-status:
+	docker compose -f $(PROXY_COMPOSE) ps
+
+web: proxy-up
+	uv run adk web $(AGENTS_DIR)
+
+cli: proxy-up
+	uv run python -m app.main
+
+api: proxy-up
+	uv run uvicorn app.api:app --reload
+
+test:
+	uv run pytest -v
+
+test-pii:
+	uv run pytest tests/test_pii_masking.py -v
+
+test-guardrails:
+	uv run pytest tests/test_prompt_injection.py tests/test_output_policy.py \
+		tests/test_action_allowlist.py tests/test_guardrails.py -v
+
+# Testes ao vivo (Layer 3): custam chamadas reais de API, por isso não
+# entram em "make test". Sobe o proxy (se preciso) antes de rodar.
+test-live: proxy-up
+	RUN_LIVE_TESTS=1 uv run pytest tests/test_golden_conversations.py -v
+
+lint:
+	uv run ruff check app tests
+
+clean:
+	find . -name "__pycache__" -not -path "*/.venv/*" -exec rm -rf {} + 2>/dev/null || true
+	find . -name ".pytest_cache" -not -path "*/.venv/*" -exec rm -rf {} + 2>/dev/null || true
+	find . -name ".ruff_cache" -not -path "*/.venv/*" -exec rm -rf {} + 2>/dev/null || true
 SDR_CICD_EOF
 
 echo "  - pyproject.toml"
@@ -441,6 +839,7 @@ dev = [
 
 [tool.pytest.ini_options]
 pythonpath = ["."]
+asyncio_mode = "auto"
 
 [tool.ruff]
 line-length = 100
@@ -2743,7 +3142,7 @@ Este projeto é dividido em partes incrementais. Este README cobre a **Parte 1**
   permanece no controle da conversa em todo turno — nenhum especialista
   assume a conversa permanentemente.
 - Estado compartilhado (`session.state`) com contrato documentado em
-  `app/session/state_schema.py`.
+  `app/agents/session/state_schema.py`.
 - Camada de modelo desacoplada: cada agente usa `LiteLlm` apontando para
   um **LiteLLM Proxy self-hosted**, que por sua vez roteia para modelos na
   **OpenRouter** — ver `litellm_proxy/config.yaml` para o mapeamento
@@ -2766,6 +3165,36 @@ Este projeto é dividido em partes incrementais. Este README cobre a **Parte 1**
 Cada agente tem comentários `TODO Parte N` no código exatamente nos pontos
 onde essas camadas vão se conectar — não são promessas soltas, são pontos
 de extensão já identificados na arquitetura.
+
+## Atalhos com Makefile
+
+Depois do primeiro setup manual acima, o dia a dia fica mais rápido via
+`make` — em especial `make web` resolve o problema de "quero testar na
+UI do adk toda hora": ele sobe o proxy (se ainda não estiver de pé),
+**espera de verdade ele responder** antes de prosseguir (isso existe
+porque `docker compose up -d` retorna assim que o container inicia, não
+quando o LiteLLM lá dentro termina de registrar os modelos — sem essa
+espera, é fácil bater num "empty reply from server" por pura corrida de
+horário), e só então abre a interface:
+
+```bash
+make web    # proxy + adk web, tudo em um comando
+make cli    # proxy + CLI (app/main.py)
+make api    # proxy + FastAPI com --reload
+
+make proxy-status   # container está de pé?
+make proxy-logs     # acompanhar logs do proxy
+make proxy-restart  # derrubar e subir de novo (necessário após editar .env)
+
+make test    # suite completa (grátis -- camadas 1 e 2 de teste)
+make test-live  # conversas douradas contra o LLM real (custa API --
+                # disponível a partir da Parte 2/3, ver estratégia de
+                # testes na versão completa deste README)
+make lint    # ruff
+make clean   # limpa __pycache__/.pytest_cache/.ruff_cache
+```
+
+Rode `make` (sem alvo) ou `make help` pra ver a lista completa.
 
 ## Como rodar
 
@@ -2830,7 +3259,42 @@ Você: quanto custa o plano?
 [OrchestratorAgent] Sobre os planos...
 ```
 
-### 5. Rodar os testes
+### 6. Interface visual do ADK (`adk web`)
+
+O ADK inclui uma UI de desenvolvimento que mostra a árvore de agentes, o
+histórico de eventos turno a turno, e o payload exato de cada chamada de
+tool (nome, argumentos, retorno) — útil sobretudo para depurar problemas
+de tool-calling sem precisar ler traceback.
+
+```bash
+uv run adk web app/agents
+```
+
+Abra `http://127.0.0.1:8000` no navegador. O agente aparece na UI com o
+nome `agents` (nome da pasta) — isso é esperado, não é o nome de nenhum
+agente nosso especificamente.
+
+**Detalhe não-óbvio, documentado aqui porque nos custou tempo depurando**:
+o ADK decide como escanear a pasta baseado numa convenção específica —
+`is_single_agent_directory()` (em `google/adk/cli/utils/agent_loader.py`)
+procura por um arquivo chamado literalmente `agent.py` (ou
+`root_agent.yaml`) diretamente na pasta apontada. Sem isso, o ADK assume
+que a pasta é um **diretório pai contendo vários agentes** e escaneia
+*suas subpastas* como se cada uma fosse um agente separado — no nosso
+caso, isso faria o ADK escanear `config/` e `session/` (que não têm
+`root_agent`) em vez do próprio pacote `agents`, e a UI aparecia vazia,
+sem nenhum erro explícito.
+
+É por isso que existe `app/agents/agent.py` — um arquivo pequeno,
+somente com `from .orchestrator import root_agent`, cuja única função é
+satisfazer essa convenção. É também o motivo de `config/` e `session/`
+estarem aninhados dentro de `app/agents/` (não como pastas irmãs de
+`app/agents/`): o ADK isola a pasta apontada como raiz de import sem
+visibilidade nenhuma para pastas irmãs via import relativo — então tudo
+que os agentes precisam importar precisa estar dentro da própria pasta
+que o `adk web` aponta.
+
+### 7. Rodar os testes
 
 ```bash
 uv run pytest
@@ -2860,15 +3324,47 @@ OpenRouter ──► Claude 3.5 Sonnet / GPT-4o-mini / Llama 3.1 (fallback)
 
 ## CI/CD (GitLab) e deploy na GCP
 
+### Modelo de branches
+
+```
+feature branches ──MR──► develop ──MR──► main
+   (trabalho acontece)   (integração,      (só deploy — nada mais)
+                          default branch
+                          do repositório)
+```
+
+- **`develop`** é a branch padrão do repositório (configurar em Settings
+  → Repository → Default branch). Toda feature branch abre MR contra
+  ela. `lint`/`test`/`docker_build_check` rodam em qualquer MR e em todo
+  push pra `develop` — feedback rápido, sem tocar em nada de GCP.
+- **`main`** só recebe merge vindo de `develop`, quando o conjunto de
+  mudanças está pronto pra ir pro ar. É a **única** branch que os jobs
+  `build_and_push`/`deploy_*` reconhecem — um push direto em `develop`
+  nunca aciona deploy, só em `main`.
+- Deliberadamente **não** é GitFlow completo (sem release/hotfix
+  branches) — pra um projeto deste porte, esse processo extra não paga
+  o custo de manutenção.
+- Recomendado: proteger `main` em Settings → Repository → Protected
+  branches (só merge via MR, sem push direto).
+
+Isso é o motivo de `.gitlab-ci.yml` usar nomes de branch explícitos
+(`"develop"`, `"main"`) nas regras, em vez de `$CI_DEFAULT_BRANCH` — uma
+vez que "branch padrão" e "branch que decide deploy" são conceitos
+diferentes aqui, uma variável só não cobre os dois.
+
+### Pipeline
+
 O pipeline (`.gitlab-ci.yml`) é evolutivo, em duas camadas:
 
 1. **Sempre roda, sem credencial nenhuma**: `lint`, `test` (smoke tests,
    sem chamada real de LLM) e `docker_build_check` (valida que os
-   Dockerfiles buildam). Isso mantém o pipeline verde desde o primeiro
-   commit, mesmo antes de qualquer configuração de nuvem.
-2. **Só aparece quando a GCP estiver configurada**: `build_and_push`
-   (Artifact Registry) e os dois `deploy_*` (Cloud Run), condicionados à
-   variável `$GCP_PROJECT_ID` existir no projeto GitLab.
+   Dockerfiles buildam) — em qualquer MR e em push pra `develop` ou
+   `main`. Isso mantém o pipeline verde desde o primeiro commit, mesmo
+   antes de qualquer configuração de nuvem.
+2. **Só aparece quando a GCP estiver configurada E o commit for em
+   `main`**: `build_and_push` (Artifact Registry) e os dois `deploy_*`
+   (Cloud Run), condicionados à variável `$GCP_PROJECT_ID` existir no
+   projeto GitLab.
 
 Arquitetura de deploy: dois serviços Cloud Run — `litellm-proxy` (o
 gateway pra OpenRouter) e `sdr-bot-api` (a API FastAPI sobre o sistema de
@@ -2951,10 +3447,14 @@ echo ""
 echo "==> CI/CD gerado/atualizado com sucesso em $TARGET_DIR"
 echo ""
 echo "Próximos passos:"
+echo "  Nota: se os agentes vierem da Parte 2 em diante, rode também"
+echo "  part2_setup.sh e part3_setup.sh antes de \"make test\"/\"make web\""
+echo "  -- os arquivos de agente importam PII e guardrails independente"
+echo "  desta camada."
+echo ""
 echo "  1. cd $TARGET_DIR && uv sync   # agora inclui fastapi/uvicorn/ruff/httpx"
-echo "  2. uv run pytest tests/ -v   # confirma que tudo passa localmente"
-echo "  3. uv run ruff check app tests"
-echo "  4. git add . && git commit -m \"ci: pipeline inicial + camada HTTP + uv\""
-echo "  5. git push -u origin main   # o pipeline roda lint+test+build_check"
-echo "  6. Quando quiser ativar deploy na GCP: seguir README.md >"
-echo "     \"Configurando deploy na GCP\" e configurar as variáveis de CI/CD"
+echo "  2. make test   # ou: uv run pytest -v"
+echo "  3. make lint   # ou: uv run ruff check app tests"
+echo "  4. make web    # sobe o proxy e abre a UI do adk web"
+echo "  5. git add . && git commit -m \"ci: pipeline inicial + camada HTTP + uv + Makefile\""
+echo "  6. git push -u origin main   # o pipeline roda lint+test+build_check"

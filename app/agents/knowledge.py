@@ -1,18 +1,49 @@
 """
 Knowledge Agent — responde dúvidas sobre produto, preço e cases.
 
-Nesta Parte 1 ele ainda NÃO tem RAG de verdade (isso é a Parte 4, via um
-MCP server dedicado rodando sobre ChromaDB). Por enquanto ele responde só
-com o que está na instruction, deixando claro ao lead quando não tem
-certeza — importante para não estabelecer hábito de alucinar antes de
-termos avaliação de faithfulness (Parte 6).
+Parte 4: ganhou RAG de verdade via McpToolset, conectado a um servidor
+MCP dedicado (mcp_server/server.py) que roda sobre ChromaDB. O servidor
+é um PROCESSO SEPARADO (igual o LiteLLM Proxy) -- o ADK conecta nele via
+subprocess/stdio, não como import Python. É por isso que mcp_server/ e
+ingestion/ podem ficar fora de app/agents/ sem esbarrar na restrição de
+import-root isolado do `adk web` (Partes 1 e 2).
+
+Pré-requisito pra isso funcionar: a base de conhecimento precisa ter
+sido indexada pelo menos uma vez (`make ingest-dev`), senão o servidor
+MCP não encontra a coleção no ChromaDB.
 """
 
-from google.adk.agents import LlmAgent
+from pathlib import Path
 
-from app.agents._guardrails import block_unauthorized_transfer
-from app.config.models import get_model_for_role
-from app.session.state_schema import STATE_LAST_RETRIEVED_CONTEXT
+from google.adk.agents import LlmAgent
+from google.adk.tools.mcp_tool.mcp_session_manager import StdioConnectionParams
+from google.adk.tools.mcp_tool.mcp_toolset import McpToolset
+from mcp import StdioServerParameters
+
+from .config.models import get_model_for_role
+from .guardrails.model_error_recovery import recover_from_duplicated_tool_call_json
+from .guardrails.output_policy import validate_output_policy
+from .guardrails.prompt_injection import detect_prompt_injection
+from .guardrails.transfer import block_unauthorized_transfer
+from .persona import PERSONA_INTRO
+from .pii.masking import mask_pii
+from .session.state_schema import STATE_LAST_RETRIEVED_CONTEXT
+
+# app/agents/knowledge.py -> app/agents -> app -> raiz do projeto.
+# Calculado em runtime (não hardcoded) pra funcionar independente de
+# onde o projeto foi clonado.
+_PROJECT_ROOT = Path(__file__).parent.parent.parent
+
+_knowledge_base_mcp = McpToolset(
+    connection_params=StdioConnectionParams(
+        server_params=StdioServerParameters(
+            command="uv",
+            args=["run", "python", "mcp_server/server.py"],
+            cwd=str(_PROJECT_ROOT),
+        ),
+        timeout=15.0,
+    ),
+)
 
 knowledge_agent = LlmAgent(
     name="KnowledgeAgent",
@@ -23,21 +54,28 @@ knowledge_agent = LlmAgent(
         "custa', 'vocês integram com X', etc."
     ),
     instruction=(
-        "Você responde perguntas sobre nosso produto SaaS de forma "
-        "precisa e concisa. "
-        "IMPORTANTE (temporário — Parte 1): você ainda não tem acesso à "
-        "base de conhecimento real. Se não tiver certeza absoluta da "
-        "resposta, diga explicitamente que vai confirmar com o time e "
-        "NÃO invente números de preço ou funcionalidades. "
-        "TODO Parte 4: este agente vai receber um MCPToolset apontando "
-        "para um servidor MCP de retrieval (ChromaDB) — ver arquitetura "
-        "no README."
+        PERSONA_INTRO
+        + "Você responde perguntas sobre nosso produto SaaS de forma "
+        "precisa e concisa, usando as ferramentas de busca disponíveis "
+        "-- NUNCA responda sobre preço, funcionalidade ou integração "
+        "de memória sem antes consultar retrieve_product_docs ou "
+        "get_pricing_info.\n\n"
+        "Para perguntas de preço/planos, use get_pricing_info (retorna "
+        "o documento completo, mais confiável que busca semântica pra "
+        "esse tipo de pergunta). Para tudo mais sobre produto, "
+        "funcionalidades, objeções ou integrações, use "
+        "retrieve_product_docs com a pergunta do lead.\n\n"
+        "Se o resultado da busca não cobrir o que foi perguntado, diga "
+        "explicitamente que vai confirmar com o time -- NÃO invente "
+        "números de preço ou funcionalidades que não vieram da busca."
     ),
+    tools=[_knowledge_base_mcp],
     output_key=STATE_LAST_RETRIEVED_CONTEXT,
     # Chamado via AgentTool a partir do Orchestrator (ver orchestrator.py),
     # não via sub_agents — então este agente nunca ganha a ferramenta
     # transfer_to_agent para começar; não há transferência a bloquear. O
-    # guardrail abaixo fica como defesa em profundidade, não a proteção
-    # primária (ver docstring de _guardrails.py para o histórico do bug).
-    after_model_callback=block_unauthorized_transfer,
+    # guardrail de transfer abaixo fica como defesa em profundidade.
+    before_model_callback=[mask_pii, detect_prompt_injection],
+    after_model_callback=[validate_output_policy, block_unauthorized_transfer],
+    on_model_error_callback=recover_from_duplicated_tool_call_json,
 )

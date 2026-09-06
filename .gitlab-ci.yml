@@ -1,10 +1,37 @@
 # .gitlab-ci.yml
 #
+# Modelo de branches deste projeto (deliberadamente simples, não é
+# GitFlow completo — não há release/hotfix branches, o que seria
+# overhead desproporcional para um projeto deste porte):
+#
+#   feature branches ──MR──► develop ──MR──► main
+#      (trabalho acontece)   (integração,     (só deploy —
+#                             default branch    nada mais)
+#                             do repositório)
+#
+# Por isso as regras abaixo usam nomes de branch explícitos
+# ("develop", "main"), não $CI_DEFAULT_BRANCH — uma vez que
+# "branch padrão do repositório" (develop) e "branch que decide o
+# deploy" (main) passam a ser conceitos diferentes, uma variável só não
+# dá conta dos dois.
+#
 # Pipeline evolutivo: lint + test + validação de Dockerfile rodam SEMPRE
-# e não dependem de nenhuma credencial. Os estágios de push/deploy na GCP
-# só entram no pipeline quando as variáveis de CI/CD abaixo estiverem
-# configuradas em Settings > CI/CD > Variables — até lá, o pipeline fica
-# verde só com lint+test+build_check, sem quebrar por falta de credencial.
+# em MR e em push pra develop/main, e não dependem de nenhuma credencial.
+# Os estágios de push/deploy na GCP só entram no pipeline quando as
+# variáveis de CI/CD abaixo estiverem configuradas E o commit for em
+# main especificamente — até lá, o pipeline fica verde só com
+# lint+test+build_check.
+#
+# `uv sync --locked` (não --frozen): --frozen instala o que estiver no
+# uv.lock SEM checar se bate com pyproject.toml -- se o lock commitado
+# estiver desatualizado (ex: uma dependência de dev foi adicionada no
+# pyproject.toml mas o uv.lock não foi regenerado), --frozen instala
+# silenciosamente incompleto, sem erro nenhum. Foi exatamente assim que
+# um `ruff check` falhou em CI com "No such file or directory" — o lock
+# commitado não tinha o ruff, e --frozen nunca reclamou disso. --locked
+# falha alto e claro nesse cenário ("lockfile não está atualizado"), o
+# que é um erro muito mais fácil de diagnosticar que "comando não
+# encontrado" no meio de um job de lint.
 #
 # Variáveis de CI/CD esperadas (configurar quando for ativar o deploy):
 #   GCP_PROJECT_ID       - ID do projeto GCP de destino
@@ -15,6 +42,15 @@
 #   WIF_POOL_ID          - ID do Workload Identity Pool
 #   WIF_PROVIDER_ID      - ID do Provider dentro do pool
 #   WIF_SERVICE_ACCOUNT  - email da service account impersonada
+#   CLOUD_SQL_CONNECTION_NAME - PROJETO:REGIAO:INSTANCIA (sai de
+#                               `terraform output`), usada por
+#                               deploy_sdr_bot_api pra montar
+#                               --add-cloudsql-instances
+#
+# Todas essas variáveis (e a infra que elas apontam: Artifact Registry, WIF,
+# Secret Manager, Cloud SQL) são provisionadas via Terraform -- ver
+# terraform/ e README.md > "Deploy via Terraform". `terraform output` gera
+# exatamente os valores a colar aqui.
 #
 # Autenticação: usamos Workload Identity Federation (OIDC), não uma chave
 # JSON de service account estática — os tokens são de curta duração e
@@ -32,6 +68,7 @@ stages:
 variables:
   API_IMAGE_TAG: "${AR_REGION}-docker.pkg.dev/${GCP_PROJECT_ID}/${AR_REPOSITORY}/sdr-bot-api:${CI_COMMIT_SHORT_SHA}"
   PROXY_IMAGE_TAG: "${AR_REGION}-docker.pkg.dev/${GCP_PROJECT_ID}/${AR_REPOSITORY}/litellm-proxy:${CI_COMMIT_SHORT_SHA}"
+  TELEGRAM_IMAGE_TAG: "${AR_REGION}-docker.pkg.dev/${GCP_PROJECT_ID}/${AR_REPOSITORY}/telegram-service:${CI_COMMIT_SHORT_SHA}"
 
 # Bloco reutilizado pelos jobs que precisam autenticar na GCP via WIF.
 # Troca o ID token do GitLab por uma credencial federada de curta duração,
@@ -57,21 +94,23 @@ lint:
   stage: lint
   image: ghcr.io/astral-sh/uv:python3.12-bookworm-slim
   script:
-    - uv sync --frozen
+    - uv sync --locked
     - uv run ruff check app tests
   rules:
     - if: $CI_PIPELINE_SOURCE == "merge_request_event"
-    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
+    - if: $CI_COMMIT_BRANCH == "develop"
+    - if: $CI_COMMIT_BRANCH == "main"
 
 test:
   stage: test
   image: ghcr.io/astral-sh/uv:python3.12-bookworm-slim
   script:
-    - uv sync --frozen
+    - uv sync --locked
     - uv run pytest tests/ -v
   rules:
     - if: $CI_PIPELINE_SOURCE == "merge_request_event"
-    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
+    - if: $CI_COMMIT_BRANCH == "develop"
+    - if: $CI_COMMIT_BRANCH == "main"
   # Nota: os testes atuais (smoke test da topologia de agentes + /health
   # da API) não fazem nenhuma chamada real de LLM nem precisam de
   # OPENROUTER_API_KEY — seguro rodar em qualquer pipeline, inclusive de
@@ -86,11 +125,20 @@ docker_build_check:
   services:
     - docker:27-dind
   script:
+    # Limpa qualquer imagem/camada residual de jobs anteriores no MESMO
+    # runner antes de buildar -- não resolve a causa raiz de imagem
+    # pesada (isso é o fix em pyproject.toml: torch CPU-only em vez do
+    # build com CUDA), mas é uma rede de segurança independente,
+    # incondicional, útil mesmo que outra dependência volte a inchar a
+    # imagem no futuro.
+    - docker system prune -af || true
     - docker build -t sdr-bot-api:ci-check .
     - docker build -t litellm-proxy:ci-check ./litellm_proxy
+    - docker build -t telegram-service:ci-check ./telegram_service
   rules:
     - if: $CI_PIPELINE_SOURCE == "merge_request_event"
-    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
+    - if: $CI_COMMIT_BRANCH == "develop"
+    - if: $CI_COMMIT_BRANCH == "main"
   # Roda SEMPRE, mesmo sem GCP configurado — só valida que os Dockerfiles
   # buildam de verdade. Pega Dockerfile quebrado antes de qualquer
   # tentativa de deploy, sem precisar de nenhuma credencial de nuvem.
@@ -115,8 +163,10 @@ build_and_push:
     - docker push "${API_IMAGE_TAG}"
     - docker build -t "${PROXY_IMAGE_TAG}" ./litellm_proxy
     - docker push "${PROXY_IMAGE_TAG}"
+    - docker build -t "${TELEGRAM_IMAGE_TAG}" ./telegram_service
+    - docker push "${TELEGRAM_IMAGE_TAG}"
   rules:
-    - if: '$GCP_PROJECT_ID && $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH'
+    - if: '$GCP_PROJECT_ID && $CI_COMMIT_BRANCH == "main"'
 
 deploy_litellm_proxy:
   stage: deploy
@@ -147,7 +197,7 @@ deploy_litellm_proxy:
     name: production/litellm-proxy
   needs: ["build_and_push"]
   rules:
-    - if: '$GCP_PROJECT_ID && $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH'
+    - if: '$GCP_PROJECT_ID && $CI_COMMIT_BRANCH == "main"'
       when: manual
 
 deploy_sdr_bot_api:
@@ -169,11 +219,46 @@ deploy_sdr_bot_api:
       --platform=managed
       --port=8080
       --allow-unauthenticated
+      --service-account="sdr-bot-api-runtime@${GCP_PROJECT_ID}.iam.gserviceaccount.com"
+      --add-cloudsql-instances="${CLOUD_SQL_CONNECTION_NAME}"
       --set-env-vars="LITELLM_PROXY_URL=${PROXY_URL},SDR_APP_NAME=sdr-bot"
-      --set-secrets="LITELLM_PROXY_KEY=litellm-proxy-key:latest"
+      --set-secrets="LITELLM_PROXY_KEY=litellm-proxy-key:latest,SESSION_DB_URL=session-db-url:latest"
   environment:
     name: production/sdr-bot-api
   needs: ["deploy_litellm_proxy"]
   rules:
-    - if: '$GCP_PROJECT_ID && $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH'
+    - if: '$GCP_PROJECT_ID && $CI_COMMIT_BRANCH == "main"'
+      when: manual
+
+deploy_telegram_service:
+  stage: deploy
+  image: google/cloud-sdk:slim
+  id_tokens:
+    GCP_ID_TOKEN:
+      aud: "https://iam.googleapis.com/projects/${GCP_PROJECT_NUMBER}/locations/global/workloadIdentityPools/${WIF_POOL_ID}/providers/${WIF_PROVIDER_ID}"
+  before_script:
+    - *gcp_auth
+  script:
+    - >
+      SDR_BOT_API_URL=$(gcloud run services describe sdr-bot-api
+      --region="${GCP_REGION}" --format='value(status.url)')
+    - >
+      gcloud run deploy telegram-service
+      --image="${TELEGRAM_IMAGE_TAG}"
+      --region="${GCP_REGION}"
+      --platform=managed
+      --port=8200
+      --allow-unauthenticated
+      --set-env-vars="SDR_BOT_API_URL=${SDR_BOT_API_URL}"
+      --set-secrets="TELEGRAM_BOT_TOKEN=telegram-bot-token:latest,TELEGRAM_WEBHOOK_SECRET=telegram-webhook-secret:latest"
+  environment:
+    name: production/telegram-service
+  # needs sdr-bot-api (não build_and_push): a URL do sdr-bot-api é
+  # descoberta dinamicamente via `gcloud run services describe`, mesmo
+  # padrão que deploy_sdr_bot_api já usa pra descobrir litellm-proxy --
+  # então este job só pode rodar depois que sdr-bot-api já existe como
+  # serviço Cloud Run.
+  needs: ["deploy_sdr_bot_api"]
+  rules:
+    - if: '$GCP_PROJECT_ID && $CI_COMMIT_BRANCH == "main"'
       when: manual

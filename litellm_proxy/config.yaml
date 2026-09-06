@@ -8,6 +8,16 @@
 # Racional de qual modelo vai em cada papel está documentado na arquitetura
 # (README.md) — resumo: tarefas de raciocínio/nuance usam modelo mais forte,
 # tarefas estruturadas/roteamento usam modelo mais barato e rápido.
+#
+# NOTA: qualification/knowledge/objection-model apontavam originalmente
+# pra anthropic/claude-3.5-sonnet — esse modelo foi oficialmente
+# aposentado pela Anthropic em 5 de janeiro de 2026 e a OpenRouter parou
+# de rotear pra ele ("No endpoints found"), o que quebrou os testes ao
+# vivo (test_golden_conversations.py). Migrado pra anthropic/claude-
+# sonnet-5 (sucessor direto na mesma faixa Sonnet, lançado 30/06/2026).
+# Isso é um lembrete de que aliases de modelo em provedores terceiros
+# precisam de manutenção periódica -- não é "configura uma vez e
+# esquece".
 
 model_list:
   # --- Orquestrador: roteamento de intenção, não precisa de raciocínio pesado ---
@@ -19,19 +29,19 @@ model_list:
   # --- Qualificação: precisa conduzir perguntas de discovery coerentes ---
   - model_name: qualification-model
     litellm_params:
-      model: openrouter/anthropic/claude-3.5-sonnet
+      model: openrouter/anthropic/claude-sonnet-5
       api_key: os.environ/OPENROUTER_API_KEY
 
   # --- Knowledge/RAG: faithfulness importa, não pode alucinar sobre produto ---
   - model_name: knowledge-model
     litellm_params:
-      model: openrouter/anthropic/claude-3.5-sonnet
+      model: openrouter/anthropic/claude-sonnet-5
       api_key: os.environ/OPENROUTER_API_KEY
 
   # --- Objeções: nuance e persuasão ---
   - model_name: objection-model
     litellm_params:
-      model: openrouter/anthropic/claude-3.5-sonnet
+      model: openrouter/anthropic/claude-sonnet-5
       api_key: os.environ/OPENROUTER_API_KEY
 
   # --- Agendamento: tarefa estruturada (extrair data/hora), modelo barato ---
@@ -53,6 +63,30 @@ model_list:
       model: openrouter/meta-llama/llama-3.1-8b-instruct
       api_key: os.environ/OPENROUTER_API_KEY
 
+  # --- Parte 6: modelo-juiz (LLM-as-judge) do golden eval set ---
+  # DELIBERADAMENTE de uma família DIFERENTE dos avaliados
+  # (qualification/knowledge/objection-model, todos claude-sonnet-5) --
+  # um modelo julgando a própria família de saída como boa é um viés de
+  # auto-avaliação documentado em LLM-as-judge. A primeira escolha foi
+  # claude-opus-5 (mesma família Anthropic, uma classe de raciocínio
+  # acima) -- trocado pra gpt-4o depois de rodar `make eval-run` de
+  # verdade: Opus é bem mais caro/lento (pressão real sobre o saldo da
+  # OpenRouter, que já bloqueou a run duas vezes nesta parte) E é uma
+  # família totalmente diferente da Sonnet (evita o viés igual, ou
+  # melhor, já que nem a "linhagem" do modelo se repete), com
+  # reputação sólida de seguir formato JSON estrito -- relevante porque
+  # eval/judge.py::parse_judge_response já teve falha de parsing num
+  # item durante teste real. gpt-4o-mini (mais barato ainda) foi
+  # descartado de propósito: já é o modelo por trás de
+  # orchestrator/scheduling/escalate-model, então reintroduziria viés
+  # de auto-avaliação pra qualquer conversa que passe por eles, além de
+  # juízes mais leves tenderem a discriminar pior nuance de tom/
+  # qualidade. Ver eval/judge.py.
+  - model_name: judge-model
+    litellm_params:
+      model: openrouter/openai/gpt-4o
+      api_key: os.environ/OPENROUTER_API_KEY
+
 litellm_settings:
   # Cada alias acima cai neste fallback em caso de erro/rate-limit.
   fallbacks:
@@ -62,11 +96,17 @@ litellm_settings:
     - objection-model: ["fallback-model"]
     - scheduling-model: ["fallback-model"]
     - escalate-model: ["fallback-model"]
+    - judge-model: ["fallback-model"]
 
-  # TODO Parte 5: adicionar "langfuse" aqui para logging de custo/latência
-  # nativo do proxy, complementando o tracing feito no lado do ADK.
-  success_callback: []
-  failure_callback: []
+  # Parte 5: langfuse_otel é o callback de PRIMEIRA CLASSE atual pra
+  # LangFuse via LiteLLM Proxy -- a alternativa mais simples
+  # (success_callback: ["langfuse"]) é a integração "legacy v2 SDK",
+  # explicitamente não recomendada pelo próprio LiteLLM pra LangFuse
+  # v3+ (o que rodamos, self-hospedado, ver langfuse/docker-compose.yml).
+  # langfuse_otel constrói o endpoint OTLP e a autenticação (Basic
+  # Auth com as chaves abaixo) automaticamente -- não precisa configurar
+  # OTEL_EXPORTER_OTLP_* manualmente.
+  callbacks: ["langfuse_otel"]
 
 general_settings:
   master_key: os.environ/LITELLM_PROXY_KEY
