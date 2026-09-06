@@ -248,9 +248,10 @@ deploy_sdr_bot_api:
   before_script:
     - *gcp_auth
   script:
-    # --memory=1Gi: mesmo problema do litellm-proxy -- confirmado via
-    # `gcloud logging read` na revision que falhou: "Memory limit of 512
-    # MiB exceeded with 540 MiB used", OOM antes de bindar na porta 8080.
+    # --memory=2Gi: 1Gi bastava só pra subir o container (bind da porta),
+    # mas uma invocação de agente de verdade (build das tool declarations
+    # pro LLM) estourou de novo -- confirmado via `gcloud logging read`:
+    # "Memory limit of 1024 MiB exceeded with 1536 MiB used".
     - >
       PROXY_URL=$(gcloud run services describe litellm-proxy
       --region="${GCP_REGION}" --format='value(status.url)')
@@ -260,7 +261,7 @@ deploy_sdr_bot_api:
       --region="${GCP_REGION}"
       --platform=managed
       --port=8080
-      --memory=1Gi
+      --memory=2Gi
       --allow-unauthenticated
       --service-account="sdr-bot-api-runtime@${GCP_PROJECT_ID}.iam.gserviceaccount.com"
       --add-cloudsql-instances="${CLOUD_SQL_CONNECTION_NAME}"
