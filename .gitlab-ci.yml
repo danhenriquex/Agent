@@ -71,6 +71,14 @@ stages:
   - deploy
 
 variables:
+  # docker:27-dind roda como container-serviço irmão (hostname "docker"),
+  # não no mesmo container do job -- sem isso o CLI cai no default
+  # unix:///var/run/docker.sock, que não existe aqui, e falha com
+  # "Cannot connect to the Docker daemon". TLS desabilitado (setup padrão
+  # documentado pelo GitLab pra dind) porque não há volume de certs
+  # compartilhado entre job e serviço.
+  DOCKER_HOST: "tcp://docker:2375"
+  DOCKER_TLS_CERTDIR: ""
   API_IMAGE_TAG: "${AR_REGION}-docker.pkg.dev/${GCP_PROJECT_ID}/${AR_REPOSITORY}/sdr-bot-api:${CI_COMMIT_SHORT_SHA}"
   PROXY_IMAGE_TAG: "${AR_REGION}-docker.pkg.dev/${GCP_PROJECT_ID}/${AR_REPOSITORY}/litellm-proxy:${CI_COMMIT_SHORT_SHA}"
   TELEGRAM_IMAGE_TAG: "${AR_REGION}-docker.pkg.dev/${GCP_PROJECT_ID}/${AR_REPOSITORY}/telegram-service:${CI_COMMIT_SHORT_SHA}"
