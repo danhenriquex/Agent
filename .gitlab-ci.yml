@@ -217,12 +217,19 @@ deploy_litellm_proxy:
     # service account do sdr-bot-api, com o cliente anexando um ID token
     # do Google na chamada — isso fica como TODO de hardening, junto com
     # os guardrails da Parte 3.
+    #
+    # --memory=1Gi: o default do Cloud Run (512 MiB) não é suficiente --
+    # confirmado via `gcloud logging read` na revision que falhou:
+    # "Memory limit of 512 MiB exceeded with 519 MiB used", processo
+    # morto por OOM antes de conseguir bindar na porta 4000, e daí o
+    # STARTUP TCP probe nunca passa.
     - >
       gcloud run deploy litellm-proxy
       --image="${PROXY_IMAGE_TAG}"
       --region="${GCP_REGION}"
       --platform=managed
       --port=4000
+      --memory=1Gi
       --allow-unauthenticated
       --set-secrets="OPENROUTER_API_KEY=openrouter-api-key:latest,LITELLM_PROXY_KEY=litellm-proxy-key:latest"
   environment:
@@ -276,6 +283,10 @@ deploy_telegram_service:
   before_script:
     - *gcp_auth
   script:
+    # --memory=1Gi: mesmo problema visto em litellm-proxy e sdr-bot-api
+    # (confirmado via `gcloud logging read` nas duas revisions que
+    # falharam: "Memory limit of 512 MiB exceeded", OOM antes de bindar
+    # a porta) -- aplicando preventivamente aqui também.
     - >
       SDR_BOT_API_URL=$(gcloud run services describe sdr-bot-api
       --region="${GCP_REGION}" --format='value(status.url)')
@@ -285,6 +296,7 @@ deploy_telegram_service:
       --region="${GCP_REGION}"
       --platform=managed
       --port=8200
+      --memory=1Gi
       --allow-unauthenticated
       --set-env-vars="SDR_BOT_API_URL=${SDR_BOT_API_URL}"
       --set-secrets="TELEGRAM_BOT_TOKEN=telegram-bot-token:latest,TELEGRAM_WEBHOOK_SECRET=telegram-webhook-secret:latest"
@@ -335,6 +347,15 @@ container_scanning_auth:
 container_scanning:
   stage: deploy
   needs: ["build_and_push", "container_scanning_auth"]
+  # O template oficial seta `dependencies: []` no job (proposital: com
+  # GIT_STRATEGY: none, ele não espera herdar artifact nenhum por
+  # padrão) -- isso sobrevive ao merge porque não redefinimos
+  # `dependencies` aqui, e SUPRIME o download do dotenv mesmo com
+  # `needs` acima (confirmado: log do job não mostra nenhuma etapa
+  # "Downloading artifacts", e o Trivy chega sem credencial nenhuma).
+  # Precisa sobrescrever explicitamente pra o dotenv de
+  # container_scanning_auth (CS_REGISTRY_USER/PASSWORD) realmente chegar.
+  dependencies: ["container_scanning_auth"]
   # Sem isso o job herda as rules default do template, que rodam na
   # branch padrão do repositório (develop, não main -- ver comentário no
   # topo deste arquivo) onde build_and_push nem existe no pipeline
