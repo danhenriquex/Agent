@@ -303,6 +303,14 @@ deploy_telegram_service:
 container_scanning:
   stage: deploy
   needs: ["build_and_push"]
+  # Sem isso o job herda as rules default do template, que rodam na
+  # branch padrão do repositório (develop, não main -- ver comentário no
+  # topo deste arquivo) onde build_and_push nem existe no pipeline
+  # (rules dele só casam com main), quebrando o "needs" acima com
+  # "'container_scanning' job needs 'build_and_push' job, but
+  # 'build_and_push' does not exist in the pipeline".
+  rules:
+    - if: '$GCP_PROJECT_ID && $CI_COMMIT_BRANCH == "main"'
   id_tokens:
     GCP_ID_TOKEN:
       aud: "https://iam.googleapis.com/projects/${GCP_PROJECT_NUMBER}/locations/global/workloadIdentityPools/${WIF_POOL_ID}/providers/${WIF_PROVIDER_ID}"
