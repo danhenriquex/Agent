@@ -6,6 +6,15 @@ AGENTS_DIR := app/agents
 PROXY_READY_URL := http://localhost:4000/health/readiness
 PROXY_READY_TIMEOUT := 30
 
+# Mesmo backend de sessão usado por app/session_service.py -- setar aqui
+# também faz `adk web` gravar no MESMO arquivo/banco que `make api` lê,
+# então conversas testadas na UI do adk web ficam visíveis via
+# GET /handoff/{user_id}/{session_id}/history no Swagger. `adk web` não
+# tem flag pra escolher app_name (usa sempre o nome do diretório de
+# agentes, "agents" nesse projeto) -- por isso SDR_APP_NAME no .env
+# precisa estar setado como "agents" pra bater com o que a API espera.
+SESSION_DB_URL ?= sqlite+aiosqlite:///./sdr_bot_sessions.db
+
 .PHONY: help sync proxy-up proxy-down proxy-restart proxy-logs proxy-status \
         web cli api test test-pii test-guardrails test-live lint clean \
         ingest-dev langfuse-secrets langfuse-up langfuse-down phoenix-up \
@@ -16,9 +25,9 @@ help:
 	@echo ""
 	@echo "  make sync          - uv sync (instala/atualiza dependências)"
 	@echo ""
-	@echo "  make web           - sobe o proxy (se preciso) e abre a UI do adk web"
+	@echo "  make web           - sobe o proxy (se preciso) e abre a UI do adk web (porta 8000)"
 	@echo "  make cli           - sobe o proxy (se preciso) e roda o bot via CLI"
-	@echo "  make api           - sobe o proxy (se preciso) e roda a API FastAPI (--reload)"
+	@echo "  make api           - sobe o proxy (se preciso) e roda a API FastAPI em localhost:8001"
 	@echo ""
 	@echo "  make proxy-up      - sobe o LiteLLM Proxy e espera ele responder de verdade"
 	@echo "  make proxy-down    - derruba o LiteLLM Proxy"
@@ -107,13 +116,13 @@ proxy-status:
 	docker compose -f $(PROXY_COMPOSE) ps
 
 web: proxy-up
-	uv run adk web $(AGENTS_DIR)
+	uv run adk web --session_service_uri="$(SESSION_DB_URL)" $(AGENTS_DIR)
 
 cli: proxy-up
 	uv run python -m app.main
 
 api: proxy-up
-	uv run uvicorn app.api:app --reload
+	uv run uvicorn app.api:app --reload --port 8001
 
 test:
 	uv run pytest -v
