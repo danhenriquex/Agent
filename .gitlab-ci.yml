@@ -278,6 +278,10 @@ deploy_telegram_service:
   before_script:
     - *gcp_auth
   script:
+    # --memory=1Gi: mesmo problema visto em litellm-proxy e sdr-bot-api
+    # (confirmado via `gcloud logging read` nas duas revisions que
+    # falharam: "Memory limit of 512 MiB exceeded", OOM antes de bindar
+    # a porta) -- aplicando preventivamente aqui também.
     - >
       SDR_BOT_API_URL=$(gcloud run services describe sdr-bot-api
       --region="${GCP_REGION}" --format='value(status.url)')
@@ -287,6 +291,7 @@ deploy_telegram_service:
       --region="${GCP_REGION}"
       --platform=managed
       --port=8200
+      --memory=1Gi
       --allow-unauthenticated
       --set-env-vars="SDR_BOT_API_URL=${SDR_BOT_API_URL}"
       --set-secrets="TELEGRAM_BOT_TOKEN=telegram-bot-token:latest,TELEGRAM_WEBHOOK_SECRET=telegram-webhook-secret:latest"
