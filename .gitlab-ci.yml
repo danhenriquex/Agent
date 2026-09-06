@@ -295,14 +295,41 @@ deploy_telegram_service:
     - if: '$GCP_PROJECT_ID && $CI_COMMIT_BRANCH == "main"'
       when: manual
 
+# registry.gitlab.com/security-products/container-scanning roda como
+# uid 1000 não-root, sem curl/jq/wget e sem permissão de escrever em
+# /var/lib/apt/lists -- não dá pra instalar NEM chamar nada ali dentro
+# (confirmado: apt falha com "Permission denied", e nem curl nem jq
+# existem de saída). Por isso o token é gerado num job separado, na
+# imagem google/cloud-sdk:slim (que já tem gcloud funcionando, mesmo
+# padrão dos outros jobs de deploy), e repassado via dotenv artifact --
+# nenhuma ferramenta precisa ser instalada dentro da imagem do scanner.
+container_scanning_auth:
+  stage: deploy
+  image: google/cloud-sdk:slim
+  needs: ["build_and_push"]
+  id_tokens:
+    GCP_ID_TOKEN:
+      aud: "https://iam.googleapis.com/projects/${GCP_PROJECT_NUMBER}/locations/global/workloadIdentityPools/${WIF_POOL_ID}/providers/${WIF_PROVIDER_ID}"
+  before_script:
+    - *gcp_auth
+  script:
+    - echo "CS_REGISTRY_USER=oauth2accesstoken" > registry_auth.env
+    - echo "CS_REGISTRY_PASSWORD=$(gcloud auth print-access-token)" >> registry_auth.env
+  artifacts:
+    reports:
+      dotenv: registry_auth.env
+  rules:
+    - if: '$GCP_PROJECT_ID && $CI_COMMIT_BRANCH == "main"'
+
 # O template (incluído no topo do arquivo) por padrão roda no stage
 # "test" (antes de build_and_push existir) e não tem credencial nenhuma
 # pro Artifact Registry, que é privado -- sem isso o job só falharia
-# tentando puxar CS_IMAGE. Autentica com o mesmo token de acesso OAuth
-# que gcloud/docker já usam (não uma chave de SA separada).
+# tentando puxar CS_IMAGE. CS_REGISTRY_USER/PASSWORD chegam prontos via
+# dotenv do container_scanning_auth acima -- ver comentário lá do porquê
+# o token não é gerado aqui dentro.
 container_scanning:
   stage: deploy
-  needs: ["build_and_push"]
+  needs: ["build_and_push", "container_scanning_auth"]
   # Sem isso o job herda as rules default do template, que rodam na
   # branch padrão do repositório (develop, não main -- ver comentário no
   # topo deste arquivo) onde build_and_push nem existe no pipeline
@@ -311,27 +338,3 @@ container_scanning:
   # 'build_and_push' does not exist in the pipeline".
   rules:
     - if: '$GCP_PROJECT_ID && $CI_COMMIT_BRANCH == "main"'
-  id_tokens:
-    GCP_ID_TOKEN:
-      aud: "https://iam.googleapis.com/projects/${GCP_PROJECT_NUMBER}/locations/global/workloadIdentityPools/${WIF_POOL_ID}/providers/${WIF_PROVIDER_ID}"
-  before_script:
-    # Esta imagem (registry.gitlab.com/security-products/container-
-    # scanning) não tem gcloud -- ao contrário dos outros jobs, que usam
-    # google/cloud-sdk:slim. Em vez de instalar o SDK inteiro só pra
-    # tirar um token, troca o ID token do GitLab por um access token via
-    # REST direto (STS + IAM Credentials), o mesmo fluxo que o gcloud
-    # faz por baixo dos panos.
-    - apt-get update && apt-get install -y --no-install-recommends curl jq
-    - >
-      FEDERATED_TOKEN=$(curl -sf -X POST "https://sts.googleapis.com/v1/token"
-      -H "Content-Type: application/json"
-      -d "{\"audience\":\"//iam.googleapis.com/projects/${GCP_PROJECT_NUMBER}/locations/global/workloadIdentityPools/${WIF_POOL_ID}/providers/${WIF_PROVIDER_ID}\",\"grantType\":\"urn:ietf:params:oauth:grant-type:token-exchange\",\"requestedTokenType\":\"urn:ietf:params:oauth:token-type:access_token\",\"scope\":\"https://www.googleapis.com/auth/cloud-platform\",\"subjectTokenType\":\"urn:ietf:params:oauth:token-type:jwt\",\"subjectToken\":\"${GCP_ID_TOKEN}\"}"
-      | jq -r .access_token)
-    - export CS_REGISTRY_USER="oauth2accesstoken"
-    - >
-      export CS_REGISTRY_PASSWORD=$(curl -sf -X POST
-      "https://iamcredentials.googleapis.com/v1/projects/-/serviceAccounts/${WIF_SERVICE_ACCOUNT}:generateAccessToken"
-      -H "Authorization: Bearer ${FEDERATED_TOKEN}"
-      -H "Content-Type: application/json"
-      -d '{"scope":["https://www.googleapis.com/auth/cloud-platform"]}'
-      | jq -r .accessToken)
