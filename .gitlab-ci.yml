@@ -307,6 +307,23 @@ container_scanning:
     GCP_ID_TOKEN:
       aud: "https://iam.googleapis.com/projects/${GCP_PROJECT_NUMBER}/locations/global/workloadIdentityPools/${WIF_POOL_ID}/providers/${WIF_PROVIDER_ID}"
   before_script:
-    - *gcp_auth
+    # Esta imagem (registry.gitlab.com/security-products/container-
+    # scanning) não tem gcloud -- ao contrário dos outros jobs, que usam
+    # google/cloud-sdk:slim. Em vez de instalar o SDK inteiro só pra
+    # tirar um token, troca o ID token do GitLab por um access token via
+    # REST direto (STS + IAM Credentials), o mesmo fluxo que o gcloud
+    # faz por baixo dos panos.
+    - apt-get update && apt-get install -y --no-install-recommends curl jq
+    - >
+      FEDERATED_TOKEN=$(curl -sf -X POST "https://sts.googleapis.com/v1/token"
+      -H "Content-Type: application/json"
+      -d "{\"audience\":\"//iam.googleapis.com/projects/${GCP_PROJECT_NUMBER}/locations/global/workloadIdentityPools/${WIF_POOL_ID}/providers/${WIF_PROVIDER_ID}\",\"grantType\":\"urn:ietf:params:oauth:grant-type:token-exchange\",\"requestedTokenType\":\"urn:ietf:params:oauth:token-type:access_token\",\"scope\":\"https://www.googleapis.com/auth/cloud-platform\",\"subjectTokenType\":\"urn:ietf:params:oauth:token-type:jwt\",\"subjectToken\":\"${GCP_ID_TOKEN}\"}"
+      | jq -r .access_token)
     - export CS_REGISTRY_USER="oauth2accesstoken"
-    - export CS_REGISTRY_PASSWORD="$(gcloud auth print-access-token)"
+    - >
+      export CS_REGISTRY_PASSWORD=$(curl -sf -X POST
+      "https://iamcredentials.googleapis.com/v1/projects/-/serviceAccounts/${WIF_SERVICE_ACCOUNT}:generateAccessToken"
+      -H "Authorization: Bearer ${FEDERATED_TOKEN}"
+      -H "Content-Type: application/json"
+      -d '{"scope":["https://www.googleapis.com/auth/cloud-platform"]}'
+      | jq -r .accessToken)
