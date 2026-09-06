@@ -1,5 +1,6 @@
-# Estes outputs viram, um a um, as variáveis de CI/CD do GitLab (Settings
-# > CI/CD > Variables) -- ver README > "Deploy via Terraform".
+# Estes outputs viram, um a um, os secrets/variables do GitHub Actions
+# (Settings > Secrets and variables > Actions) -- ver README > "Deploy via
+# Terraform".
 
 output "GCP_PROJECT_ID" {
   value = var.gcp_project_id
@@ -22,11 +23,11 @@ output "AR_REPOSITORY" {
 }
 
 output "WIF_POOL_ID" {
-  value = google_iam_workload_identity_pool.gitlab_pool.workload_identity_pool_id
+  value = google_iam_workload_identity_pool.cicd_pool.workload_identity_pool_id
 }
 
 output "WIF_PROVIDER_ID" {
-  value = google_iam_workload_identity_pool_provider.gitlab_provider.workload_identity_pool_provider_id
+  value = google_iam_workload_identity_pool_provider.github_provider.workload_identity_pool_provider_id
 }
 
 output "WIF_SERVICE_ACCOUNT" {

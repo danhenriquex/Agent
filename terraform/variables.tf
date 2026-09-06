@@ -28,19 +28,19 @@ variable "ar_repository" {
 
 variable "wif_pool_id" {
   type        = string
-  default     = "gitlab-pool"
-  description = "ID do Workload Identity Pool usado pelo GitLab CI."
+  default     = "github-pool"
+  description = "ID do Workload Identity Pool usado pelo GitHub Actions."
 }
 
 variable "wif_provider_id" {
   type        = string
-  default     = "gitlab-provider"
+  default     = "github-provider"
   description = "ID do Provider OIDC dentro do pool."
 }
 
-variable "gitlab_project_path" {
+variable "github_repository" {
   type        = string
-  description = "Caminho completo do projeto no GitLab (ex: \"namespace/agents\"), usado na attribute_condition do WIF -- não é o nome do projeto GCP."
+  description = "owner/repo completo no GitHub (ex: \"danhenriquex/Agent\"), usado na attribute_condition do WIF -- não é o nome do projeto GCP."
 }
 
 variable "deploy_sa_account_id" {

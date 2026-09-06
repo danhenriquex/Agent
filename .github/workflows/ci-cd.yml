@@ -1,0 +1,226 @@
+# Migrado de .gitlab-ci.yml (GitLab CI) -- ver git log desse arquivo pra
+# a versão anterior. Duas simplificações que vêm de graça no GitHub
+# Actions, sem workaround nenhum:
+#   - runners ubuntu-latest já vêm com docker + buildx instalados, então
+#     nenhuma das ginásticas do GitLab (docker-cli separado, docker-buildx
+#     separado, DOCKER_HOST/DOCKER_TLS_CERTDIR pro dind) é necessária.
+#   - container scanning roda no MESMO job que builda/empurra a imagem,
+#     não precisa de um job separado só pra gerar token e repassar via
+#     dotenv (isso existia no GitLab só por causa da imagem não-root do
+#     scanner gerenciado, que não tinha curl/jq).
+#
+# Aprovação manual pros jobs de deploy (equivalente ao `when: manual` do
+# GitLab): configurada via GitHub Environments com "required reviewers"
+# (Settings > Environments > production-*), não dá pra expressar isso só
+# no YAML do workflow.
+
+name: CI/CD
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+    branches: [main]
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v3
+      - run: uv sync --locked
+      - run: uv run ruff check app tests
+
+  test:
+    runs-on: ubuntu-latest
+    needs: [lint]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v3
+      - run: uv sync --locked
+      - run: uv run pytest tests/ -v
+      # Nota: os testes atuais (smoke test da topologia de agentes +
+      # /health da API) não fazem nenhuma chamada real de LLM nem
+      # precisam de OPENROUTER_API_KEY -- seguro rodar em qualquer PR,
+      # inclusive de contribuidor externo.
+
+  docker_build_check:
+    runs-on: ubuntu-latest
+    needs: [test]
+    steps:
+      - uses: actions/checkout@v4
+      # Roda SEMPRE, mesmo sem GCP configurado -- só valida que os
+      # Dockerfiles buildam de verdade. Pega Dockerfile quebrado antes de
+      # qualquer tentativa de deploy, sem precisar de nenhuma credencial
+      # de nuvem.
+      - run: docker build -t sdr-bot-api:ci-check .
+      - run: docker build -t litellm-proxy:ci-check ./litellm_proxy
+      - run: docker build -t telegram-service:ci-check ./telegram_service
+
+  build_and_push:
+    runs-on: ubuntu-latest
+    needs: [docker_build_check]
+    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+    permissions:
+      contents: read
+      id-token: write
+    outputs:
+      api_image_tag: ${{ steps.tags.outputs.api }}
+      proxy_image_tag: ${{ steps.tags.outputs.proxy }}
+      telegram_image_tag: ${{ steps.tags.outputs.telegram }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - id: tags
+        run: |
+          echo "api=${{ secrets.AR_REGION }}-docker.pkg.dev/${{ secrets.GCP_PROJECT_ID }}/${{ secrets.AR_REPOSITORY }}/sdr-bot-api:${{ github.sha }}" >> "$GITHUB_OUTPUT"
+          echo "proxy=${{ secrets.AR_REGION }}-docker.pkg.dev/${{ secrets.GCP_PROJECT_ID }}/${{ secrets.AR_REPOSITORY }}/litellm-proxy:${{ github.sha }}" >> "$GITHUB_OUTPUT"
+          echo "telegram=${{ secrets.AR_REGION }}-docker.pkg.dev/${{ secrets.GCP_PROJECT_ID }}/${{ secrets.AR_REPOSITORY }}/telegram-service:${{ github.sha }}" >> "$GITHUB_OUTPUT"
+
+      - uses: google-github-actions/auth@v2
+        with:
+          project_id: ${{ secrets.GCP_PROJECT_ID }}
+          workload_identity_provider: "projects/${{ secrets.GCP_PROJECT_NUMBER }}/locations/global/workloadIdentityPools/${{ secrets.WIF_POOL_ID }}/providers/${{ secrets.WIF_PROVIDER_ID }}"
+          service_account: ${{ secrets.WIF_SERVICE_ACCOUNT }}
+
+      - uses: google-github-actions/setup-gcloud@v2
+
+      - run: gcloud auth configure-docker "${{ secrets.AR_REGION }}-docker.pkg.dev" --quiet
+
+      - run: docker build -t "${{ steps.tags.outputs.api }}" .
+      - run: docker push "${{ steps.tags.outputs.api }}"
+      - run: docker build -t "${{ steps.tags.outputs.proxy }}" ./litellm_proxy
+      - run: docker push "${{ steps.tags.outputs.proxy }}"
+      - run: docker build -t "${{ steps.tags.outputs.telegram }}" ./telegram_service
+      - run: docker push "${{ steps.tags.outputs.telegram }}"
+
+      # Container scanning: no mesmo job, direto na imagem que expõe mais
+      # superfície de rede (sdr-bot-api) -- sem job separado pra gerar
+      # token (a credencial WIF já autenticada acima já dá pull na
+      # imagem que acabou de ser empurrada).
+      - uses: aquasecurity/trivy-action@0.28.0
+        with:
+          image-ref: ${{ steps.tags.outputs.api }}
+          format: table
+          severity: "CRITICAL,HIGH"
+          exit-code: "0" # não quebra o pipeline -- mesmo comportamento do allow_failure:true do template GitLab
+
+  codeql:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      security-events: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: github/codeql-action/init@v3
+        with:
+          languages: python
+      - uses: github/codeql-action/analyze@v3
+      # Secret scanning não precisa de job nenhum: é uma feature nativa
+      # do repositório (Settings > Code security > Secret scanning),
+      # equivalente ao template Secret-Detection do GitLab.
+
+  deploy_litellm_proxy:
+    runs-on: ubuntu-latest
+    needs: [build_and_push]
+    environment:
+      name: production-litellm-proxy
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: google-github-actions/auth@v2
+        with:
+          project_id: ${{ secrets.GCP_PROJECT_ID }}
+          workload_identity_provider: "projects/${{ secrets.GCP_PROJECT_NUMBER }}/locations/global/workloadIdentityPools/${{ secrets.WIF_POOL_ID }}/providers/${{ secrets.WIF_PROVIDER_ID }}"
+          service_account: ${{ secrets.WIF_SERVICE_ACCOUNT }}
+      - uses: google-github-actions/setup-gcloud@v2
+      # NOTA de segurança (deliberadamente simplificado nesta fase):
+      # --allow-unauthenticated aqui porque a autenticação de fato é o
+      # LITELLM_PROXY_KEY validado dentro da aplicação (general_settings.
+      # master_key), não IAM do Cloud Run. O endurecimento correto é usar
+      # --no-allow-unauthenticated + conceder roles/run.invoker só para a
+      # service account do sdr-bot-api, com o cliente anexando um ID
+      # token do Google na chamada -- isso fica como TODO de hardening.
+      #
+      # --memory=1Gi: o default do Cloud Run (512 MiB) não é suficiente
+      # -- confirmado via logs na revision que falhou: "Memory limit of
+      # 512 MiB exceeded with 519 MiB used", OOM antes de bindar a porta.
+      - run: |
+          gcloud run deploy litellm-proxy \
+            --image="${{ needs.build_and_push.outputs.proxy_image_tag }}" \
+            --region="${{ secrets.GCP_REGION }}" \
+            --platform=managed \
+            --port=4000 \
+            --memory=1Gi \
+            --allow-unauthenticated \
+            --set-secrets="OPENROUTER_API_KEY=openrouter-api-key:latest,LITELLM_PROXY_KEY=litellm-proxy-key:latest"
+
+  deploy_sdr_bot_api:
+    runs-on: ubuntu-latest
+    needs: [deploy_litellm_proxy, build_and_push]
+    environment:
+      name: production-sdr-bot-api
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: google-github-actions/auth@v2
+        with:
+          project_id: ${{ secrets.GCP_PROJECT_ID }}
+          workload_identity_provider: "projects/${{ secrets.GCP_PROJECT_NUMBER }}/locations/global/workloadIdentityPools/${{ secrets.WIF_POOL_ID }}/providers/${{ secrets.WIF_PROVIDER_ID }}"
+          service_account: ${{ secrets.WIF_SERVICE_ACCOUNT }}
+      - uses: google-github-actions/setup-gcloud@v2
+      - id: proxy_url
+        run: echo "url=$(gcloud run services describe litellm-proxy --region="${{ secrets.GCP_REGION }}" --format='value(status.url)')" >> "$GITHUB_OUTPUT"
+      # --memory=2Gi: 1Gi bastava só pra subir o container (bind da
+      # porta), mas uma invocação de agente de verdade (build das tool
+      # declarations pro LLM) estourou de novo -- confirmado via logs:
+      # "Memory limit of 1024 MiB exceeded with 1536 MiB used".
+      - run: |
+          gcloud run deploy sdr-bot-api \
+            --image="${{ needs.build_and_push.outputs.api_image_tag }}" \
+            --region="${{ secrets.GCP_REGION }}" \
+            --platform=managed \
+            --port=8080 \
+            --memory=2Gi \
+            --allow-unauthenticated \
+            --service-account="sdr-bot-api-runtime@${{ secrets.GCP_PROJECT_ID }}.iam.gserviceaccount.com" \
+            --add-cloudsql-instances="${{ secrets.CLOUD_SQL_CONNECTION_NAME }}" \
+            --set-env-vars="LITELLM_PROXY_URL=${{ steps.proxy_url.outputs.url }},SDR_APP_NAME=sdr-bot" \
+            --set-secrets="LITELLM_PROXY_KEY=litellm-proxy-key:latest,SESSION_DB_URL=session-db-url:latest"
+
+  deploy_telegram_service:
+    runs-on: ubuntu-latest
+    # needs sdr-bot-api (não build_and_push diretamente): a URL do
+    # sdr-bot-api é descoberta dinamicamente via `gcloud run services
+    # describe`, mesmo padrão que deploy_sdr_bot_api já usa pra
+    # descobrir litellm-proxy -- então este job só pode rodar depois que
+    # sdr-bot-api já existe como serviço Cloud Run.
+    needs: [deploy_sdr_bot_api, build_and_push]
+    environment:
+      name: production-telegram-service
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: google-github-actions/auth@v2
+        with:
+          project_id: ${{ secrets.GCP_PROJECT_ID }}
+          workload_identity_provider: "projects/${{ secrets.GCP_PROJECT_NUMBER }}/locations/global/workloadIdentityPools/${{ secrets.WIF_POOL_ID }}/providers/${{ secrets.WIF_PROVIDER_ID }}"
+          service_account: ${{ secrets.WIF_SERVICE_ACCOUNT }}
+      - uses: google-github-actions/setup-gcloud@v2
+      - id: sdr_bot_api_url
+        run: echo "url=$(gcloud run services describe sdr-bot-api --region="${{ secrets.GCP_REGION }}" --format='value(status.url)')" >> "$GITHUB_OUTPUT"
+      # --memory=1Gi: mesmo problema visto em litellm-proxy e sdr-bot-api
+      # (OOM no default de 512 MiB antes de bindar a porta).
+      - run: |
+          gcloud run deploy telegram-service \
+            --image="${{ needs.build_and_push.outputs.telegram_image_tag }}" \
+            --region="${{ secrets.GCP_REGION }}" \
+            --platform=managed \
+            --port=8200 \
+            --memory=1Gi \
+            --allow-unauthenticated \
+            --set-env-vars="SDR_BOT_API_URL=${{ steps.sdr_bot_api_url.outputs.url }}" \
+            --set-secrets="TELEGRAM_BOT_TOKEN=telegram-bot-token:latest,TELEGRAM_WEBHOOK_SECRET=telegram-webhook-secret:latest"

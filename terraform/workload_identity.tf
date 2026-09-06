@@ -1,45 +1,47 @@
-# Setup de WIF pro GitLab CI -- reproduz de forma idempotente/versionada o
-# que README.md > "Configurando deploy na GCP" documentava como script
-# manual (issuer, attribute-mapping e attribute-condition exatos já
-# confirmados lá, não inferidos).
+# Setup de WIF pro GitHub Actions -- reproduz de forma idempotente/versionada
+# o que README.md > "Configurando deploy na GCP" documenta como setup
+# manual. Migrado do GitLab CI (issuer/claims diferentes: GitHub usa
+# "repository" em vez de "project_path", e o issuer é
+# token.actions.githubusercontent.com) -- ver git log deste arquivo pra a
+# versão anterior, caso o GitLab volte a ser usado.
 
-resource "google_iam_workload_identity_pool" "gitlab_pool" {
+resource "google_iam_workload_identity_pool" "cicd_pool" {
   workload_identity_pool_id = var.wif_pool_id
-  display_name              = "GitLab CI"
+  display_name              = "CI/CD"
 
   depends_on = [google_project_service.apis]
 }
 
-resource "google_iam_workload_identity_pool_provider" "gitlab_provider" {
-  workload_identity_pool_id         = google_iam_workload_identity_pool.gitlab_pool.workload_identity_pool_id
+resource "google_iam_workload_identity_pool_provider" "github_provider" {
+  workload_identity_pool_id         = google_iam_workload_identity_pool.cicd_pool.workload_identity_pool_id
   workload_identity_pool_provider_id = var.wif_provider_id
-  display_name                       = "GitLab.com OIDC"
+  display_name                       = "GitHub Actions OIDC"
 
   attribute_mapping = {
     "google.subject"       = "assertion.sub"
-    "attribute.repository" = "assertion.project_path"
+    "attribute.repository" = "assertion.repository"
   }
-  attribute_condition = "assertion.project_path == '${var.gitlab_project_path}'"
+  attribute_condition = "assertion.repository == '${var.github_repository}'"
 
   oidc {
-    issuer_uri = "https://gitlab.com"
+    issuer_uri = "https://token.actions.githubusercontent.com"
   }
 }
 
 resource "google_service_account" "deploy_sa" {
   account_id   = var.deploy_sa_account_id
-  display_name = "GitLab CI/CD deployer"
+  display_name = "GitHub Actions CI/CD deployer"
 }
 
-# Permite que a identidade federada do GitLab (restrita ao projeto exato
-# via attribute_condition acima) impersone a SA de deploy. Usa o nome
-# numérico do pool (google_iam_workload_identity_pool.gitlab_pool.name,
+# Permite que a identidade federada do GitHub Actions (restrita ao repo
+# exato via attribute_condition acima) impersone a SA de deploy. Usa o
+# nome numérico do pool (google_iam_workload_identity_pool.cicd_pool.name,
 # formato projects/<numero>/locations/global/workloadIdentityPools/<id>),
 # não a string do pool_id -- caso contrário o binding não casa com nada.
 resource "google_service_account_iam_member" "deploy_sa_wif_binding" {
   service_account_id = google_service_account.deploy_sa.name
   role                = "roles/iam.workloadIdentityUser"
-  member              = "principalSet://iam.googleapis.com/${google_iam_workload_identity_pool.gitlab_pool.name}/attribute.repository/${var.gitlab_project_path}"
+  member              = "principalSet://iam.googleapis.com/${google_iam_workload_identity_pool.cicd_pool.name}/attribute.repository/${var.github_repository}"
 }
 
 resource "google_project_iam_member" "deploy_sa_run_admin" {
