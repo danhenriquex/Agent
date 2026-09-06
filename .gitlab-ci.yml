@@ -59,6 +59,11 @@
 # para o setup do lado GCP (feito uma vez, fora do pipeline).
 # Referência: https://docs.gitlab.com/ci/cloud_services/google_cloud/
 
+include:
+  - template: Jobs/SAST.gitlab-ci.yml
+  - template: Jobs/Secret-Detection.gitlab-ci.yml
+  - template: Jobs/Container-Scanning.gitlab-ci.yml
+
 stages:
   - lint
   - test
@@ -69,6 +74,11 @@ variables:
   API_IMAGE_TAG: "${AR_REGION}-docker.pkg.dev/${GCP_PROJECT_ID}/${AR_REPOSITORY}/sdr-bot-api:${CI_COMMIT_SHORT_SHA}"
   PROXY_IMAGE_TAG: "${AR_REGION}-docker.pkg.dev/${GCP_PROJECT_ID}/${AR_REPOSITORY}/litellm-proxy:${CI_COMMIT_SHORT_SHA}"
   TELEGRAM_IMAGE_TAG: "${AR_REGION}-docker.pkg.dev/${GCP_PROJECT_ID}/${AR_REPOSITORY}/telegram-service:${CI_COMMIT_SHORT_SHA}"
+  # Container Scanning (template incluído acima) escaneia por padrão
+  # $CI_APPLICATION_REPOSITORY:$CI_APPLICATION_TAG, que não bate com as
+  # tags reais no Artifact Registry -- aponta explicitamente pra imagem
+  # da API, que é a que expõe superfície de rede maior.
+  CS_IMAGE: "${API_IMAGE_TAG}"
 
 # Bloco reutilizado pelos jobs que precisam autenticar na GCP via WIF.
 # Troca o ID token do GitLab por uma credencial federada de curta duração,
@@ -265,3 +275,19 @@ deploy_telegram_service:
   rules:
     - if: '$GCP_PROJECT_ID && $CI_COMMIT_BRANCH == "main"'
       when: manual
+
+# O template (incluído no topo do arquivo) por padrão roda no stage
+# "test" (antes de build_and_push existir) e não tem credencial nenhuma
+# pro Artifact Registry, que é privado -- sem isso o job só falharia
+# tentando puxar CS_IMAGE. Autentica com o mesmo token de acesso OAuth
+# que gcloud/docker já usam (não uma chave de SA separada).
+container_scanning:
+  stage: deploy
+  needs: ["build_and_push"]
+  id_tokens:
+    GCP_ID_TOKEN:
+      aud: "https://iam.googleapis.com/projects/${GCP_PROJECT_NUMBER}/locations/global/workloadIdentityPools/${WIF_POOL_ID}/providers/${WIF_PROVIDER_ID}"
+  before_script:
+    - *gcp_auth
+    - export CS_REGISTRY_USER="oauth2accesstoken"
+    - export CS_REGISTRY_PASSWORD="$(gcloud auth print-access-token)"
