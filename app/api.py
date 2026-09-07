@@ -76,8 +76,34 @@ async def health() -> dict:
     return {"status": "ok"}
 
 
+_RESET_COMMAND = "/newsession"
+
+
 @app.post("/chat", response_model=ChatResponse)
 async def chat(payload: ChatRequest) -> ChatResponse:
+    # Fica aqui (não em telegram_service) pelo mesmo motivo do handoff
+    # logo abaixo: a decisão de resetar uma conversa não é específica de
+    # canal -- QUALQUER canal que chame /chat (web, WhatsApp, Telegram)
+    # ganha isso de graça, num lugar só, em vez de cada adapter ter que
+    # reimplementar "reconhecer esse comando". Checado ANTES do
+    # handoff_mode de propósito: também serve pra um lead sair de uma
+    # conversa em handoff (humano assumiu) e voltar a falar com o bot.
+    if payload.message.strip().lower() == _RESET_COMMAND:
+        await _session_service.delete_session(
+            app_name=APP_NAME, user_id=payload.user_id, session_id=payload.session_id
+        )
+        await get_or_create_session(
+            _session_service,
+            app_name=APP_NAME,
+            user_id=payload.user_id,
+            session_id=payload.session_id,
+            initial_state={STATE_CHANNEL: payload.channel},
+        )
+        return ChatResponse(
+            agent="system",
+            response="Nova conversa iniciada! Pode mandar sua mensagem.",
+        )
+
     session = await get_or_create_session(
         _session_service,
         app_name=APP_NAME,
