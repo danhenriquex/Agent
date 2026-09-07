@@ -88,9 +88,49 @@ class HistoryResponse(BaseModel):
     events: list[HistoryEvent]
 
 
+class SessionSummary(BaseModel):
+    user_id: str
+    session_id: str
+    channel: str | None = None
+    handoff_mode: bool = False
+    last_update_time: float
+
+
 @app.get("/health")
 async def health() -> dict:
     return {"status": "ok"}
+
+
+@app.get("/sessions", response_model=list[SessionSummary])
+async def list_sessions() -> list[SessionSummary]:
+    """Lista toda conversa existente (qualquer user_id/session_id) --
+    é como se descobre QUAIS pares user_id/session_id existem, pra
+    depois consultar /handoff/{user_id}/{session_id}/history de cada
+    um. Existe porque, sem observabilidade de produção funcionando
+    (ver app/agents/observability.py), não tem outro jeito de saber
+    quem já falou com o bot.
+
+    list_sessions() do ADK, sem user_id, já retorna TODAS as sessões
+    de qualquer usuário -- não precisa de uma tabela paralela nem de
+    tracing pra isso, é literalmente uma consulta na mesma tabela que
+    guarda o histórico. Retorna sessões sem os `events` (mais leve,
+    útil só pra listar "quem", não "o quê foi dito") -- reordenadas
+    da mais recente pra mais antiga, já que numa lista de conversas
+    isso importa mais que a ordem de criação usada internamente.
+    """
+    response = await _session_service.list_sessions(app_name=APP_NAME)
+    summaries = [
+        SessionSummary(
+            user_id=session.user_id,
+            session_id=session.id,
+            channel=session.state.get(STATE_CHANNEL),
+            handoff_mode=bool(session.state.get(STATE_HANDOFF_MODE)),
+            last_update_time=session.last_update_time,
+        )
+        for session in response.sessions
+    ]
+    summaries.sort(key=lambda s: s.last_update_time, reverse=True)
+    return summaries
 
 
 _RESET_COMMAND = "/newsession"
