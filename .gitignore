@@ -28,4 +28,7 @@ sdr_bot_sessions.db-*
 terraform/.terraform/
 terraform/*.tfstate*
 terraform/terraform.tfvars
+# saída de `terraform plan -out=tfplan` -- artefato local/pontual, pode
+# conter valores de secret em texto puro no diff planejado.
+terraform/tfplan
 app/agents/.adk/session.db
