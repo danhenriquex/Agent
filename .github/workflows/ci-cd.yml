@@ -174,17 +174,19 @@ jobs:
       - uses: google-github-actions/setup-gcloud@v2
       - id: proxy_url
         run: echo "url=$(gcloud run services describe litellm-proxy --region="${{ secrets.GCP_REGION }}" --format='value(status.url)')" >> "$GITHUB_OUTPUT"
-      # --memory=2Gi: 1Gi bastava só pra subir o container (bind da
-      # porta), mas uma invocação de agente de verdade (build das tool
-      # declarations pro LLM) estourou de novo -- confirmado via logs:
-      # "Memory limit of 1024 MiB exceeded with 1536 MiB used".
+      # --memory=4Gi: 2Gi ainda não bastava -- confirmado via logs numa
+      # invocação de agente real: "Memory limit of 2048 MiB exceeded with
+      # 2196 MiB used" (depois de já termos subido de 512Mi -> 1Gi ->
+      # 2Gi pelo mesmo motivo). App carrega ADK + guardrails + Presidio
+      # (NER/PII) tudo num processo só -- uso varia bastante conforme o
+      # que a conversa aciona, sem sinal de platô ainda visto até agora.
       - run: |
           gcloud run deploy sdr-bot-api \
             --image="$API_IMAGE_TAG" \
             --region="${{ secrets.GCP_REGION }}" \
             --platform=managed \
             --port=8080 \
-            --memory=2Gi \
+            --memory=4Gi \
             --allow-unauthenticated \
             --service-account="sdr-bot-api-runtime@${{ secrets.GCP_PROJECT_ID }}.iam.gserviceaccount.com" \
             --add-cloudsql-instances="${{ secrets.CLOUD_SQL_CONNECTION_NAME }}" \
