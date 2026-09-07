@@ -22,6 +22,17 @@ on:
   pull_request:
     branches: [main]
 
+# Computados uma vez, no nível do workflow -- mesmo padrão do
+# .gitlab-ci.yml original (API_IMAGE_TAG/PROXY_IMAGE_TAG/TELEGRAM_IMAGE_TAG
+# como `variables:` top-level). NÃO usar job `outputs:` pra isso: o GitHub
+# Actions zera silenciosamente qualquer output que contenha um secret
+# ("Skip output ... since it may contain secret"), o que gerava
+# --image="" nos jobs de deploy. env vars comuns não têm essa restrição.
+env:
+  API_IMAGE_TAG: ${{ secrets.AR_REGION }}-docker.pkg.dev/${{ secrets.GCP_PROJECT_ID }}/${{ secrets.AR_REPOSITORY }}/sdr-bot-api:${{ github.sha }}
+  PROXY_IMAGE_TAG: ${{ secrets.AR_REGION }}-docker.pkg.dev/${{ secrets.GCP_PROJECT_ID }}/${{ secrets.AR_REPOSITORY }}/litellm-proxy:${{ github.sha }}
+  TELEGRAM_IMAGE_TAG: ${{ secrets.AR_REGION }}-docker.pkg.dev/${{ secrets.GCP_PROJECT_ID }}/${{ secrets.AR_REPOSITORY }}/telegram-service:${{ github.sha }}
+
 jobs:
   lint:
     runs-on: ubuntu-latest
@@ -64,18 +75,8 @@ jobs:
     permissions:
       contents: read
       id-token: write
-    outputs:
-      api_image_tag: ${{ steps.tags.outputs.api }}
-      proxy_image_tag: ${{ steps.tags.outputs.proxy }}
-      telegram_image_tag: ${{ steps.tags.outputs.telegram }}
     steps:
       - uses: actions/checkout@v4
-
-      - id: tags
-        run: |
-          echo "api=${{ secrets.AR_REGION }}-docker.pkg.dev/${{ secrets.GCP_PROJECT_ID }}/${{ secrets.AR_REPOSITORY }}/sdr-bot-api:${{ github.sha }}" >> "$GITHUB_OUTPUT"
-          echo "proxy=${{ secrets.AR_REGION }}-docker.pkg.dev/${{ secrets.GCP_PROJECT_ID }}/${{ secrets.AR_REPOSITORY }}/litellm-proxy:${{ github.sha }}" >> "$GITHUB_OUTPUT"
-          echo "telegram=${{ secrets.AR_REGION }}-docker.pkg.dev/${{ secrets.GCP_PROJECT_ID }}/${{ secrets.AR_REPOSITORY }}/telegram-service:${{ github.sha }}" >> "$GITHUB_OUTPUT"
 
       - uses: google-github-actions/auth@v2
         with:
@@ -87,12 +88,12 @@ jobs:
 
       - run: gcloud auth configure-docker "${{ secrets.AR_REGION }}-docker.pkg.dev" --quiet
 
-      - run: docker build -t "${{ steps.tags.outputs.api }}" .
-      - run: docker push "${{ steps.tags.outputs.api }}"
-      - run: docker build -t "${{ steps.tags.outputs.proxy }}" ./litellm_proxy
-      - run: docker push "${{ steps.tags.outputs.proxy }}"
-      - run: docker build -t "${{ steps.tags.outputs.telegram }}" ./telegram_service
-      - run: docker push "${{ steps.tags.outputs.telegram }}"
+      - run: docker build -t "$API_IMAGE_TAG" .
+      - run: docker push "$API_IMAGE_TAG"
+      - run: docker build -t "$PROXY_IMAGE_TAG" ./litellm_proxy
+      - run: docker push "$PROXY_IMAGE_TAG"
+      - run: docker build -t "$TELEGRAM_IMAGE_TAG" ./telegram_service
+      - run: docker push "$TELEGRAM_IMAGE_TAG"
 
       # Container scanning: no mesmo job, direto na imagem que expõe mais
       # superfície de rede (sdr-bot-api) -- sem job separado pra gerar
@@ -100,7 +101,7 @@ jobs:
       # imagem que acabou de ser empurrada).
       - uses: aquasecurity/trivy-action@v0.36.0
         with:
-          image-ref: ${{ steps.tags.outputs.api }}
+          image-ref: ${{ env.API_IMAGE_TAG }}
           format: table
           severity: "CRITICAL,HIGH"
           exit-code: "0" # não quebra o pipeline -- mesmo comportamento do allow_failure:true do template GitLab
@@ -148,7 +149,7 @@ jobs:
       # 512 MiB exceeded with 519 MiB used", OOM antes de bindar a porta.
       - run: |
           gcloud run deploy litellm-proxy \
-            --image="${{ needs.build_and_push.outputs.proxy_image_tag }}" \
+            --image="$PROXY_IMAGE_TAG" \
             --region="${{ secrets.GCP_REGION }}" \
             --platform=managed \
             --port=4000 \
@@ -158,7 +159,7 @@ jobs:
 
   deploy_sdr_bot_api:
     runs-on: ubuntu-latest
-    needs: [deploy_litellm_proxy, build_and_push]
+    needs: [deploy_litellm_proxy]
     environment:
       name: production-sdr-bot-api
     permissions:
@@ -179,7 +180,7 @@ jobs:
       # "Memory limit of 1024 MiB exceeded with 1536 MiB used".
       - run: |
           gcloud run deploy sdr-bot-api \
-            --image="${{ needs.build_and_push.outputs.api_image_tag }}" \
+            --image="$API_IMAGE_TAG" \
             --region="${{ secrets.GCP_REGION }}" \
             --platform=managed \
             --port=8080 \
@@ -197,7 +198,7 @@ jobs:
     # describe`, mesmo padrão que deploy_sdr_bot_api já usa pra
     # descobrir litellm-proxy -- então este job só pode rodar depois que
     # sdr-bot-api já existe como serviço Cloud Run.
-    needs: [deploy_sdr_bot_api, build_and_push]
+    needs: [deploy_sdr_bot_api]
     environment:
       name: production-telegram-service
     permissions:
@@ -216,7 +217,7 @@ jobs:
       # (OOM no default de 512 MiB antes de bindar a porta).
       - run: |
           gcloud run deploy telegram-service \
-            --image="${{ needs.build_and_push.outputs.telegram_image_tag }}" \
+            --image="$TELEGRAM_IMAGE_TAG" \
             --region="${{ secrets.GCP_REGION }}" \
             --platform=managed \
             --port=8200 \
