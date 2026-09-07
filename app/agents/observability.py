@@ -10,10 +10,27 @@ app/agents/ como raiz de import, sem visibilidade de módulos irmãos
 fora dela.
 
 register() nunca levanta exceção mesmo se o Phoenix não estiver
-acessível (testado manualmente: BatchSpanProcessor exporta em
-background, falha de export só fica logada, nunca propaga) -- seguro
-chamar isso incondicionalmente, inclusive em testes/CI onde o Phoenix
-não está rodando.
+acessível (testado manualmente: falha de export só fica logada, nunca
+propaga) -- seguro chamar isso incondicionalmente, inclusive em
+testes/CI onde o Phoenix não está rodando.
+
+batch=False (SimpleSpanProcessor, exporta cada span de forma síncrona,
+inline) é deliberado, não o default ingênuo -- descoberto rodando em
+produção de verdade: com batch=True (BatchSpanProcessor), NENHUM trace
+chegava no Phoenix, sempre, mesmo com PHOENIX_COLLECTOR_ENDPOINT
+correto e um /chat de verdade retornando 200 (confirmado checando os
+logs do próprio Cloud Run do Phoenix: zero requisições em /v1/traces).
+Causa raiz: Cloud Run só aloca CPU pro container ENQUANTO ele processa
+uma requisição (a menos que a own service tenha
+--no-cpu-throttling, que sdr-bot-api não tem, de propósito, pelo custo
+recorrente que isso significa) -- a thread de background que o
+BatchSpanProcessor usa pra fazer flush a cada 5s nunca chega a ser
+escalonada entre requisições, então spans só se acumulavam em memória
+e nunca eram exportados. batch=False exporta cada span sincronamente,
+como parte do request handler (quando a CPU está garantidamente
+alocada) -- custa uma chamada HTTP extra (mesma região) por turno de
+agente, troca aceitável num bot de baixo tráfego frente ao custo de
+manter CPU sempre alocada só pra isso.
 """
 
 import os
@@ -27,7 +44,7 @@ _PROJECT_NAME = os.environ.get("PHOENIX_PROJECT_NAME", "sdr-bot")
 
 register(
     project_name=_PROJECT_NAME,
-    batch=True,
+    batch=False,
     auto_instrument=True,
     verbose=False,
 )
