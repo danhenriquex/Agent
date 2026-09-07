@@ -14,23 +14,39 @@ acessível (testado manualmente: falha de export só fica logada, nunca
 propaga) -- seguro chamar isso incondicionalmente, inclusive em
 testes/CI onde o Phoenix não está rodando.
 
-batch=False (SimpleSpanProcessor, exporta cada span de forma síncrona,
-inline) é deliberado, não o default ingênuo -- descoberto rodando em
-produção de verdade: com batch=True (BatchSpanProcessor), NENHUM trace
-chegava no Phoenix, sempre, mesmo com PHOENIX_COLLECTOR_ENDPOINT
-correto e um /chat de verdade retornando 200 (confirmado checando os
-logs do próprio Cloud Run do Phoenix: zero requisições em /v1/traces).
-Causa raiz: Cloud Run só aloca CPU pro container ENQUANTO ele processa
-uma requisição (a menos que a own service tenha
---no-cpu-throttling, que sdr-bot-api não tem, de propósito, pelo custo
-recorrente que isso significa) -- a thread de background que o
-BatchSpanProcessor usa pra fazer flush a cada 5s nunca chega a ser
-escalonada entre requisições, então spans só se acumulavam em memória
-e nunca eram exportados. batch=False exporta cada span sincronamente,
-como parte do request handler (quando a CPU está garantidamente
-alocada) -- custa uma chamada HTTP extra (mesma região) por turno de
-agente, troca aceitável num bot de baixo tráfego frente ao custo de
-manter CPU sempre alocada só pra isso.
+batch=True (BatchSpanProcessor) É INTENCIONAL mesmo sabendo que, em
+Cloud Run, ele nunca chega a exportar nada -- ver INCIDENTE abaixo
+antes de tentar "consertar" trocando pra batch=False de novo.
+
+Estado conhecido: tracing pra Phoenix **não funciona em produção**
+(Cloud Run) hoje, só localmente (`make phoenix-up`). Root cause do
+lado do batch=True: Cloud Run só aloca CPU pro container ENQUANTO ele
+processa uma requisição (sdr-bot-api não roda com
+--no-cpu-throttling, de propósito, pelo custo recorrente que isso
+significaria) -- a thread de background que o BatchSpanProcessor usa
+pra fazer flush a cada 5s nunca chega a ser escalonada entre
+requisições, então spans só se acumulam em memória e nunca são
+exportados (confirmado: zero requisições em /v1/traces nos logs do
+Cloud Run do Phoenix, mesmo com /chat retornando 200 normalmente).
+
+INCIDENTE (não repetir): trocar pra batch=False (SimpleSpanProcessor,
+export síncrono, inline no request) foi tentado como correção e
+DERRUBOU sdr-bot-api em produção -- os exports síncronos começaram a
+falhar por timeout ("Failed to export span batch due to timeout, max
+retries or shutdown"), cada timeout bloqueando o request inteiro, até
+esgotar as 3 instâncias (maxScale) só com requisições penduradas;
+`/health` chegou a não responder mais. Revertido via rollback de
+tráfego pro revision anterior. Causa exata do timeout do export em si
+NÃO foi identificada (um teste direto de fora do Cloud Run pro
+endpoint /v1/traces do Phoenix respondeu rápido) -- possivelmente
+específico da chamada saindo de DENTRO do container do sdr-bot-api,
+não investigado a fundo por causa do risco de repetir o incidente.
+
+Até essa investigação ser retomada (ou a infra de tracing ser trocada
+por algo que não dependa de Cloud Run agendar uma thread de
+background, ex: LangFuse com storage externo, ou --no-cpu-throttling
+assumindo o custo), fica batch=True: sem traces em produção, mas sem
+risco de derrubar o /chat de verdade.
 """
 
 import os
@@ -44,7 +60,7 @@ _PROJECT_NAME = os.environ.get("PHOENIX_PROJECT_NAME", "sdr-bot")
 
 register(
     project_name=_PROJECT_NAME,
-    batch=False,
+    batch=True,
     auto_instrument=True,
     verbose=False,
 )
