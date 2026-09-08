@@ -670,13 +670,20 @@ intenção de chamar uma tool ("Realizando busca por funcionalidades do
 produto...") como se fosse a resposta final, em vez de chamar a tool
 de verdade e responder com o resultado — sintoma clássico de
 disciplina de tool-use mais fraca em modelos menores, não um bug de
-infra. `knowledge-model` foi revertido pra `claude-sonnet-5` por causa
-disso; `qualification-model`/`objection-model` continuam em
-`gpt-4o-mini` (não mostraram o sintoma). Isso significa que 5 dos 6
-agentes avaliados usam `gpt-4o-mini`, e o juiz (`gpt-4o`) é da MESMA
-família GPT-4o — o viés que essa escolha existia pra evitar, embora a
-dimensão mais sensível a alucinação (`faithfulness`, avaliada sobre a
-saída do `knowledge-model`) já não compartilhe família com o juiz.
+infra. Em vez de voltar direto pra `claude-sonnet-5` (10-15x mais caro
+que `gpt-4o-mini`), testamos `claude-haiku-4.5` via `make eval-run`
+antes de decidir — diferente da troca original, que foi direto pra
+produção sem validar contra o eval set. Resultado: 22 itens completados
+sem a narrativa de tool-call, média combinada 4.49 contra a baseline
+4.576 (delta 0.086, dentro da tolerância de 0.4 de
+`eval/regression.py`) — então `knowledge-model` ficou em
+`claude-haiku-4.5`, mais barato que Sonnet 5 e sem o sintoma;
+`qualification-model`/`objection-model` continuam em `gpt-4o-mini`
+(não mostraram o sintoma). Isso significa que 5 dos 6 agentes
+avaliados usam `gpt-4o-mini`, e o juiz (`gpt-4o`) é da MESMA família
+GPT-4o — o viés que essa escolha existia pra evitar, embora a dimensão
+mais sensível a alucinação (`faithfulness`, avaliada sobre a saída do
+`knowledge-model`) já não compartilhe família com o juiz.
 Não resolvido pros outros 5: se o viés de auto-avaliação importar pros
 seus resultados, troque `judge-model` pra fora da família GPT-4o antes
 de confiar num `make eval-run`. Ver TODO em `litellm_proxy/config.yaml`.

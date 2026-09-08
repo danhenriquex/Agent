@@ -8,11 +8,12 @@ própria família de saída como boa é um viés de auto-avaliação
 documentado em LLM-as-judge. ESSA PROPRIEDADE ESTÁ PARCIALMENTE
 QUEBRADA HOJE: qualification/knowledge/objection-model foram trocados
 de claude-sonnet-5 pra gpt-4o-mini por custo (juiz é gpt-4o, MESMA
-família GPT-4o); knowledge-model depois voltou pra claude-sonnet-5
-por qualidade (narrava intenção de tool call em vez de chamar a tool
-de verdade), então a dimensão de faithfulness já não compartilha
-família com o juiz -- qualification/objection-model continuam
-gpt-4o-mini. Ver o TODO no bloco do judge-model em
+família GPT-4o); knowledge-model depois foi pra claude-haiku-4.5 por
+qualidade (narrava intenção de tool call em vez de chamar a tool de
+verdade -- validado via `make eval-run` antes de trocar, ao contrário
+da troca original pra gpt-4o-mini), então a dimensão de faithfulness
+já não compartilha família com o juiz -- qualification/objection-model
+continuam gpt-4o-mini. Ver o TODO no bloco do judge-model em
 litellm_proxy/config.yaml antes de confiar nos scores de uma run.
 Mudar o modelo-juiz é uma mudança em config.yaml, não neste arquivo --
 mesmo racional de `get_model_for_role` em app/agents/config/models.py.
