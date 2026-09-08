@@ -19,6 +19,7 @@ import random
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
 from google.adk.errors import StaleSessionError
 from google.adk.events import Event, EventActions
 from google.adk.runners import Runner
@@ -50,6 +51,30 @@ async def _lifespan(_app: FastAPI):
 
 
 app = FastAPI(title="SDR Bot API", version="0.1.0", lifespan=_lifespan)
+
+# HANDOFF_DASHBOARD_ORIGINS: essa API não tem CORS habilitado até aqui
+# porque nenhum dos canais existentes (telegram_service, o CLI, o
+# widget web futuro) é um browser chamando de uma origem diferente --
+# telegram_service e o CLI rodam server-side, sem CORS envolvido. O
+# painel de handoff (React, Parte 7) é o primeiro cliente que roda no
+# browser do agente humano, numa origem diferente (ex: localhost:5173
+# em dev) -- sem isso, toda chamada dele pra /sessions, /handoff/*
+# seria bloqueada pelo próprio browser antes de chegar aqui. Lista
+# vazia por padrão (nenhuma origem liberada) -- setar explicitamente
+# no .env em vez de liberar "*", já que /handoff/*/reply e /claim não
+# têm autenticação nenhuma hoje (ver docstring de claim_handoff).
+_cors_origins = [
+    origin.strip()
+    for origin in os.getenv("HANDOFF_DASHBOARD_ORIGINS", "").split(",")
+    if origin.strip()
+]
+if _cors_origins:
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origins=_cors_origins,
+        allow_methods=["GET", "POST"],
+        allow_headers=["*"],
+    )
 
 _session_service = get_session_service()
 _runner = Runner(agent=root_agent, app_name=APP_NAME, session_service=_session_service)
@@ -276,6 +301,36 @@ async def claim_handoff(user_id: str, session_id: str, payload: ClaimRequest) ->
     await _session_service.append_event(session, event)
 
     return {"status": "claimed", "session_id": session_id, "claimed_by": payload.claimed_by}
+
+
+@app.post("/handoff/{user_id}/{session_id}/release")
+async def release_handoff(user_id: str, session_id: str) -> dict:
+    """Devolve a conversa pro bot -- o outro lado do claim_handoff.
+    Sem isso, a única forma de uma sessão SAIR do modo handoff era o
+    próprio lead mandar /newsession (que também apaga a conversa) --
+    não existia um jeito do humano dizer "terminei, bot pode
+    continuar" sem resetar tudo. Idempotente pelo mesmo motivo de
+    claim_handoff: chamar de novo numa sessão que já não está em
+    handoff não é erro, só não muda nada."""
+    session = await _session_service.get_session(
+        app_name=APP_NAME, user_id=user_id, session_id=session_id
+    )
+    if session is None:
+        raise HTTPException(status_code=404, detail="Sessão não encontrada")
+
+    event = Event(
+        author="system",
+        actions=EventActions(
+            state_delta={
+                STATE_HANDOFF_MODE: False,
+                STATE_HANDOFF_CLAIMED_BY: None,
+            }
+        ),
+        invocation_id=f"handoff-release-{session_id}",
+    )
+    await _session_service.append_event(session, event)
+
+    return {"status": "released", "session_id": session_id}
 
 
 @app.post("/handoff/{user_id}/{session_id}/reply")

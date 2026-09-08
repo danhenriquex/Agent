@@ -135,6 +135,49 @@ def test_claim_nonexistent_session_returns_404(client):
     assert response.status_code == 404
 
 
+def test_release_returns_conversation_to_bot(client):
+    test_client, api_module = client
+
+    with patch.object(api_module._runner, "run_async", _fake_run_async):
+        test_client.post("/chat", json={"user_id": "u1", "session_id": "s1", "message": "oi"})
+    test_client.post("/handoff/u1/s1/claim", json={"claimed_by": "agente-joao"})
+
+    release_response = test_client.post("/handoff/u1/s1/release")
+    assert release_response.status_code == 200
+    assert release_response.json()["status"] == "released"
+
+    with patch.object(api_module._runner, "run_async", _fake_run_async):
+        response = test_client.post(
+            "/chat", json={"user_id": "u1", "session_id": "s1", "message": "terceira mensagem"}
+        )
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["handoff_mode"] is False
+    assert body["response"] == "resposta do bot"
+    assert body["agent"] == "OrchestratorAgent"
+
+
+def test_release_is_idempotent_when_not_in_handoff(client):
+    test_client, api_module = client
+
+    with patch.object(api_module._runner, "run_async", _fake_run_async):
+        test_client.post("/chat", json={"user_id": "u1", "session_id": "s1", "message": "oi"})
+
+    response = test_client.post("/handoff/u1/s1/release")
+
+    assert response.status_code == 200
+    assert response.json()["status"] == "released"
+
+
+def test_release_nonexistent_session_returns_404(client):
+    test_client, _api_module = client
+
+    response = test_client.post("/handoff/u1/sessao-que-nao-existe/release")
+
+    assert response.status_code == 404
+
+
 async def test_history_returns_events_in_order(client):
     test_client, api_module = client
 
