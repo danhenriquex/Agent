@@ -70,6 +70,20 @@ COPY --from=builder /app/.venv /app/.venv
 COPY --from=builder /app/app ./app
 COPY --from=builder /app/mcp_server ./mcp_server
 
+# Sem isso, o modelo de embedding (baixado no builder pra materializar
+# o índice acima) era baixado de NOVO da HuggingFace Hub, pela rede, a
+# cada instância nova em produção -- runtime não herdava esse cache de
+# forma nenhuma antes (só /app/.venv, /app/app, /app/mcp_server eram
+# copiados). Descoberto em produção de verdade: "MCP tool execution
+# failed with McpError: Timed out while waiting for response to
+# ClientRequest. Waited 15.0 seconds." na primeira pergunta de RAG de
+# cada instância fria -- o download pela rede (~470MB, sem HF_TOKEN,
+# sujeito a rate limit mais baixo) estourava o timeout da tool call
+# quase sempre. Com o cache local já presente, o carregamento é do
+# disco (visto no build: "Loading weights: 100%" em ~1-2s), não da
+# rede.
+COPY --from=builder /root/.cache/huggingface /root/.cache/huggingface
+
 ENV PATH="/app/.venv/bin:$PATH"
 ENV PORT=8080
 EXPOSE 8080
