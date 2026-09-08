@@ -23,7 +23,7 @@
 
 services:
   langfuse-worker:
-    image: docker.io/langfuse/langfuse-worker:3
+    image: docker.io/langfuse/langfuse-worker:3.225.7
     restart: always
     depends_on: &langfuse-depends-on
       postgres:
@@ -78,7 +78,7 @@ services:
       REDIS_TLS_ENABLED: "false"
 
   langfuse-web:
-    image: docker.io/langfuse/langfuse:3
+    image: docker.io/langfuse/langfuse:3.225.7
     restart: always
     depends_on: *langfuse-depends-on
     ports:
