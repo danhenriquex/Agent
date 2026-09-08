@@ -643,24 +643,34 @@ bem.
 ### `judge-model`: por que um modelo diferente dos avaliados
 
 `litellm_proxy/config.yaml` ganhou o alias `judge-model`, apontando
-pra `openai/gpt-4o` — deliberadamente de uma família diferente de
-`qualification-model`/`knowledge-model`/`objection-model` (todos
-`claude-sonnet-5`). Um modelo julgando a própria família de saída como
-boa é um viés de auto-avaliação documentado em LLM-as-judge.
+pra `openai/gpt-4o` — na época, deliberadamente de uma família
+diferente de `qualification-model`/`knowledge-model`/`objection-model`
+(todos `claude-sonnet-5`). Um modelo julgando a própria família de
+saída como boa é um viés de auto-avaliação documentado em LLM-as-judge.
 
 A primeira escolha tinha sido `claude-opus-5` (mesma família Anthropic,
 uma classe de raciocínio acima do avaliado) — trocado pra `gpt-4o`
 depois de rodar `make eval-run` de verdade: Opus é bem mais caro/lento
 (pressão real sobre o saldo da OpenRouter, que já bloqueou a run com
-402 nesta parte), e `gpt-4o` já é uma família totalmente diferente da
+402 nesta parte), e `gpt-4o` já era uma família totalmente diferente da
 Sonnet (elimina o viés igual ou melhor) com reputação sólida de seguir
 formato JSON estrito — relevante porque uma falha real de parsing
 apareceu num item durante teste (ver descoberta abaixo). `gpt-4o-mini`
-(mais barato ainda) foi descartado de propósito: já é o modelo por trás
-de `orchestrator-model`/`scheduling-model`/`escalate-model`, então
-reintroduziria viés de auto-avaliação pra qualquer conversa que passe
-por eles, e um juiz mais leve tende a discriminar pior nuance de tom/
-qualidade.
+(mais barato ainda) foi descartado de propósito NA ÉPOCA: já era o
+modelo por trás de `orchestrator-model`/`scheduling-model`/
+`escalate-model`, reintroduzindo viés de auto-avaliação pra qualquer
+conversa que passe por eles.
+
+**Atualização (custo) — essa propriedade está quebrada agora**:
+`qualification-model`/`knowledge-model`/`objection-model` foram
+trocados de `claude-sonnet-5` pra `gpt-4o-mini` (Sonnet 5 dominava o
+gasto na OpenRouter mesmo sendo só 3 dos 7 aliases). Isso significa que
+TODOS os 6 agentes avaliados agora usam `gpt-4o-mini`, e o juiz
+(`gpt-4o`) é da MESMA família GPT-4o — exatamente o viés que essa
+escolha existia pra evitar. Não resolvido: se o viés de auto-avaliação
+importar pros seus resultados, troque `judge-model` pra fora da
+família GPT-4o antes de confiar num `make eval-run`. Ver TODO em
+`litellm_proxy/config.yaml`.
 
 `eval/judge.py` pede ao juiz um JSON com nota 1-5 **por dimensão**
 (`criteria_adherence`, `tone_and_persona`, `faithfulness` quando

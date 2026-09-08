@@ -2,17 +2,16 @@
 LLM-as-judge: pontua a resposta real de um agente contra o critério
 qualitativo de um item do golden set (`eval/golden_set.py`).
 
-`judge-model` (litellm_proxy/config.yaml) é DELIBERADAMENTE de uma
-família diferente dos modelos sendo avaliados (qualification/knowledge/
-objection-model, todos claude-sonnet-5) -- um modelo julgando a própria
-família de saída como boa é um viés de auto-avaliação documentado em
-LLM-as-judge. Hoje aponta pra gpt-4o (trocado de claude-opus-5 depois
-de rodar `make eval-run` de verdade: Opus é bem mais caro/lento, e
-gpt-4o já é uma família totalmente diferente da Sonnet com reputação
-sólida de seguir formato JSON estrito -- ver comentário em
-litellm_proxy/config.yaml pro histórico completo da troca). Mudar o
-modelo-juiz é uma mudança em config.yaml, não neste arquivo -- mesmo
-racional de `get_model_for_role` em app/agents/config/models.py.
+`judge-model` (litellm_proxy/config.yaml) era DELIBERADAMENTE de uma
+família diferente dos modelos sendo avaliados -- um modelo julgando a
+própria família de saída como boa é um viés de auto-avaliação
+documentado em LLM-as-judge. ESSA PROPRIEDADE ESTÁ QUEBRADA HOJE:
+qualification/knowledge/objection-model foram trocados de claude-
+sonnet-5 pra gpt-4o-mini por custo, e o juiz (gpt-4o) é da MESMA
+família GPT-4o -- ver o TODO no bloco do judge-model em
+litellm_proxy/config.yaml antes de confiar nos scores de uma run.
+Mudar o modelo-juiz é uma mudança em config.yaml, não neste arquivo --
+mesmo racional de `get_model_for_role` em app/agents/config/models.py.
 
 Duas responsabilidades ficam deliberadamente separadas neste módulo:
 - `build_judge_prompt` / `parse_judge_response`: puras, sem I/O --
