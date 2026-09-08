@@ -72,3 +72,9 @@ variable "cloud_sql_database_name" {
   default     = "sdr_bot"
   description = "Nome do banco de dados Postgres dentro da instância."
 }
+
+variable "observability_vm_machine_type" {
+  type        = string
+  default     = "e2-medium"
+  description = "Tipo da VM que roda Phoenix + LangFuse self-hospedados (ver terraform/observability_vm.tf). Suba pra e2-standard-2 se o ClickHouse OOMar."
+}

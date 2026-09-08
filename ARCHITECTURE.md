@@ -458,6 +458,12 @@ LangFuse (self-hospedado: postgres + clickhouse +
   passa pelo proxy, num lugar só, independente de qual dos 6 agentes
   disparou.
 
+> Esta seção descreve o setup LOCAL (`make phoenix-up`/`make
+> langfuse-up`). Em produção, os dois rodam numa VM dedicada, não em
+> Cloud Run -- ver "VM de observabilidade" na seção CI/CD abaixo pro
+> porquê (Cloud Run e background export não combinam) e pro histórico
+> completo de incidentes reais que levaram a essa decisão.
+
 ### Phoenix — instrumentação automática
 
 Um `phoenix.otel.register(auto_instrument=True)` instrumenta
@@ -824,13 +830,12 @@ O pipeline (`.github/workflows/ci-cd.yml`) é evolutivo, em duas camadas:
    (Settings → Environments → `production-*`), não dá pra expressar isso
    só no YAML do workflow.
 
-Arquitetura de deploy: quatro serviços Cloud Run —
-`litellm-proxy` (gateway pra OpenRouter), `sdr-bot-api` (API FastAPI
-sobre o sistema de agentes, aponta pro proxy via `LITELLM_PROXY_URL`),
-`telegram-service` (webhook do Telegram, aponta pro `sdr-bot-api` via
-`SDR_BOT_API_URL`) e `phoenix` (tracing OpenTelemetry dos agentes, ver
-`app/agents/observability.py` — `sdr-bot-api` aponta pra ele via
-`PHOENIX_COLLECTOR_ENDPOINT`).
+Arquitetura de deploy: três serviços Cloud Run — `litellm-proxy`
+(gateway pra OpenRouter), `sdr-bot-api` (API FastAPI sobre o sistema de
+agentes, aponta pro proxy via `LITELLM_PROXY_URL`), `telegram-service`
+(webhook do Telegram, aponta pro `sdr-bot-api` via `SDR_BOT_API_URL`) —
+mais uma VM (não Cloud Run) rodando Phoenix + LangFuse, ver "VM de
+observabilidade" logo abaixo.
 
 ### Configurando deploy na GCP (rodar uma vez, fora do pipeline)
 
@@ -897,12 +902,97 @@ echo -n "sua-master-key-do-proxy" | gcloud secrets create litellm-proxy-key --da
 | `WIF_PROVIDER_ID` | `github-provider` |
 | `WIF_SERVICE_ACCOUNT` | `gitlab-ci-deployer@<project-id>.iam.gserviceaccount.com` |
 | `CLOUD_SQL_CONNECTION_NAME` | `PROJETO:REGIAO:INSTANCIA` (sai de `terraform output`) |
+| `VPC_CONNECTOR_NAME` | sai de `terraform output` (ver "VM de observabilidade" abaixo) |
+| `OBSERVABILITY_VM_INTERNAL_IP` | idem |
 
 Nenhuma chave JSON de service account é armazenada em lugar nenhum — a
 autenticação usa o ID token OIDC que o próprio GitHub Actions emite por
 job (`id-token: write` em `.github/workflows/ci-cd.yml`, via
 `google-github-actions/auth`), trocado por uma credencial federada de
 curta duração.
+
+### VM de observabilidade (Phoenix + LangFuse)
+
+**Por que uma VM, não Cloud Run**: já tentamos Phoenix em Cloud Run
+duas vezes, e as duas falharam por um motivo estrutural, não um bug
+pontual. Cloud Run só aloca CPU pro container ENQUANTO ele processa uma
+requisição:
+
+- `batch=True` (BatchSpanProcessor, exporta em background a cada 5s):
+  a thread de flush nunca é escalonada entre requisições — zero traces
+  chegavam no Phoenix, sempre, confirmado checando os logs do próprio
+  Cloud Run do Phoenix (zero requisições em `/v1/traces`).
+- `batch=False` (SimpleSpanProcessor, exporta de forma síncrona,
+  inline): os exports começaram a falhar por timeout em produção,
+  bloqueando o `/chat` inteiro até esgotar as 3 instâncias — um
+  incidente real, mitigado via rollback de tráfego pro revision
+  anterior. Causa exata do timeout nunca confirmada, mas plausível que
+  o PRÓPRIO Phoenix (também em Cloud Run, também sujeito a CPU
+  throttling) estivesse lento o bastante pra estourar o timeout do
+  exporter.
+
+Uma VM normal, sempre ligada, não tem esse problema em nenhum dos dois
+lados — nem quem exporta (ainda `sdr-bot-api`, ainda em Cloud Run, é
+por isso que o código continua em `batch=True` por enquanto) nem quem
+recebe (agora a VM, não mais Cloud Run).
+
+**Infra** (`terraform/observability_vm.tf`): uma VPC dedicada, sem IP
+externo, alcançável pelo Cloud Run só via Serverless VPC Access
+(`--vpc-connector`/`--vpc-egress=private-ranges-only` nos jobs
+`deploy_litellm_proxy`/`deploy_sdr_bot_api`) — nunca exposta na
+internet pública, já que os traces contêm o conteúdo real da conversa
+do lead. `observability/docker-compose.yml` (7 containers: os 6 do
+LangFuse + Phoenix, com `PHOENIX_WORKING_DIR` num volume nomeado —
+diferente do Cloud Run, aqui o storage persiste de verdade entre
+restarts) é enviado pra um bucket GCS e baixado pela própria VM no
+boot, junto com um `.env` puxado do Secret Manager (`gcloud secrets
+versions access`).
+
+**Segredos a popular manualmente** (mesma regra dos outros — nunca via
+Terraform):
+
+```bash
+# Blob único com todas as variáveis LANGFUSE_* (ver .env.example) --
+# mesmo conteúdo que `make langfuse-secrets` já gera hoje pro .env local.
+cat <<'EOF' | gcloud secrets versions add observability-vm-env --data-file=-
+LANGFUSE_SALT=...
+LANGFUSE_ENCRYPTION_KEY=...
+LANGFUSE_NEXTAUTH_SECRET=...
+LANGFUSE_POSTGRES_PASSWORD=...
+LANGFUSE_CLICKHOUSE_PASSWORD=...
+LANGFUSE_REDIS_AUTH=...
+LANGFUSE_MINIO_ROOT_PASSWORD=...
+LANGFUSE_PUBLIC_KEY=...
+LANGFUSE_SECRET_KEY=...
+LANGFUSE_INIT_USER_PASSWORD=...
+EOF
+
+# MESMOS valores de LANGFUSE_PUBLIC_KEY/SECRET_KEY acima, como secrets
+# individuais -- litellm-proxy (Cloud Run) referencia estes dois via
+# --set-secrets, não o blob acima.
+echo -n "..." | gcloud secrets versions add langfuse-public-key --data-file=-
+echo -n "..." | gcloud secrets versions add langfuse-secret-key --data-file=-
+```
+
+**Verificação pós-deploy** (a VM não tem IP público, então acesso é
+via IAP — exige `roles/iap.tunnelResourceAccessor` na sua identidade):
+
+```bash
+gcloud compute ssh observability-vm --zone=us-central1-a --tunnel-through-iap \
+  -- 'docker compose -f /opt/observability/docker-compose.yml ps'
+
+# Túnel local pra abrir a UI do LangFuse (http://localhost:3000) ou do
+# Phoenix (http://localhost:6006) no seu navegador:
+gcloud compute ssh observability-vm --zone=us-central1-a --tunnel-through-iap \
+  -- -L 3000:localhost:3000 -L 6006:localhost:6006
+```
+
+**Antes de trocar `batch=True` → `batch=False`** em
+`app/agents/observability.py` de novo: confirme que a VM responde
+rápido e de forma estável com um teste direto primeiro (`curl` num
+loop, várias vezes, sob alguma carga), não só uma vez — foi
+exatamente uma condição transiente que passou despercebida da última
+vez que isso foi tentado em Cloud Run.
 
 ### Deploy via Terraform
 
