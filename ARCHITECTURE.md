@@ -661,16 +661,25 @@ modelo por trás de `orchestrator-model`/`scheduling-model`/
 `escalate-model`, reintroduzindo viés de auto-avaliação pra qualquer
 conversa que passe por eles.
 
-**Atualização (custo) — essa propriedade está quebrada agora**:
-`qualification-model`/`knowledge-model`/`objection-model` foram
-trocados de `claude-sonnet-5` pra `gpt-4o-mini` (Sonnet 5 dominava o
-gasto na OpenRouter mesmo sendo só 3 dos 7 aliases). Isso significa que
-TODOS os 6 agentes avaliados agora usam `gpt-4o-mini`, e o juiz
-(`gpt-4o`) é da MESMA família GPT-4o — exatamente o viés que essa
-escolha existia pra evitar. Não resolvido: se o viés de auto-avaliação
-importar pros seus resultados, troque `judge-model` pra fora da
-família GPT-4o antes de confiar num `make eval-run`. Ver TODO em
-`litellm_proxy/config.yaml`.
+**Atualização (custo) — essa propriedade está parcialmente quebrada
+agora**: `qualification-model`/`knowledge-model`/`objection-model`
+foram trocados de `claude-sonnet-5` pra `gpt-4o-mini` (Sonnet 5
+dominava o gasto na OpenRouter mesmo sendo só 3 dos 7 aliases). Em
+produção real, `knowledge-model` em `gpt-4o-mini` passou a narrar a
+intenção de chamar uma tool ("Realizando busca por funcionalidades do
+produto...") como se fosse a resposta final, em vez de chamar a tool
+de verdade e responder com o resultado — sintoma clássico de
+disciplina de tool-use mais fraca em modelos menores, não um bug de
+infra. `knowledge-model` foi revertido pra `claude-sonnet-5` por causa
+disso; `qualification-model`/`objection-model` continuam em
+`gpt-4o-mini` (não mostraram o sintoma). Isso significa que 5 dos 6
+agentes avaliados usam `gpt-4o-mini`, e o juiz (`gpt-4o`) é da MESMA
+família GPT-4o — o viés que essa escolha existia pra evitar, embora a
+dimensão mais sensível a alucinação (`faithfulness`, avaliada sobre a
+saída do `knowledge-model`) já não compartilhe família com o juiz.
+Não resolvido pros outros 5: se o viés de auto-avaliação importar pros
+seus resultados, troque `judge-model` pra fora da família GPT-4o antes
+de confiar num `make eval-run`. Ver TODO em `litellm_proxy/config.yaml`.
 
 `eval/judge.py` pede ao juiz um JSON com nota 1-5 **por dimensão**
 (`criteria_adherence`, `tone_and_persona`, `faithfulness` quando

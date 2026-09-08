@@ -22,17 +22,34 @@
 # ATUALIZAÇÃO (custo): os três acima foram trocados de claude-sonnet-5
 # pra gpt-4o-mini -- decisão explícita de custo (Sonnet 5 é ~10-15x
 # mais caro por token, e dominava o gasto na OpenRouter mesmo sendo só
-# 3 dos 7 aliases). Trade-off CONSCIENTE, não validado por eval antes
-# da troca: fica como TODO rodar `make eval-run` e comparar contra
-# eval/baseline.json pra confirmar que qualidade (em especial
-# judge_faithfulness do knowledge-model, a dimensão que existe
-# especificamente pra pegar alucinação sobre produto) não caiu demais.
+# 3 dos 7 aliases).
+#
+# REVERTIDO PARCIALMENTE (qualidade): knowledge-model voltou pra
+# claude-sonnet-5, confirmado em produção real -- gpt-4o-mini narrava
+# a intenção de usar a tool ("Realizando busca por funcionalidades do
+# produto...") como se fosse a resposta final, em vez de chamar a tool
+# e responder com o resultado, deixando o lead sem resposta de
+# verdade. Não é bug nosso: disciplina de tool-use (decidir chamar uma
+# tool SILENCIOSAMENTE vs. narrar a intenção em prosa) é justamente a
+# capacidade que mais degrada em modelos menores -- e o prompt de
+# knowledge_agent tem uma regra condicional de duas etapas ("NUNCA
+# responda sem consultar a tool" + "se o resultado não cobrir, diga
+# que vai confirmar com o time"), exatamente o tipo de contrato
+# multi-passo onde um modelo mais fraco tende a atalhar. qualification/
+# objection-model continuam em gpt-4o-mini -- não mostraram esse
+# sintoma (fluxos mais simples, sem esse mesmo contrato condicional de
+# tool-use). Ainda fica como TODO rodar `make eval-run` pra confirmar
+# com número, não só anedota, que qualification/objection realmente
+# seguram a qualidade em gpt-4o-mini.
+#
 # Efeito colateral pro judge-model abaixo: a razão original de excluir
 # gpt-4o-mini como juiz era evitar viés de auto-avaliação com
-# orchestrator/scheduling/escalate-model -- agora TODOS os 6 agentes
-# avaliados usam gpt-4o-mini, e o juiz (gpt-4o) é da MESMA família
-# (GPT-4o), exatamente o tipo de viés que o design original evitava.
-# Não resolvido aqui -- ver TODO no bloco do judge-model.
+# orchestrator/scheduling/escalate-model -- agora qualification/
+# objection-model TAMBÉM são gpt-4o-mini (5 dos 6 agentes avaliados),
+# e o juiz (gpt-4o) é da MESMA família (GPT-4o). Parcialmente mitigado
+# pelo revert do knowledge-model (a dimensão de faithfulness mais
+# sensível não compartilha mais família com o juiz), mas não resolvido
+# pros outros 5 -- ver TODO no bloco do judge-model.
 
 model_list:
   # --- Orquestrador: roteamento de intenção, não precisa de raciocínio pesado ---
@@ -50,12 +67,13 @@ model_list:
       api_key: os.environ/OPENROUTER_API_KEY
 
   # --- Knowledge/RAG: faithfulness importa, não pode alucinar sobre produto ---
-  # gpt-4o-mini por custo (ver NOTA de atualização acima) -- era
-  # claude-sonnet-5. Esta é a dimensão mais arriscada da troca --
-  # confirmar via `make eval-run` que faithfulness não caiu.
+  # REVERTIDO pra claude-sonnet-5 (ver bloco REVERTIDO PARCIALMENTE
+  # acima) -- passou por gpt-4o-mini por custo, mas em produção real
+  # narrava a intenção de usar a tool em vez de chamá-la de fato,
+  # deixando o lead sem resposta.
   - model_name: knowledge-model
     litellm_params:
-      model: openrouter/openai/gpt-4o-mini
+      model: openrouter/anthropic/claude-sonnet-5
       api_key: os.environ/OPENROUTER_API_KEY
 
   # --- Objeções: nuance e persuasão ---
@@ -103,14 +121,18 @@ model_list:
   # orchestrator/scheduling/escalate-model, reintroduzindo viés de
   # auto-avaliação pra qualquer conversa que passe por eles.
   #
-  # TODO (quebrado pela troca de custo acima): qualification/knowledge/
-  # objection-model agora TAMBÉM são gpt-4o-mini -- ou seja, TODOS os 6
-  # agentes avaliados usam gpt-4o-mini, e o juiz (gpt-4o) é da MESMA
-  # família (GPT-4o), exatamente o viés que esta escolha existia pra
-  # evitar. Não resolvido -- se o viés de auto-avaliação importar de
-  # verdade pros seus resultados, troque o judge-model pra algo fora da
-  # família GPT-4o (ex: um Claude ou Llama maior) antes de confiar nos
-  # scores do próximo `make eval-run`.
+  # TODO (parcialmente quebrado pela troca de custo acima, e só
+  # parcialmente corrigido pelo revert do knowledge-model): qualification/
+  # objection-model continuam gpt-4o-mini -- ou seja, 5 dos 6 agentes
+  # avaliados usam gpt-4o-mini, e o juiz (gpt-4o) é da MESMA família
+  # (GPT-4o), o viés que esta escolha existia pra evitar. knowledge-model
+  # voltou pra claude-sonnet-5 (fora da família do juiz), então a
+  # dimensão mais sensível a alucinação (faithfulness sobre produto) já
+  # não compartilha família com quem julga. Não resolvido pros outros
+  # 5 -- se o viés de auto-avaliação importar de verdade pros seus
+  # resultados, troque o judge-model pra algo fora da família GPT-4o
+  # (ex: um Claude ou Llama maior) antes de confiar nos scores do
+  # próximo `make eval-run`.
   - model_name: judge-model
     litellm_params:
       model: openrouter/openai/gpt-4o
