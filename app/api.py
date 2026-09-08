@@ -13,9 +13,12 @@ duplicada em cada adaptador de canal (ver app/handoff/delivery.py pro
 racional completo).
 """
 
+import asyncio
 import os
+import random
 
 from fastapi import FastAPI, HTTPException
+from google.adk.errors import StaleSessionError
 from google.adk.events import Event, EventActions
 from google.adk.runners import Runner
 from google.genai import types
@@ -78,6 +81,28 @@ async def health() -> dict:
 
 _RESET_COMMAND = "/newsession"
 
+# StaleSessionError acontece quando duas requisições pra MESMA sessão
+# se sobrepõem -- ex: telegram_service dá timeout (30s) esperando uma
+# resposta lenta (cold start, RAG), Telegram reenvia o mesmo update, e
+# a tentativa original ainda está rodando em background quando a
+# reenviada chega. A que perde a corrida tenta gravar um evento sobre
+# um estado de sessão que já mudou, e o ADK rejeita (checagem de
+# concorrência otimista) -- a própria mensagem de erro já diz o que
+# fazer: recarregar a sessão e tentar de novo. Descoberto em produção
+# de verdade: sem isso, a sessão ficava PERMANENTEMENTE corrompida (um
+# evento de tool_call gravado sem o tool_result correspondente), e
+# TODA mensagem seguinte nessa sessão falhava do mesmo jeito pra
+# sempre, até alguém mandar /newsession manualmente.
+_MAX_STALE_SESSION_RETRIES = 3
+
+
+async def _backoff_before_retry(attempt: int) -> None:
+    # Jitter aleatório (não backoff exponencial fixo) de propósito: o
+    # cenário típico é DUAS requisições colidindo ao mesmo tempo -- um
+    # delay determinístico faria as duas tentarem de novo no mesmo
+    # instante, colidindo de novo.
+    await asyncio.sleep(random.uniform(0.1, 0.4) * (attempt + 1))
+
 
 @app.post("/chat", response_model=ChatResponse)
 async def chat(payload: ChatRequest) -> ChatResponse:
@@ -118,7 +143,20 @@ async def chat(payload: ChatRequest) -> ChatResponse:
             content=types.Content(role="user", parts=[types.Part(text=payload.message)]),
             invocation_id=f"handoff-{payload.session_id}",
         )
-        await _session_service.append_event(session, event)
+        for attempt in range(_MAX_STALE_SESSION_RETRIES):
+            try:
+                await _session_service.append_event(session, event)
+                break
+            except StaleSessionError:
+                if attempt == _MAX_STALE_SESSION_RETRIES - 1:
+                    raise
+                await _backoff_before_retry(attempt)
+                # append_event precisa do Session OBJECT atualizado, não
+                # só do session_id -- reusar o `session` antigo de novo
+                # falharia com o mesmo erro.
+                session = await _session_service.get_session(
+                    app_name=APP_NAME, user_id=payload.user_id, session_id=payload.session_id
+                )
         return ChatResponse(agent="human", response="", handoff_mode=True)
 
     content = types.Content(role="user", parts=[types.Part(text=payload.message)])
@@ -126,14 +164,31 @@ async def chat(payload: ChatRequest) -> ChatResponse:
     agent_name = "OrchestratorAgent"
     response_text = ""
 
-    async for event in _runner.run_async(
-        user_id=payload.user_id,
-        session_id=payload.session_id,
-        new_message=content,
-    ):
-        if event.is_final_response() and event.content and event.content.parts:
-            agent_name = event.author
-            response_text = event.content.parts[0].text
+    for attempt in range(_MAX_STALE_SESSION_RETRIES):
+        try:
+            async for event in _runner.run_async(
+                user_id=payload.user_id,
+                session_id=payload.session_id,
+                new_message=content,
+            ):
+                if event.is_final_response() and event.content and event.content.parts:
+                    agent_name = event.author
+                    response_text = event.content.parts[0].text
+            break
+        except StaleSessionError:
+            if attempt == _MAX_STALE_SESSION_RETRIES - 1:
+                raise
+            # run_async recarrega a sessão do zero a cada chamada (não
+            # reusa um objeto Session em memória) -- só repetir a
+            # chamada já conta como "recarregar" no sentido que o ADK
+            # pede. Seguro reenviar a MESMA new_message: se chegou a
+            # cair aqui, o evento de usuário desta tentativa nunca foi
+            # persistido de verdade (ver traceback real que motivou
+            # isso: falhava em _append_user_event, o primeiro append da
+            # chamada).
+            agent_name = "OrchestratorAgent"
+            response_text = ""
+            await _backoff_before_retry(attempt)
 
     return ChatResponse(agent=agent_name, response=response_text)
 
