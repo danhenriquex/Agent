@@ -31,12 +31,44 @@ COPY app/ ./app/
 RUN --mount=type=cache,target=/root/.cache/uv \
     uv sync --frozen --no-dev
 
+# Materializa o índice RAG (ChromaDB) DURANTE o build -- decisão já
+# documentada em ARCHITECTURE.md, nunca antes implementada de fato: o
+# Dockerfile só copiava app/, então mcp_server/server.py nem existia no
+# container, e KnowledgeAgent quebrava com "[Errno 2] No such file or
+# directory" na primeira pergunta de RAG em produção. Baixa o modelo de
+# embedding (~470MB) e roda a ingestão real aqui -- trade-off aceito:
+# rebuild necessário a cada mudança na base de conhecimento
+# (ingestion/knowledge_base/*.md), em troca de não precisar de GCS +
+# sync em runtime nem de recursos Terraform novos.
+#
+# PII_HASH_SALT: qualquer valor serve aqui -- não é dado real de
+# produção, só precisa existir pra importar app.agents.pii.engine (o
+# asset_check no_pii_leaked_into_index) sem levantar erro de config
+# ausente.
+#
+# PYTHONPATH=/app: sem isso, o asset_check no_pii_leaked_into_index
+# falha com "ModuleNotFoundError: No module named 'app'" -- descoberto
+# rodando o build de verdade. O executor multiprocess do Dagster
+# lança um subprocess NOVO por step (confirmado nos logs: "Launching
+# subprocess for..."), e esse subprocess específico (o único que faz
+# `from app.agents.pii.engine import ...`, os outros steps não tocam
+# em app/) não herda /app no sys.path do jeito que uma invocação
+# direta herdaria.
+COPY ingestion/ ./ingestion/
+COPY mcp_server/server.py ./mcp_server/server.py
+
+RUN --mount=type=cache,target=/root/.cache/uv \
+    PII_HASH_SALT=build-time-only-not-a-real-secret-000000000000 \
+    PYTHONPATH=/app \
+    uv run dagster asset materialize -f ingestion/definitions.py --select '*'
+
 FROM python:3.12-slim-bookworm AS runtime
 
 WORKDIR /app
 
 COPY --from=builder /app/.venv /app/.venv
 COPY --from=builder /app/app ./app
+COPY --from=builder /app/mcp_server ./mcp_server
 
 ENV PATH="/app/.venv/bin:$PATH"
 ENV PORT=8080

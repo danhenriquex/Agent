@@ -1131,17 +1131,34 @@ gcloud run services logs read sdr-bot-api       --region="$GCP_REGION" --limit=5
 
 #### Gaps conhecidos, documentados e não resolvidos aqui
 
-- **RAG em produção (`mcp_server/chroma_data/`)**: o índice Chroma é
-  gitignored e só existe localmente após `make ingest-dev`. O
-  `Dockerfile` raiz hoje só copia `app/` — se deployado como está, o
-  `KnowledgeAgent` quebra silenciosamente no primeiro `get_collection()`
-  (a coleção não existe). Decisão tomada: materializar o índice **durante
-  o build da imagem** (stage extra no `Dockerfile` rodando `uv run dagster
-  asset materialize -f ingestion/definitions.py --select '*'`), não via
-  GCS + sync em runtime — exige zero recursos Terraform novos, e o
-  trade-off (rebuild necessário a cada mudança na base de conhecimento,
-  download do modelo de embedding em cache miss) é aceitável para uma base
-  de conhecimento que muda com pouca frequência. Fica como TODO: a mudança
-  em si é no `Dockerfile`, fora do escopo deste Terraform.
+- ~~**RAG em produção**~~ -- RESOLVIDO. O `Dockerfile` raiz materializa
+  o índice Chroma **durante o build da imagem** (roda `dagster asset
+  materialize -f ingestion/definitions.py --select '*'` no builder
+  stage, copia `mcp_server/` -- server.py + o `chroma_data/` recém-
+  gerado -- pro runtime stage), em vez de GCS + sync em runtime: zero
+  recursos Terraform novos, trade-off aceito de rebuild a cada mudança
+  na base de conhecimento (`ingestion/knowledge_base/*.md`).
+  Verificado rodando o build de verdade e consultando a coleção
+  resultante (recall correto pra "quanto custa o plano"). Dois bugs
+  reais encontrados fazendo isso:
+  - `knowledge.py` chamava o servidor MCP via `command="uv", args=
+    ["run", "python", ...]` -- o runtime stage nunca teve `uv`
+    instalado (só o builder), então o subprocess falhava com
+    `[Errno 2] No such file or directory` na primeira pergunta de RAG.
+    Trocado por `command=sys.executable` (o interpretador do processo
+    atual, que já é o `.venv/bin/python` certo nos dois ambientes).
+  - O `asset_check` `no_pii_leaked_into_index` (que faz `from
+    app.agents.pii.engine import ...`) falhava com `ModuleNotFoundError:
+    No module named 'app'` DENTRO do build -- o executor multiprocess
+    do Dagster lança um subprocess novo por step, e esse step
+    específico não herdava `/app` no `sys.path`. Precisou de
+    `PYTHONPATH=/app` explícito só nesse `RUN`.
+  Nota operacional: no GitHub Actions (runners efêmeros, sem cache de
+  camada Docker entre execuções), esse stage roda em TODO push pra
+  `main`, não só quando a base de conhecimento muda -- baixa de novo o
+  modelo de embedding (~470MB) a cada deploy. Aceito por enquanto;
+  adicionar cache de build (ex: `docker/build-push-action` com cache
+  no GHA ou num registry) resolveria, mas fica como otimização futura,
+  não bloqueador.
 - **Hardening do `--allow-unauthenticated`** (`litellm-proxy` e
   `telegram-service`): TODO consciente, junto dos guardrails da Parte 3.
