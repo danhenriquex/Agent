@@ -13,6 +13,7 @@ sido indexada pelo menos uma vez (`make ingest-dev`), senão o servidor
 MCP não encontra a coleção no ChromaDB.
 """
 
+import logging
 import sys
 from pathlib import Path
 
@@ -51,6 +52,45 @@ _knowledge_base_mcp = McpToolset(
         timeout=15.0,
     ),
 )
+
+_logger = logging.getLogger(__name__)
+
+
+async def warmup_mcp_connection() -> None:
+    """Pré-aquece a conexão MCP -- spawna o subprocess (mcp_server/
+    server.py), faz o handshake stdio, e lista as tools -- ANTES do
+    primeiro request real chegar.
+
+    Sem isso, a primeira pergunta de RAG em cada instância nova paga o
+    boot do subprocess (~20s+, medido em produção real: do início do
+    request até o banner do FastMCP aparecer no log) DENTRO do próprio
+    request do usuário. Descoberto rodando de verdade: essa lentidão
+    disparava retries internos do ADK/LiteLLM na chamada da tool, e
+    CADA retry deixava um tool_call órfão (sem tool_result
+    correspondente) permanentemente gravado na sessão -- uma sessão
+    chegou a acumular 25+ tool_calls órfãos numa ÚNICA requisição,
+    corrompendo a conversa pro resto do histórico (toda mensagem
+    seguinte reenvia o mesmo histórico quebrado pro LLM). Chamado no
+    lifespan de startup do FastAPI (app/api.py).
+
+    Não aquece o modelo de embedding em si (isso só carrega no
+    PRIMEIRO uso real de uma tool, dentro do subprocess -- ver
+    mcp_server/server.py::_get_collection) -- só o boot do processo e a
+    conexão MCP, que é a fatia dominante do tempo medido. Chamar uma
+    tool de verdade aqui pra aquecer o embedding também exigiria
+    replicar a machinery interna do McpToolset pra invocar uma tool
+    fora de um agent run -- fora de escopo por ora; o ganho principal
+    já vem do boot do subprocess.
+
+    Seguro falhar aqui -- não impede o startup do app, só significa
+    que o warmup não rolou e a conexão volta a acontecer lazy no
+    primeiro uso real (comportamento de antes desta mudança).
+    """
+    try:
+        await _knowledge_base_mcp.get_tools()
+    except Exception:
+        _logger.warning("Falha ao pré-aquecer conexão MCP", exc_info=True)
+
 
 knowledge_agent = LlmAgent(
     name="KnowledgeAgent",
