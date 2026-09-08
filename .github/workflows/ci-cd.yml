@@ -155,6 +155,17 @@ jobs:
       # only é essencial: sem isso, TODO tráfego de saída (inclusive pra
       # OpenRouter) passaria pelo connector à toa -- só o range privado
       # (10.10.0.0/24) precisa ir por ali.
+      #
+      # --min-instances=1: sem isso, litellm-proxy escala pra ZERO
+      # quando ocioso -- confirmado em produção real que isso CASCATEIA
+      # com o cold start do sdr-bot-api: um request real chega,
+      # sdr-bot-api cold-starta (~15-20s), tenta chamar litellm-proxy,
+      # que TAMBÉM está frio e leva outros ~20-30s pra subir, só então
+      # a chamada de verdade pro OpenRouter acontece -- facilmente >60s
+      # no total, estourando o timeout de 30s do telegram_service (e o
+      # próprio Telegram desiste do webhook). Custo recorrente real
+      # (ver conversa sobre --no-cpu-throttling do Phoenix), aceito
+      # deliberadamente aqui pra eliminar essa cascata.
       - run: |
           gcloud run deploy litellm-proxy \
             --image="$PROXY_IMAGE_TAG" \
@@ -162,6 +173,7 @@ jobs:
             --platform=managed \
             --port=4000 \
             --memory=1Gi \
+            --min-instances=1 \
             --allow-unauthenticated \
             --vpc-connector="${{ secrets.VPC_CONNECTOR_NAME }}" \
             --vpc-egress=private-ranges-only \
@@ -204,6 +216,11 @@ jobs:
       # trocar pra batch=False DEPOIS de confirmar manualmente (curl
       # direto) que a VM responde rápido e de forma estável, pra não
       # repetir o mesmo incidente.
+      #
+      # --min-instances=1: mesmo racional do litellm-proxy acima --
+      # sdr-bot-api sozinho já cold-starta em ~15-20s (boot do Python +
+      # handshake do subprocess MCP), e isso se soma ao cold start do
+      # litellm-proxy quando os dois estão frios ao mesmo tempo.
       - run: |
           gcloud run deploy sdr-bot-api \
             --image="$API_IMAGE_TAG" \
@@ -211,6 +228,7 @@ jobs:
             --platform=managed \
             --port=8080 \
             --memory=4Gi \
+            --min-instances=1 \
             --allow-unauthenticated \
             --service-account="sdr-bot-api-runtime@${{ secrets.GCP_PROJECT_ID }}.iam.gserviceaccount.com" \
             --add-cloudsql-instances="${{ secrets.CLOUD_SQL_CONNECTION_NAME }}" \
