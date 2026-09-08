@@ -13,6 +13,7 @@ sido indexada pelo menos uma vez (`make ingest-dev`), senão o servidor
 MCP não encontra a coleção no ChromaDB.
 """
 
+import sys
 from pathlib import Path
 
 from google.adk.agents import LlmAgent
@@ -36,9 +37,15 @@ _PROJECT_ROOT = Path(__file__).parent.parent.parent
 
 _knowledge_base_mcp = McpToolset(
     connection_params=StdioConnectionParams(
+        # sys.executable, não "uv"/"uv run python": o processo atual
+        # (seja `uv run uvicorn ...` local ou o CMD direto do container
+        # em produção) já roda sob o interpretador certo -- reusar
+        # sys.executable funciona nos dois ambientes sem exigir que `uv`
+        # esteja instalado em produção (o runtime stage do Dockerfile
+        # nunca teve `uv`, só o builder stage tem).
         server_params=StdioServerParameters(
-            command="uv",
-            args=["run", "python", "mcp_server/server.py"],
+            command=sys.executable,
+            args=["mcp_server/server.py"],
             cwd=str(_PROJECT_ROOT),
         ),
         timeout=15.0,
