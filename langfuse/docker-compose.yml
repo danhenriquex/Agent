@@ -15,6 +15,15 @@
 # compose.yml) -- nunca hardcoded aqui. Ver .env.example pra lista
 # completa e comando de geração de cada um.
 #
+# Imagens pinadas numa versão exata (3.225.7), não na tag flutuante
+# `:3` -- descoberto rodando de verdade: local (pull antigo) e a VM de
+# produção (pull recente, ver observability/docker-compose.yml)
+# acabaram em versões DIFERENTES do LangFuse só por terem sido
+# baixadas em datas diferentes, o que mudou como o Input/Output de um
+# trace era exibido (dado não se perdeu, só parava de aparecer no
+# preview bonito). As DUAS cópias deste compose (aqui e em
+# observability/) precisam ser atualizadas JUNTAS ao trocar de versão.
+#
 # LANGFUSE_INIT_* faz o LangFuse se auto-provisionar no primeiro boot
 # (org, projeto, usuário, E as API keys) -- assim o LiteLLM Proxy já
 # sobe sabendo as chaves certas via .env, sem precisar logar na UI e
@@ -22,7 +31,7 @@
 
 services:
   langfuse-worker:
-    image: docker.io/langfuse/langfuse-worker:3
+    image: docker.io/langfuse/langfuse-worker:3.225.7
     restart: always
     depends_on: &langfuse-depends-on
       postgres:
@@ -84,7 +93,7 @@ services:
       REDIS_TLS_ENABLED: "false"
 
   langfuse-web:
-    image: docker.io/langfuse/langfuse:3
+    image: docker.io/langfuse/langfuse:3.225.7
     restart: always
     depends_on: *langfuse-depends-on
     ports:
