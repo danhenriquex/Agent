@@ -206,8 +206,15 @@ services:
       - "6006:6006"
     volumes:
       - phoenix_data:/mnt/data/phoenix
+    # CMD-SHELL (wget) não funciona aqui -- descoberto rodando de
+    # verdade: a imagem arizephoenix/phoenix não tem /bin/sh (nem
+    # wget), então CMD-SHELL falha com "exec: /bin/sh: no such file or
+    # directory" pra sempre, mesmo com o Phoenix respondendo normal
+    # (confirmado via curl direto do host: 200). python3 (o próprio
+    # runtime da imagem) faz o mesmo papel sem precisar de shell nem
+    # de nenhum binário adicional.
     healthcheck:
-      test: ["CMD-SHELL", "wget --no-verbose --tries=1 --spider http://localhost:6006/ || exit 1"]
+      test: ["CMD", "python3", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:6006/')"]
       interval: 5s
       timeout: 5s
       retries: 10

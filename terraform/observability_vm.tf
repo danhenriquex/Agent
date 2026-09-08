@@ -36,6 +36,28 @@ resource "google_compute_subnetwork" "observability_subnet" {
   ip_cidr_range = "10.10.0.0/24"
 }
 
+# Sem IP externo, a VM não tem NENHUM acesso à internet por padrão --
+# nem entrada nem SAÍDA. O Cloud NAT resolve só a saída (a VM consegue
+# iniciar conexões pra fora, ex: apt/Docker Hub no boot), sem abrir
+# NENHUMA porta de entrada -- continua impossível iniciar uma conexão
+# DE FORA pra VM sem passar pelo connector/firewall já definidos acima.
+# Descoberto rodando de verdade: o startup-script travou ~6min em
+# "Network is unreachable" tentando alcançar deb.debian.org/
+# download.docker.com sem isso.
+resource "google_compute_router" "observability_router" {
+  name    = "observability-router"
+  region  = var.gcp_region
+  network = google_compute_network.observability_vpc.id
+}
+
+resource "google_compute_router_nat" "observability_nat" {
+  name                               = "observability-nat"
+  router                             = google_compute_router.observability_router.name
+  region                             = var.gcp_region
+  nat_ip_allocate_option             = "AUTO_ONLY"
+  source_subnetwork_ip_ranges_to_nat = "ALL_SUBNETWORKS_ALL_IP_RANGES"
+}
+
 # Serverless VPC Access -- a "ponte" que permite Cloud Run (sdr-bot-api,
 # litellm-proxy) alcançar o IP INTERNO da VM. Precisa do próprio range
 # /28, separado do range da VM (não pode sobrepor).
@@ -44,6 +66,12 @@ resource "google_vpc_access_connector" "cloud_run_connector" {
   region        = var.gcp_region
   network       = google_compute_network.observability_vpc.name
   ip_cidr_range = "10.10.1.0/28"
+  # A API do GCP passou a exigir isso explícito (sem default implícito
+  # mais) -- min_instances=2 é o mínimo permitido pelo Serverless VPC
+  # Access; max_instances=3 mantém o footprint pequeno (é só uma ponte
+  # de rede pra um projeto de baixo tráfego, não precisa de mais).
+  min_instances = 2
+  max_instances = 3
   depends_on    = [google_project_service.apis]
 }
 
