@@ -84,6 +84,17 @@ COPY --from=builder /app/mcp_server ./mcp_server
 # rede.
 COPY --from=builder /root/.cache/huggingface /root/.cache/huggingface
 
+# HF_HUB_OFFLINE=1: sem isso, o cache acima só evita o RE-DOWNLOAD dos
+# pesos -- sentence-transformers/huggingface_hub ainda faz um HEAD
+# de rede a cada carregamento pra checar se há versão mais nova, MESMO
+# com o arquivo local presente. Descoberto em produção de verdade:
+# esse HEAD tomou 429 da HF ("Rate limited. Waiting 182.0s before
+# retry"), e esse bloqueio sozinho (não o download) já estourava o
+# timeout de 15s da tool call MCP, deixando tool_calls órfãos e
+# derrubando a conversa inteira. Setar aqui, não no builder -- o
+# builder PRECISA de rede pra buscar o modelo a primeira vez.
+ENV HF_HUB_OFFLINE=1
+
 ENV PATH="/app/.venv/bin:$PATH"
 ENV PORT=8080
 EXPOSE 8080
