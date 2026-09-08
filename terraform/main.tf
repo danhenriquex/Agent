@@ -33,6 +33,12 @@ locals {
     "cloudresourcemanager.googleapis.com",
     "serviceusage.googleapis.com",
     "compute.googleapis.com",
+    # VM + rede privada de observability_vm.tf (Phoenix + LangFuse
+    # self-hospedados): vpcaccess pro connector que deixa Cloud Run
+    # alcançar a VM, storage pro bucket que guarda o docker-compose.yml
+    # que a VM baixa no boot.
+    "vpcaccess.googleapis.com",
+    "storage.googleapis.com",
   ]
 
   compute_default_sa = "${var.gcp_project_number}-compute@developer.gserviceaccount.com"

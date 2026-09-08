@@ -147,6 +147,14 @@ jobs:
       # --memory=1Gi: o default do Cloud Run (512 MiB) não é suficiente
       # -- confirmado via logs na revision que falhou: "Memory limit of
       # 512 MiB exceeded with 519 MiB used", OOM antes de bindar a porta.
+      #
+      # --vpc-connector/--vpc-egress: alcança a VM de observabilidade
+      # (terraform/observability_vm.tf) via Serverless VPC Access --
+      # LANGFUSE_OTEL_HOST aponta pro IP INTERNO dela (http, não https --
+      # tráfego dentro da VPC, sem TLS na frente). egress=private-ranges-
+      # only é essencial: sem isso, TODO tráfego de saída (inclusive pra
+      # OpenRouter) passaria pelo connector à toa -- só o range privado
+      # (10.10.0.0/24) precisa ir por ali.
       - run: |
           gcloud run deploy litellm-proxy \
             --image="$PROXY_IMAGE_TAG" \
@@ -155,72 +163,14 @@ jobs:
             --port=4000 \
             --memory=1Gi \
             --allow-unauthenticated \
-            --set-secrets="OPENROUTER_API_KEY=openrouter-api-key:latest,LITELLM_PROXY_KEY=litellm-proxy-key:latest"
-
-  # Sobe o Phoenix (tracing de agentes/RAG, ver app/agents/observability.py)
-  # como serviço Cloud Run próprio, em vez de deixar como só-local
-  # (make phoenix-up). Sem isso, cada `Runner.run()` do sdr-bot-api em
-  # produção tenta exportar spans pra localhost:4317, que não existe
-  # dentro do container -- silencioso (register() nunca propaga erro de
-  # export), mas 100% dos traces de produção eram perdidos, e os logs
-  # do Cloud Run ficavam poluídos com "Transient error ... retrying"
-  # a cada requisição (confirmado via gcloud logging read).
-  deploy_phoenix:
-    runs-on: ubuntu-latest
-    needs: [docker_build_check]
-    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
-    environment:
-      name: production-phoenix
-    permissions:
-      contents: read
-      id-token: write
-    steps:
-      - uses: google-github-actions/auth@v2
-        with:
-          project_id: ${{ secrets.GCP_PROJECT_ID }}
-          workload_identity_provider: "projects/${{ secrets.GCP_PROJECT_NUMBER }}/locations/global/workloadIdentityPools/${{ secrets.WIF_POOL_ID }}/providers/${{ secrets.WIF_PROVIDER_ID }}"
-          service_account: ${{ secrets.WIF_SERVICE_ACCOUNT }}
-      - uses: google-github-actions/setup-gcloud@v2
-      # Imagem pública oficial da Arize (não passa por build_and_push --
-      # não é código nosso). Pinada numa tag real (verificada via Docker
-      # Hub API, não "latest") pelo mesmo motivo do trivy-action: uma tag
-      # móvel muda de baixo dos nossos pés sem aviso.
-      #
-      # --max-instances=1 é ESSENCIAL, não só custo: sem um Postgres
-      # externo (decisão deliberada de manter simples nesta fase), o
-      # Phoenix guarda os traces em storage local dentro do próprio
-      # container. Com mais de uma instância, cada uma teria seu próprio
-      # storage desconectado -- metade dos traces numa, metade na outra,
-      # sem uma timeline completa em lugar nenhum. --min-instances=1
-      # evita cold start E evita reciclagem por scale-to-zero, que
-      # apagaria todo o histórico acumulado.
-      #
-      # PHOENIX_PORT=6006 explícito: é o mesmo valor default do pacote
-      # (ver phoenix/config.py: PORT = 6006), mas o Cloud Run injeta sua
-      # própria env var PORT (que o Phoenix ignora, ele só lê
-      # PHOENIX_PORT) -- setar explícito evita depender de um default
-      # implícito de uma lib de terceiro coincidir com --port abaixo.
-      #
-      # --allow-unauthenticated: mesmo racional (e mesmo TODO de
-      # hardening) do litellm-proxy, só que mais sensível -- a UI do
-      # Phoenix mostra o conteúdo completo das conversas, mesmo dado do
-      # endpoint /handoff/.../history, que já é público hoje. Endurecer
-      # os dois juntos é o próximo passo, não piora o que já existe.
-      - run: |
-          gcloud run deploy phoenix \
-            --image="arizephoenix/phoenix:version-20.8.0" \
-            --region="${{ secrets.GCP_REGION }}" \
-            --platform=managed \
-            --port=6006 \
-            --memory=1Gi \
-            --min-instances=1 \
-            --max-instances=1 \
-            --allow-unauthenticated \
-            --set-env-vars="PHOENIX_PORT=6006"
+            --vpc-connector="${{ secrets.VPC_CONNECTOR_NAME }}" \
+            --vpc-egress=private-ranges-only \
+            --set-env-vars="LANGFUSE_OTEL_HOST=http://${{ secrets.OBSERVABILITY_VM_INTERNAL_IP }}:3000" \
+            --set-secrets="OPENROUTER_API_KEY=openrouter-api-key:latest,LITELLM_PROXY_KEY=litellm-proxy-key:latest,LANGFUSE_PUBLIC_KEY=langfuse-public-key:latest,LANGFUSE_SECRET_KEY=langfuse-secret-key:latest"
 
   deploy_sdr_bot_api:
     runs-on: ubuntu-latest
-    needs: [deploy_litellm_proxy, deploy_phoenix]
+    needs: [deploy_litellm_proxy]
     environment:
       name: production-sdr-bot-api
     permissions:
@@ -235,12 +185,6 @@ jobs:
       - uses: google-github-actions/setup-gcloud@v2
       - id: proxy_url
         run: echo "url=$(gcloud run services describe litellm-proxy --region="${{ secrets.GCP_REGION }}" --format='value(status.url)')" >> "$GITHUB_OUTPUT"
-      # Mesmo padrão de descoberta dinâmica de URL do proxy_url acima --
-      # não é secret (é só a URL pública do serviço), então não cai no
-      # bug de "Skip output ... since it may contain secret" que afetou
-      # API_IMAGE_TAG/etc (esses sim vêm de secrets.*).
-      - id: phoenix_url
-        run: echo "url=$(gcloud run services describe phoenix --region="${{ secrets.GCP_REGION }}" --format='value(status.url)')" >> "$GITHUB_OUTPUT"
       # --memory=4Gi: 2Gi ainda não bastava -- confirmado via logs numa
       # invocação de agente real: "Memory limit of 2048 MiB exceeded with
       # 2196 MiB used" (depois de já termos subido de 512Mi -> 1Gi ->
@@ -248,9 +192,18 @@ jobs:
       # (NER/PII) tudo num processo só -- uso varia bastante conforme o
       # que a conversa aciona, sem sinal de platô ainda visto até agora.
       #
-      # PHOENIX_COLLECTOR_ENDPOINT: precisa do path /v1/traces (endpoint
-      # OTLP/HTTP que o Phoenix expõe na MESMA porta 6006 da UI -- não
-      # precisa do gRPC 4317, ver .env.example pro equivalente local).
+      # PHOENIX_COLLECTOR_ENDPOINT agora aponta pro IP interno da VM de
+      # observabilidade (ver comentário do --vpc-connector acima) -- NÃO
+      # mais um serviço Cloud Run. Phoenix rodando em Cloud Run (batch=
+      # True OU False) já causou dois problemas reais: zero traces
+      # chegavam (thread de background nunca escalonada) e, na tentativa
+      # de correção, um incidente real de produção (export síncrono
+      # travando por timeout até esgotar as instâncias -- ver histórico
+      # completo em app/agents/observability.py). Ainda assim
+      # observability.py continua em batch=True por enquanto -- só
+      # trocar pra batch=False DEPOIS de confirmar manualmente (curl
+      # direto) que a VM responde rápido e de forma estável, pra não
+      # repetir o mesmo incidente.
       - run: |
           gcloud run deploy sdr-bot-api \
             --image="$API_IMAGE_TAG" \
@@ -261,7 +214,9 @@ jobs:
             --allow-unauthenticated \
             --service-account="sdr-bot-api-runtime@${{ secrets.GCP_PROJECT_ID }}.iam.gserviceaccount.com" \
             --add-cloudsql-instances="${{ secrets.CLOUD_SQL_CONNECTION_NAME }}" \
-            --set-env-vars="LITELLM_PROXY_URL=${{ steps.proxy_url.outputs.url }},SDR_APP_NAME=sdr-bot,PHOENIX_COLLECTOR_ENDPOINT=${{ steps.phoenix_url.outputs.url }}/v1/traces" \
+            --vpc-connector="${{ secrets.VPC_CONNECTOR_NAME }}" \
+            --vpc-egress=private-ranges-only \
+            --set-env-vars="LITELLM_PROXY_URL=${{ steps.proxy_url.outputs.url }},SDR_APP_NAME=sdr-bot,PHOENIX_COLLECTOR_ENDPOINT=http://${{ secrets.OBSERVABILITY_VM_INTERNAL_IP }}:6006/v1/traces" \
             --set-secrets="LITELLM_PROXY_KEY=litellm-proxy-key:latest,SESSION_DB_URL=session-db-url:latest"
 
   deploy_telegram_service:
