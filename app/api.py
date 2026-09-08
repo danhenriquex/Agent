@@ -16,6 +16,7 @@ racional completo).
 import asyncio
 import os
 import random
+from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, HTTPException
 from google.adk.errors import StaleSessionError
@@ -25,6 +26,7 @@ from google.genai import types
 from pydantic import BaseModel
 
 from app.agents import root_agent  # importar isso já carrega o .env (ver app/config/__init__.py)
+from app.agents.knowledge import warmup_mcp_connection
 from app.agents.session.state_schema import (
     STATE_CHANNEL,
     STATE_HANDOFF_CLAIMED_BY,
@@ -35,7 +37,19 @@ from app.session_service import get_or_create_session, get_session_service
 
 APP_NAME = os.getenv("SDR_APP_NAME", "sdr-bot")
 
-app = FastAPI(title="SDR Bot API", version="0.1.0")
+
+@asynccontextmanager
+async def _lifespan(_app: FastAPI):
+    # Pré-aquece a conexão MCP (ver warmup_mcp_connection) ANTES de
+    # aceitar tráfego real -- move o custo de boot do subprocess pro
+    # startup do container (que já tem startup-cpu-boost=true e um
+    # STARTUP TCP probe esperando por ele), em vez de pagar esse custo
+    # dentro da primeira requisição real de um usuário.
+    await warmup_mcp_connection()
+    yield
+
+
+app = FastAPI(title="SDR Bot API", version="0.1.0", lifespan=_lifespan)
 
 _session_service = get_session_service()
 _runner = Runner(agent=root_agent, app_name=APP_NAME, session_service=_session_service)

@@ -18,6 +18,21 @@
 # Isso é um lembrete de que aliases de modelo em provedores terceiros
 # precisam de manutenção periódica -- não é "configura uma vez e
 # esquece".
+#
+# ATUALIZAÇÃO (custo): os três acima foram trocados de claude-sonnet-5
+# pra gpt-4o-mini -- decisão explícita de custo (Sonnet 5 é ~10-15x
+# mais caro por token, e dominava o gasto na OpenRouter mesmo sendo só
+# 3 dos 7 aliases). Trade-off CONSCIENTE, não validado por eval antes
+# da troca: fica como TODO rodar `make eval-run` e comparar contra
+# eval/baseline.json pra confirmar que qualidade (em especial
+# judge_faithfulness do knowledge-model, a dimensão que existe
+# especificamente pra pegar alucinação sobre produto) não caiu demais.
+# Efeito colateral pro judge-model abaixo: a razão original de excluir
+# gpt-4o-mini como juiz era evitar viés de auto-avaliação com
+# orchestrator/scheduling/escalate-model -- agora TODOS os 6 agentes
+# avaliados usam gpt-4o-mini, e o juiz (gpt-4o) é da MESMA família
+# (GPT-4o), exatamente o tipo de viés que o design original evitava.
+# Não resolvido aqui -- ver TODO no bloco do judge-model.
 
 model_list:
   # --- Orquestrador: roteamento de intenção, não precisa de raciocínio pesado ---
@@ -27,21 +42,28 @@ model_list:
       api_key: os.environ/OPENROUTER_API_KEY
 
   # --- Qualificação: precisa conduzir perguntas de discovery coerentes ---
+  # gpt-4o-mini por custo (ver NOTA de atualização acima) -- era
+  # claude-sonnet-5.
   - model_name: qualification-model
     litellm_params:
-      model: openrouter/anthropic/claude-sonnet-5
+      model: openrouter/openai/gpt-4o-mini
       api_key: os.environ/OPENROUTER_API_KEY
 
   # --- Knowledge/RAG: faithfulness importa, não pode alucinar sobre produto ---
+  # gpt-4o-mini por custo (ver NOTA de atualização acima) -- era
+  # claude-sonnet-5. Esta é a dimensão mais arriscada da troca --
+  # confirmar via `make eval-run` que faithfulness não caiu.
   - model_name: knowledge-model
     litellm_params:
-      model: openrouter/anthropic/claude-sonnet-5
+      model: openrouter/openai/gpt-4o-mini
       api_key: os.environ/OPENROUTER_API_KEY
 
   # --- Objeções: nuance e persuasão ---
+  # gpt-4o-mini por custo (ver NOTA de atualização acima) -- era
+  # claude-sonnet-5.
   - model_name: objection-model
     litellm_params:
-      model: openrouter/anthropic/claude-sonnet-5
+      model: openrouter/openai/gpt-4o-mini
       api_key: os.environ/OPENROUTER_API_KEY
 
   # --- Agendamento: tarefa estruturada (extrair data/hora), modelo barato ---
@@ -64,24 +86,31 @@ model_list:
       api_key: os.environ/OPENROUTER_API_KEY
 
   # --- Parte 6: modelo-juiz (LLM-as-judge) do golden eval set ---
-  # DELIBERADAMENTE de uma família DIFERENTE dos avaliados
-  # (qualification/knowledge/objection-model, todos claude-sonnet-5) --
-  # um modelo julgando a própria família de saída como boa é um viés de
-  # auto-avaliação documentado em LLM-as-judge. A primeira escolha foi
-  # claude-opus-5 (mesma família Anthropic, uma classe de raciocínio
-  # acima) -- trocado pra gpt-4o depois de rodar `make eval-run` de
-  # verdade: Opus é bem mais caro/lento (pressão real sobre o saldo da
-  # OpenRouter, que já bloqueou a run duas vezes nesta parte) E é uma
-  # família totalmente diferente da Sonnet (evita o viés igual, ou
-  # melhor, já que nem a "linhagem" do modelo se repete), com
+  # HISTÓRICO (não mais totalmente válido, ver TODO abaixo):
+  # DELIBERADAMENTE escolhido de uma família DIFERENTE dos avaliados
+  # (na época, qualification/knowledge/objection-model, todos claude-
+  # sonnet-5) -- um modelo julgando a própria família de saída como boa
+  # é um viés de auto-avaliação documentado em LLM-as-judge. A primeira
+  # escolha foi claude-opus-5 (mesma família Anthropic, uma classe de
+  # raciocínio acima) -- trocado pra gpt-4o depois de rodar
+  # `make eval-run` de verdade: Opus é bem mais caro/lento (pressão
+  # real sobre o saldo da OpenRouter, que já bloqueou a run duas vezes
+  # nesta parte) E era uma família totalmente diferente da Sonnet, com
   # reputação sólida de seguir formato JSON estrito -- relevante porque
   # eval/judge.py::parse_judge_response já teve falha de parsing num
   # item durante teste real. gpt-4o-mini (mais barato ainda) foi
-  # descartado de propósito: já é o modelo por trás de
-  # orchestrator/scheduling/escalate-model, então reintroduziria viés
-  # de auto-avaliação pra qualquer conversa que passe por eles, além de
-  # juízes mais leves tenderem a discriminar pior nuance de tom/
-  # qualidade. Ver eval/judge.py.
+  # descartado de propósito NA ÉPOCA: já era o modelo por trás de
+  # orchestrator/scheduling/escalate-model, reintroduzindo viés de
+  # auto-avaliação pra qualquer conversa que passe por eles.
+  #
+  # TODO (quebrado pela troca de custo acima): qualification/knowledge/
+  # objection-model agora TAMBÉM são gpt-4o-mini -- ou seja, TODOS os 6
+  # agentes avaliados usam gpt-4o-mini, e o juiz (gpt-4o) é da MESMA
+  # família (GPT-4o), exatamente o viés que esta escolha existia pra
+  # evitar. Não resolvido -- se o viés de auto-avaliação importar de
+  # verdade pros seus resultados, troque o judge-model pra algo fora da
+  # família GPT-4o (ex: um Claude ou Llama maior) antes de confiar nos
+  # scores do próximo `make eval-run`.
   - model_name: judge-model
     litellm_params:
       model: openrouter/openai/gpt-4o
